@@ -484,6 +484,9 @@ class SobelEdgeDetector:
         nms_relax=0.96,
         low_ratio=0.04,
         high_ratio=0.12,
+        auto_threshold=True,
+        contrast_ref=80.0,
+        min_threshold_scale=0.5,
         threshold_method="ratio",
         low_percentile=35.0,
         high_percentile=80.0,
@@ -549,11 +552,25 @@ class SobelEdgeDetector:
             edges = magnitude
         
         # 4. 이중 임계값 및 에지 추적 (연결된 에지)
+        low_ratio_adj = low_ratio
+        high_ratio_adj = high_ratio
+        soft_low_adj = soft_low_ratio
+        soft_high_adj = soft_high_ratio
+        if auto_threshold:
+            p10, p90 = np.percentile(image, [10, 90])
+            contrast = max(float(p90 - p10), 1.0)
+            scale = min(1.0, contrast / float(contrast_ref))
+            scale = max(scale, float(min_threshold_scale))
+            low_ratio_adj *= scale
+            high_ratio_adj *= scale
+            soft_low_adj *= scale
+            soft_high_adj *= scale
+
         if use_hysteresis:
             edges_threshold, weak, strong = self.double_threshold(
                 edges,
-                low_ratio=low_ratio,
-                high_ratio=high_ratio,
+                low_ratio=low_ratio_adj,
+                high_ratio=high_ratio_adj,
                 method=threshold_method,
                 low_percentile=low_percentile,
                 high_percentile=high_percentile,
@@ -571,8 +588,8 @@ class SobelEdgeDetector:
                 soft_mad_high = mad_high_k if soft_mad_high_k is None else soft_mad_high_k
                 edges_threshold_soft, weak_soft, strong_soft = self.double_threshold(
                     edges,
-                    low_ratio=soft_low_ratio,
-                    high_ratio=soft_high_ratio,
+                    low_ratio=soft_low_adj,
+                    high_ratio=soft_high_adj,
                     method=soft_method,
                     low_percentile=soft_low_pct,
                     high_percentile=soft_high_pct,

@@ -232,6 +232,9 @@ def _run_case(
         nms_relax=settings["nms_relax"],
         low_ratio=settings["low_ratio"],
         high_ratio=settings["high_ratio"],
+        auto_threshold=settings["auto_threshold"],
+        contrast_ref=settings["contrast_ref"],
+        min_threshold_scale=settings["min_threshold_scale"],
         threshold_method=settings["threshold_method"],
         low_percentile=settings["low_percentile"],
         high_percentile=settings["high_percentile"],
@@ -332,6 +335,9 @@ def main():
         "nms_relax": 1.0,
         "low_ratio": 0.04,
         "high_ratio": 0.12,
+        "auto_threshold": True,
+        "contrast_ref": 80.0,
+        "min_threshold_scale": 0.5,
         "threshold_method": "ratio",
         "low_percentile": 35.0,
         "high_percentile": 80.0,
@@ -469,16 +475,31 @@ def main():
 
     strategies = [
         {
-            "name": f"best_relax_{best_relax:.2f}_band2",
-            "settings": dict(base_settings, nms_relax=best_relax, boundary_band_radius=2),
+            "name": f"best_relax_{best_relax:.2f}_band2_auto",
+            "settings": dict(
+                base_settings,
+                nms_relax=best_relax,
+                boundary_band_radius=2,
+                auto_threshold=True,
+            ),
         },
         {
-            "name": f"best_relax_{best_relax:.2f}_band3",
-            "settings": dict(base_settings, nms_relax=best_relax, boundary_band_radius=3),
+            "name": f"best_relax_{best_relax:.2f}_band3_auto",
+            "settings": dict(
+                base_settings,
+                nms_relax=best_relax,
+                boundary_band_radius=3,
+                auto_threshold=True,
+            ),
         },
         {
-            "name": f"best_relax_{best_relax:.2f}_no_band",
-            "settings": dict(base_settings, nms_relax=best_relax, use_boundary_band_filter=False),
+            "name": f"best_relax_{best_relax:.2f}_band2_fixed",
+            "settings": dict(
+                base_settings,
+                nms_relax=best_relax,
+                boundary_band_radius=2,
+                auto_threshold=False,
+            ),
         },
     ]
 

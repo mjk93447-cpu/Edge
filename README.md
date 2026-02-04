@@ -35,3 +35,14 @@ python sobel_edge_detection.py
 - pillow
 
 > `tkinter`는 파이썬 기본 내장 모듈입니다.
+
+### exe 빌드 (오프라인 배포용)
+아래 명령으로 단일 실행 파일을 생성할 수 있습니다.
+
+```bash
+python -m pip install -r requirements-dev.txt
+pyinstaller --onefile --windowed --name edge_batch_gui.exe sobel_edge_detection.py
+```
+
+생성된 실행 파일:
+- `dist/edge_batch_gui.exe`

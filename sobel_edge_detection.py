@@ -1,6 +1,7 @@
 import os
 import queue
 import threading
+from collections import deque
 from datetime import datetime
 try:
     import tkinter as tk
@@ -12,6 +13,7 @@ except ModuleNotFoundError:
     ttk = None
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image
 
 class SobelEdgeDetector:
@@ -39,20 +41,15 @@ class SobelEdgeDetector:
     def apply_convolution(self, image, kernel):
         """컨볼루션 연산 적용"""
         h, w = image.shape
+        kernel = kernel.astype(np.float32, copy=False)
         k_h, k_w = kernel.shape
         pad_h, pad_w = k_h // 2, k_w // 2
         
         # 패딩 추가
         padded = np.pad(image, ((pad_h, pad_h), (pad_w, pad_w)), mode='edge')
-        result = np.zeros_like(image)
-        
-        # 컨볼루션 수행
-        for i in range(h):
-            for j in range(w):
-                region = padded[i:i+k_h, j:j+k_w]
-                result[i, j] = np.sum(region * kernel)
-        
-        return result
+        windows = sliding_window_view(padded, (k_h, k_w))
+        result = np.tensordot(windows, kernel, axes=((2, 3), (0, 1)))
+        return result.astype(np.float32, copy=False)
 
     def apply_gaussian_blur(self, image, kernel_size=5, sigma=1.2):
         """가우시안 블러로 노이즈를 완화하여 정밀도 개선"""
@@ -60,6 +57,7 @@ class SobelEdgeDetector:
             return image
         if kernel_size % 2 == 0:
             kernel_size += 1
+        sigma = max(float(sigma), 0.1)
 
         radius = kernel_size // 2
         ax = np.arange(-radius, radius + 1, dtype=np.float32)
@@ -82,44 +80,45 @@ class SobelEdgeDetector:
     
     def non_maximum_suppression(self, magnitude, direction):
         """Non-Maximum Suppression으로 얇은 에지 생성"""
-        h, w = magnitude.shape
-        suppressed = np.zeros_like(magnitude)
-        
+        magnitude = magnitude.astype(np.float32, copy=False)
+        suppressed = np.zeros_like(magnitude, dtype=np.float32)
+
         # 각도를 0, 45, 90, 135도로 양자화
         angle = direction * 180.0 / np.pi
         angle[angle < 0] += 180
-        
-        for i in range(1, h-1):
-            for j in range(1, w-1):
-                q = 255
-                r = 255
-                
-                # 0도 (수평)
-                if (0 <= angle[i,j] < 22.5) or (157.5 <= angle[i,j] <= 180):
-                    q = magnitude[i, j+1]
-                    r = magnitude[i, j-1]
-                # 45도
-                elif 22.5 <= angle[i,j] < 67.5:
-                    q = magnitude[i+1, j-1]
-                    r = magnitude[i-1, j+1]
-                # 90도 (수직)
-                elif 67.5 <= angle[i,j] < 112.5:
-                    q = magnitude[i+1, j]
-                    r = magnitude[i-1, j]
-                # 135도
-                elif 112.5 <= angle[i,j] < 157.5:
-                    q = magnitude[i-1, j-1]
-                    r = magnitude[i+1, j+1]
-                
-                # 현재 픽셀이 이웃보다 크면 유지, 아니면 억제
-                if magnitude[i,j] >= q and magnitude[i,j] >= r:
-                    suppressed[i,j] = magnitude[i,j]
-                else:
-                    suppressed[i,j] = 0
-        
+
+        padded = np.pad(magnitude, ((1, 1), (1, 1)), mode="constant")
+        center = padded[1:-1, 1:-1]
+        right = padded[1:-1, 2:]
+        left = padded[1:-1, :-2]
+        up = padded[:-2, 1:-1]
+        down = padded[2:, 1:-1]
+        up_left = padded[:-2, :-2]
+        up_right = padded[:-2, 2:]
+        down_left = padded[2:, :-2]
+        down_right = padded[2:, 2:]
+
+        mask_0 = (angle < 22.5) | (angle >= 157.5)
+        mask_45 = (angle >= 22.5) & (angle < 67.5)
+        mask_90 = (angle >= 67.5) & (angle < 112.5)
+        mask_135 = (angle >= 112.5) & (angle < 157.5)
+
+        keep_0 = mask_0 & (center >= right) & (center >= left)
+        keep_45 = mask_45 & (center >= up_right) & (center >= down_left)
+        keep_90 = mask_90 & (center >= up) & (center >= down)
+        keep_135 = mask_135 & (center >= up_left) & (center >= down_right)
+
+        suppressed[keep_0 | keep_45 | keep_90 | keep_135] = center[
+            keep_0 | keep_45 | keep_90 | keep_135
+        ]
+
+        suppressed[0, :] = 0
+        suppressed[-1, :] = 0
+        suppressed[:, 0] = 0
+        suppressed[:, -1] = 0
         return suppressed
     
-    def double_threshold(self, image, low_ratio=0.1, high_ratio=0.2):
+    def double_threshold(self, image, low_ratio=0.06, high_ratio=0.18):
         """이중 임계값 적용"""
         high_threshold = image.max() * high_ratio
         low_threshold = image.max() * low_ratio
@@ -141,19 +140,26 @@ class SobelEdgeDetector:
         """에지 추적 (Hysteresis)"""
         h, w = image.shape
         result = image.copy()
-        
-        for i in range(1, h-1):
-            for j in range(1, w-1):
-                if result[i, j] == weak:
-                    # 주변 8개 픽셀 중 강한 에지가 있으면 연결
-                    if ((result[i+1, j-1] == strong) or (result[i+1, j] == strong) or 
-                        (result[i+1, j+1] == strong) or (result[i, j-1] == strong) or 
-                        (result[i, j+1] == strong) or (result[i-1, j-1] == strong) or 
-                        (result[i-1, j] == strong) or (result[i-1, j+1] == strong)):
-                        result[i, j] = strong
-                    else:
-                        result[i, j] = 0
-        
+        strong_mask = result == strong
+        weak_mask = result == weak
+
+        neighbors = [
+            (-1, -1), (-1, 0), (-1, 1),
+            (0, -1),           (0, 1),
+            (1, -1),  (1, 0),  (1, 1),
+        ]
+
+        stack = deque(zip(*np.where(strong_mask)))
+        while stack:
+            i, j = stack.pop()
+            for di, dj in neighbors:
+                ni, nj = i + di, j + dj
+                if 0 <= ni < h and 0 <= nj < w and weak_mask[ni, nj]:
+                    weak_mask[ni, nj] = False
+                    result[ni, nj] = strong
+                    stack.append((ni, nj))
+
+        result[weak_mask] = 0
         return result
     
     def detect_edges(
@@ -164,8 +170,8 @@ class SobelEdgeDetector:
         use_blur=True,
         blur_kernel_size=5,
         blur_sigma=1.2,
-        low_ratio=0.1,
-        high_ratio=0.2,
+        low_ratio=0.06,
+        high_ratio=0.18,
     ):
         """전체 에지 검출 파이프라인"""
         # 1. 이미지 로드

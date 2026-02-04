@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime
 
 import numpy as np
@@ -115,25 +116,24 @@ def save_metrics(metrics, path):
                 handle.write(f"{key}: {value}\n")
 
 
-def main():
-    output_dir = ensure_output_dir()
+def _save_debug_overlay(original, pred_edges, missing_edges, path):
+    overlay = np.stack([original] * 3, axis=-1)
+    overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    overlay[pred_edges] = [0, 255, 0]
+    overlay[missing_edges] = [0, 0, 255]
+    Image.fromarray(overlay).save(path)
 
-    mask = create_bending_loop_mask()
-    image = render_image_from_mask(mask)
 
-    input_path = os.path.join(output_dir, "bending_loop_input.png")
-    mask_path = os.path.join(output_dir, "bending_loop_mask.png")
+def _run_case(detector, output_dir, name, line_width, noise_sigma, settings):
+    mask = create_bending_loop_mask(line_width=line_width)
+    image = render_image_from_mask(mask, noise_sigma=noise_sigma, seed=7)
+
+    input_path = os.path.join(output_dir, f"{name}_input.png")
+    mask_path = os.path.join(output_dir, f"{name}_mask.png")
     Image.fromarray(image).save(input_path)
     Image.fromarray(mask).save(mask_path)
 
-    detector = SobelEdgeDetector()
-    settings = {
-        "use_blur": True,
-        "blur_kernel_size": 5,
-        "blur_sigma": 1.4,
-        "low_ratio": 0.12,
-        "high_ratio": 0.25,
-    }
+    start = time.perf_counter()
     results = detector.detect_edges(
         input_path,
         use_nms=True,
@@ -144,32 +144,74 @@ def main():
         low_ratio=settings["low_ratio"],
         high_ratio=settings["high_ratio"],
     )
+    elapsed = time.perf_counter() - start
 
     pred_edges = results["edges"] > 0
     gt_edges = compute_boundary(mask)
 
     overlay, _ = _make_overlay_image(results["original"], results["edges"])
-    overlay_path = os.path.join(output_dir, "bending_loop_edges_green.png")
+    overlay_path = os.path.join(output_dir, f"{name}_edges_green.png")
     Image.fromarray(overlay).save(overlay_path)
 
-    pred_edge_path = os.path.join(output_dir, "bending_loop_edges_binary.png")
-    gt_edge_path = os.path.join(output_dir, "bending_loop_edges_gt.png")
+    pred_edge_path = os.path.join(output_dir, f"{name}_edges_binary.png")
+    gt_edge_path = os.path.join(output_dir, f"{name}_edges_gt.png")
     Image.fromarray((pred_edges * 255).astype(np.uint8)).save(pred_edge_path)
     Image.fromarray((gt_edges * 255).astype(np.uint8)).save(gt_edge_path)
 
+    missing_edges = gt_edges & ~dilate(pred_edges, radius=1)
+    missing_overlay_path = os.path.join(output_dir, f"{name}_edges_missing.png")
+    _save_debug_overlay(results["original"], pred_edges, missing_edges, missing_overlay_path)
+
     metrics = evaluate_edges(pred_edges, gt_edges, tolerance=1)
+    metrics["elapsed_sec"] = elapsed
+    metrics["line_width"] = line_width
+    metrics["noise_sigma"] = noise_sigma
     for key, value in settings.items():
         metrics[f"setting_{key}"] = value
-    metrics_path = os.path.join(output_dir, "edge_metrics.txt")
+
+    metrics_path = os.path.join(output_dir, f"edge_metrics_{name}.txt")
     save_metrics(metrics, metrics_path)
+
+    return metrics, overlay_path, missing_overlay_path
+
+
+def main():
+    output_dir = ensure_output_dir()
+
+    detector = SobelEdgeDetector()
+    settings = {
+        "use_blur": True,
+        "blur_kernel_size": 5,
+        "blur_sigma": 1.2,
+        "low_ratio": 0.06,
+        "high_ratio": 0.18,
+    }
+
+    cases = [
+        ("bending_loop", 42, 4),
+        ("bending_loop_thin", 24, 5),
+    ]
 
     print("Performance evaluation complete.")
     print(f"Output directory: {output_dir}")
-    for key, value in metrics.items():
-        if isinstance(value, float):
-            print(f"{key}: {value:.4f}")
-        else:
-            print(f"{key}: {value}")
+
+    for name, line_width, noise_sigma in cases:
+        metrics, overlay_path, missing_overlay_path = _run_case(
+            detector,
+            output_dir,
+            name,
+            line_width,
+            noise_sigma,
+            settings,
+        )
+        print(f"\nCase: {name}")
+        print(f"- overlay: {overlay_path}")
+        print(f"- missing: {missing_overlay_path}")
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                print(f"{key}: {value:.4f}")
+            else:
+                print(f"{key}: {value}")
 
 
 if __name__ == "__main__":

@@ -365,7 +365,7 @@ class SobelEdgeDetector:
         use_closing=False,
         closing_radius=1,
         closing_iterations=1,
-        use_thinning=True,
+        use_thinning=False,
         thinning_max_iter=15,
     ):
         """전체 에지 검출 파이프라인"""

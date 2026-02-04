@@ -105,10 +105,15 @@ class SobelEdgeDetector:
         
         return magnitude, direction, grad_x, grad_y
     
-    def non_maximum_suppression(self, magnitude, direction):
+    def non_maximum_suppression(self, magnitude, direction, relax=1.0):
         """Non-Maximum Suppression으로 얇은 에지 생성"""
         magnitude = magnitude.astype(np.float32, copy=False)
         suppressed = np.zeros_like(magnitude, dtype=np.float32)
+        relax = float(relax)
+        if relax <= 0:
+            relax = 1.0
+        if relax > 1.0:
+            relax = 1.0
 
         # 각도를 0, 45, 90, 135도로 양자화
         angle = direction * 180.0 / np.pi
@@ -130,10 +135,10 @@ class SobelEdgeDetector:
         mask_90 = (angle >= 67.5) & (angle < 112.5)
         mask_135 = (angle >= 112.5) & (angle < 157.5)
 
-        keep_0 = mask_0 & (center >= right) & (center >= left)
-        keep_45 = mask_45 & (center >= up_right) & (center >= down_left)
-        keep_90 = mask_90 & (center >= up) & (center >= down)
-        keep_135 = mask_135 & (center >= up_left) & (center >= down_right)
+        keep_0 = mask_0 & (center >= right * relax) & (center >= left * relax)
+        keep_45 = mask_45 & (center >= up_right * relax) & (center >= down_left * relax)
+        keep_90 = mask_90 & (center >= up * relax) & (center >= down * relax)
+        keep_135 = mask_135 & (center >= up_left * relax) & (center >= down_right * relax)
 
         suppressed[keep_0 | keep_45 | keep_90 | keep_135] = center[
             keep_0 | keep_45 | keep_90 | keep_135
@@ -255,6 +260,7 @@ class SobelEdgeDetector:
         contrast_low_pct=2.0,
         contrast_high_pct=98.0,
         magnitude_gamma=1.0,
+        nms_relax=1.0,
         low_ratio=0.04,
         high_ratio=0.12,
         threshold_method="ratio",
@@ -300,7 +306,7 @@ class SobelEdgeDetector:
         
         # 3. Non-Maximum Suppression (얇은 에지)
         if use_nms:
-            edges = self.non_maximum_suppression(magnitude, direction)
+            edges = self.non_maximum_suppression(magnitude, direction, relax=nms_relax)
         else:
             edges = magnitude
         

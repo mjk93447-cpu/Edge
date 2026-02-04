@@ -288,7 +288,7 @@ def main():
             },
         },
         {
-            "name": "relaxed_peak_refine",
+            "name": "relax_095_no_refine",
             "settings": {
                 "use_median_filter": False,
                 "median_kernel_size": 3,
@@ -299,7 +299,7 @@ def main():
                 "contrast_low_pct": 2.0,
                 "contrast_high_pct": 98.0,
                 "magnitude_gamma": 1.0,
-                "nms_relax": 0.9,
+                "nms_relax": 0.95,
                 "low_ratio": 0.04,
                 "high_ratio": 0.12,
                 "threshold_method": "ratio",
@@ -320,14 +320,14 @@ def main():
                 "use_closing": False,
                 "closing_radius": 1,
                 "closing_iterations": 1,
-                "use_peak_refine": True,
+                "use_peak_refine": False,
                 "peak_fill_radius": 1,
                 "use_thinning": False,
                 "thinning_max_iter": 15,
             },
         },
         {
-            "name": "relaxed_thin",
+            "name": "relax_095_thin",
             "settings": {
                 "use_median_filter": False,
                 "median_kernel_size": 3,
@@ -338,7 +338,7 @@ def main():
                 "contrast_low_pct": 2.0,
                 "contrast_high_pct": 98.0,
                 "magnitude_gamma": 1.0,
-                "nms_relax": 0.9,
+                "nms_relax": 0.95,
                 "low_ratio": 0.04,
                 "high_ratio": 0.12,
                 "threshold_method": "ratio",

@@ -220,6 +220,15 @@ class SobelEdgeDetector:
         padded = np.pad(binary, radius, mode="constant", constant_values=False)
         windows = sliding_window_view(padded, (size, size))
         return np.any(windows, axis=(-2, -1))
+
+    def erode_binary(self, binary, radius=1):
+        """이진 이미지 침식 (노이즈 정리/클로징용)"""
+        if radius <= 0:
+            return binary
+        size = radius * 2 + 1
+        padded = np.pad(binary, radius, mode="constant", constant_values=False)
+        windows = sliding_window_view(padded, (size, size))
+        return np.all(windows, axis=(-2, -1))
     
     def detect_edges(
         self,
@@ -245,6 +254,9 @@ class SobelEdgeDetector:
         soft_low_ratio=0.03,
         soft_high_ratio=0.1,
         link_radius=2,
+        use_closing=True,
+        closing_radius=1,
+        closing_iterations=1,
     ):
         """전체 에지 검출 파이프라인"""
         # 1. 이미지 로드
@@ -313,6 +325,12 @@ class SobelEdgeDetector:
             threshold = edges.max() * 0.15
             edges_final = np.where(edges > threshold, 255, 0)
         
+        if use_closing and use_hysteresis:
+            edge_mask = edges_final > 0
+            for _ in range(max(int(closing_iterations), 1)):
+                edge_mask = self.erode_binary(self.dilate_binary(edge_mask, closing_radius), closing_radius)
+            edges_final = np.where(edge_mask, 255, 0)
+
         edges_final = edges_final.astype(np.uint8)
         return {
             'original': original,

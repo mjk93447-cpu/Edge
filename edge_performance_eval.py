@@ -124,9 +124,24 @@ def _save_debug_overlay(original, pred_edges, missing_edges, path):
     Image.fromarray(overlay).save(path)
 
 
-def _run_case(detector, output_dir, name, line_width, noise_sigma, settings):
+def _run_case(
+    detector,
+    output_dir,
+    name,
+    line_width,
+    noise_sigma,
+    background,
+    foreground,
+    settings,
+):
     mask = create_bending_loop_mask(line_width=line_width)
-    image = render_image_from_mask(mask, noise_sigma=noise_sigma, seed=7)
+    image = render_image_from_mask(
+        mask,
+        background=background,
+        foreground=foreground,
+        noise_sigma=noise_sigma,
+        seed=7,
+    )
 
     input_path = os.path.join(output_dir, f"{name}_input.png")
     mask_path = os.path.join(output_dir, f"{name}_mask.png")
@@ -141,8 +156,16 @@ def _run_case(detector, output_dir, name, line_width, noise_sigma, settings):
         use_blur=settings["use_blur"],
         blur_kernel_size=settings["blur_kernel_size"],
         blur_sigma=settings["blur_sigma"],
+        use_contrast_stretch=settings["use_contrast_stretch"],
+        contrast_low_pct=settings["contrast_low_pct"],
+        contrast_high_pct=settings["contrast_high_pct"],
+        magnitude_gamma=settings["magnitude_gamma"],
         low_ratio=settings["low_ratio"],
         high_ratio=settings["high_ratio"],
+        threshold_method=settings["threshold_method"],
+        low_percentile=settings["low_percentile"],
+        high_percentile=settings["high_percentile"],
+        min_threshold=settings["min_threshold"],
     )
     elapsed = time.perf_counter() - start
 
@@ -166,6 +189,8 @@ def _run_case(detector, output_dir, name, line_width, noise_sigma, settings):
     metrics["elapsed_sec"] = elapsed
     metrics["line_width"] = line_width
     metrics["noise_sigma"] = noise_sigma
+    metrics["background"] = background
+    metrics["foreground"] = foreground
     for key, value in settings.items():
         metrics[f"setting_{key}"] = value
 
@@ -179,39 +204,96 @@ def main():
     output_dir = ensure_output_dir()
 
     detector = SobelEdgeDetector()
-    settings = {
-        "use_blur": True,
-        "blur_kernel_size": 5,
-        "blur_sigma": 1.2,
-        "low_ratio": 0.06,
-        "high_ratio": 0.18,
-    }
+    strategies = [
+        {
+            "name": "ratio_blur5",
+            "settings": {
+                "use_blur": True,
+                "blur_kernel_size": 5,
+                "blur_sigma": 1.2,
+                "use_contrast_stretch": False,
+                "contrast_low_pct": 2.0,
+                "contrast_high_pct": 98.0,
+                "magnitude_gamma": 1.0,
+                "low_ratio": 0.06,
+                "high_ratio": 0.18,
+                "threshold_method": "ratio",
+                "low_percentile": 35.0,
+                "high_percentile": 80.0,
+                "min_threshold": 1.0,
+            },
+        },
+        {
+            "name": "percentile_contrast",
+            "settings": {
+                "use_blur": True,
+                "blur_kernel_size": 3,
+                "blur_sigma": 0.9,
+                "use_contrast_stretch": True,
+                "contrast_low_pct": 2.0,
+                "contrast_high_pct": 98.0,
+                "magnitude_gamma": 1.0,
+                "low_ratio": 0.06,
+                "high_ratio": 0.18,
+                "threshold_method": "percentile",
+                "low_percentile": 35.0,
+                "high_percentile": 80.0,
+                "min_threshold": 1.0,
+            },
+        },
+        {
+            "name": "percentile_gamma",
+            "settings": {
+                "use_blur": True,
+                "blur_kernel_size": 3,
+                "blur_sigma": 0.9,
+                "use_contrast_stretch": True,
+                "contrast_low_pct": 1.5,
+                "contrast_high_pct": 98.5,
+                "magnitude_gamma": 0.85,
+                "low_ratio": 0.06,
+                "high_ratio": 0.18,
+                "threshold_method": "percentile",
+                "low_percentile": 30.0,
+                "high_percentile": 75.0,
+                "min_threshold": 1.0,
+            },
+        },
+    ]
 
     cases = [
-        ("bending_loop", 42, 4),
-        ("bending_loop_thin", 24, 5),
+        {"name": "bending_loop", "line_width": 42, "noise_sigma": 4, "background": 230, "foreground": 45},
+        {"name": "bending_loop_thin", "line_width": 24, "noise_sigma": 5, "background": 230, "foreground": 45},
+        {"name": "bending_loop_faint_thin", "line_width": 18, "noise_sigma": 6, "background": 200, "foreground": 150},
     ]
 
     print("Performance evaluation complete.")
     print(f"Output directory: {output_dir}")
 
-    for name, line_width, noise_sigma in cases:
-        metrics, overlay_path, missing_overlay_path = _run_case(
-            detector,
-            output_dir,
-            name,
-            line_width,
-            noise_sigma,
-            settings,
-        )
-        print(f"\nCase: {name}")
-        print(f"- overlay: {overlay_path}")
-        print(f"- missing: {missing_overlay_path}")
-        for key, value in metrics.items():
-            if isinstance(value, float):
-                print(f"{key}: {value:.4f}")
-            else:
-                print(f"{key}: {value}")
+    for strategy in strategies:
+        strategy_name = strategy["name"]
+        settings = strategy["settings"]
+        print(f"\n=== Strategy: {strategy_name} ===")
+        for case in cases:
+            case_tag = f"{strategy_name}_{case['name']}"
+            metrics, overlay_path, missing_overlay_path = _run_case(
+                detector,
+                output_dir,
+                case_tag,
+                case["line_width"],
+                case["noise_sigma"],
+                case["background"],
+                case["foreground"],
+                settings,
+            )
+            print(f"\nCase: {case_tag}")
+            print(f"- overlay: {overlay_path}")
+            print(f"- missing: {missing_overlay_path}")
+            for key, value in metrics.items():
+                if isinstance(value, float):
+                    print(f"{key}: {value:.4f}")
+                else:
+                    print(f"{key}: {value}")
 
 
 if __name__ == "__main__":

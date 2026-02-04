@@ -65,6 +65,20 @@ class SobelEdgeDetector:
         kernel = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
         kernel /= np.sum(kernel)
         return self.apply_convolution(image, kernel)
+
+    def contrast_stretch(self, image, low_pct=2.0, high_pct=98.0):
+        """저대비 영역을 늘려 약한 에지를 강화"""
+        low_pct = float(low_pct)
+        high_pct = float(high_pct)
+        if high_pct <= low_pct:
+            return image
+
+        low_val, high_val = np.percentile(image, [low_pct, high_pct])
+        if high_val <= low_val:
+            return image
+
+        stretched = (image - low_val) * (255.0 / (high_val - low_val))
+        return np.clip(stretched, 0, 255).astype(np.float32)
     
     def compute_gradient(self, image):
         """Sobel 필터로 그래디언트 계산"""
@@ -118,10 +132,33 @@ class SobelEdgeDetector:
         suppressed[:, -1] = 0
         return suppressed
     
-    def double_threshold(self, image, low_ratio=0.06, high_ratio=0.18):
+    def double_threshold(
+        self,
+        image,
+        low_ratio=0.06,
+        high_ratio=0.18,
+        method="ratio",
+        low_percentile=35.0,
+        high_percentile=80.0,
+        min_threshold=1.0,
+    ):
         """이중 임계값 적용"""
-        high_threshold = image.max() * high_ratio
-        low_threshold = image.max() * low_ratio
+        if method == "percentile":
+            sample = image[image > 0]
+            if sample.size == 0:
+                high_threshold = image.max() * high_ratio
+                low_threshold = image.max() * low_ratio
+            else:
+                high_threshold = np.percentile(sample, high_percentile)
+                low_threshold = np.percentile(sample, low_percentile)
+        else:
+            high_threshold = image.max() * high_ratio
+            low_threshold = image.max() * low_ratio
+
+        high_threshold = max(float(high_threshold), min_threshold)
+        low_threshold = max(float(low_threshold), min_threshold)
+        if low_threshold > high_threshold:
+            low_threshold = high_threshold
         
         strong = 255
         weak = 75
@@ -168,10 +205,18 @@ class SobelEdgeDetector:
         use_nms=True,
         use_hysteresis=True,
         use_blur=True,
-        blur_kernel_size=5,
-        blur_sigma=1.2,
+        blur_kernel_size=3,
+        blur_sigma=0.9,
+        use_contrast_stretch=True,
+        contrast_low_pct=2.0,
+        contrast_high_pct=98.0,
+        magnitude_gamma=1.0,
         low_ratio=0.06,
         high_ratio=0.18,
+        threshold_method="percentile",
+        low_percentile=35.0,
+        high_percentile=80.0,
+        min_threshold=1.0,
     ):
         """전체 에지 검출 파이프라인"""
         # 1. 이미지 로드
@@ -181,9 +226,15 @@ class SobelEdgeDetector:
         # 1-1. 블러로 노이즈 완화
         if use_blur:
             image = self.apply_gaussian_blur(image, blur_kernel_size, blur_sigma)
+
+        # 1-2. 저대비 보정
+        if use_contrast_stretch:
+            image = self.contrast_stretch(image, contrast_low_pct, contrast_high_pct)
         
         # 2. Sobel 필터 적용
         magnitude, direction, grad_x, grad_y = self.compute_gradient(image)
+        if magnitude_gamma != 1.0:
+            magnitude = np.power(magnitude, magnitude_gamma)
         
         # 3. Non-Maximum Suppression (얇은 에지)
         if use_nms:
@@ -194,7 +245,13 @@ class SobelEdgeDetector:
         # 4. 이중 임계값 및 에지 추적 (연결된 에지)
         if use_hysteresis:
             edges_threshold, weak, strong = self.double_threshold(
-                edges, low_ratio=low_ratio, high_ratio=high_ratio
+                edges,
+                low_ratio=low_ratio,
+                high_ratio=high_ratio,
+                method=threshold_method,
+                low_percentile=low_percentile,
+                high_percentile=high_percentile,
+                min_threshold=min_threshold,
             )
             edges_final = self.edge_tracking(edges_threshold, weak, strong)
         else:

@@ -2,8 +2,14 @@ import os
 import queue
 import threading
 from datetime import datetime
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ModuleNotFoundError:
+    tk = None
+    filedialog = None
+    messagebox = None
+    ttk = None
 
 import numpy as np
 from PIL import Image
@@ -360,6 +366,8 @@ class EdgeBatchGUI:
 
 
 def main():
+    if tk is None:
+        raise RuntimeError("tkinter가 설치되어 있지 않습니다. GUI 실행을 위해 설치하세요.")
     root = tk.Tk()
     EdgeBatchGUI(root)
     root.mainloop()

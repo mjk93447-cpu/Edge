@@ -267,6 +267,11 @@ class SobelEdgeDetector:
         soft_low_ratio=0.03,
         soft_high_ratio=0.1,
         link_radius=2,
+        soft_threshold_method=None,
+        soft_low_percentile=None,
+        soft_high_percentile=None,
+        soft_mad_low_k=None,
+        soft_mad_high_k=None,
         use_closing=True,
         closing_radius=1,
         closing_iterations=1,
@@ -315,16 +320,21 @@ class SobelEdgeDetector:
             edges_strong = self.edge_tracking(edges_threshold, weak, strong)
 
             if use_soft_linking:
+                soft_method = soft_threshold_method or threshold_method
+                soft_low_pct = low_percentile if soft_low_percentile is None else soft_low_percentile
+                soft_high_pct = high_percentile if soft_high_percentile is None else soft_high_percentile
+                soft_mad_low = mad_low_k if soft_mad_low_k is None else soft_mad_low_k
+                soft_mad_high = mad_high_k if soft_mad_high_k is None else soft_mad_high_k
                 edges_threshold_soft, weak_soft, strong_soft = self.double_threshold(
                     edges,
                     low_ratio=soft_low_ratio,
                     high_ratio=soft_high_ratio,
-                    method=threshold_method,
-                    low_percentile=low_percentile,
-                    high_percentile=high_percentile,
+                    method=soft_method,
+                    low_percentile=soft_low_pct,
+                    high_percentile=soft_high_pct,
                     min_threshold=min_threshold,
-                    mad_low_k=mad_low_k,
-                    mad_high_k=mad_high_k,
+                    mad_low_k=soft_mad_low,
+                    mad_high_k=soft_mad_high,
                 )
                 edges_soft = self.edge_tracking(edges_threshold_soft, weak_soft, strong_soft)
                 strong_mask = edges_strong > 0

@@ -127,7 +127,23 @@ def main():
     Image.fromarray(mask).save(mask_path)
 
     detector = SobelEdgeDetector()
-    results = detector.detect_edges(input_path, use_nms=True, use_hysteresis=True)
+    settings = {
+        "use_blur": True,
+        "blur_kernel_size": 5,
+        "blur_sigma": 1.4,
+        "low_ratio": 0.12,
+        "high_ratio": 0.25,
+    }
+    results = detector.detect_edges(
+        input_path,
+        use_nms=True,
+        use_hysteresis=True,
+        use_blur=settings["use_blur"],
+        blur_kernel_size=settings["blur_kernel_size"],
+        blur_sigma=settings["blur_sigma"],
+        low_ratio=settings["low_ratio"],
+        high_ratio=settings["high_ratio"],
+    )
 
     pred_edges = results["edges"] > 0
     gt_edges = compute_boundary(mask)
@@ -142,6 +158,8 @@ def main():
     Image.fromarray((gt_edges * 255).astype(np.uint8)).save(gt_edge_path)
 
     metrics = evaluate_edges(pred_edges, gt_edges, tolerance=1)
+    for key, value in settings.items():
+        metrics[f"setting_{key}"] = value
     metrics_path = os.path.join(output_dir, "edge_metrics.txt")
     save_metrics(metrics, metrics_path)
 

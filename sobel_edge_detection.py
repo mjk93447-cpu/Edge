@@ -53,6 +53,20 @@ class SobelEdgeDetector:
                 result[i, j] = np.sum(region * kernel)
         
         return result
+
+    def apply_gaussian_blur(self, image, kernel_size=5, sigma=1.2):
+        """가우시안 블러로 노이즈를 완화하여 정밀도 개선"""
+        if kernel_size < 3:
+            return image
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        radius = kernel_size // 2
+        ax = np.arange(-radius, radius + 1, dtype=np.float32)
+        xx, yy = np.meshgrid(ax, ax)
+        kernel = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        kernel /= np.sum(kernel)
+        return self.apply_convolution(image, kernel)
     
     def compute_gradient(self, image):
         """Sobel 필터로 그래디언트 계산"""
@@ -105,10 +119,10 @@ class SobelEdgeDetector:
         
         return suppressed
     
-    def double_threshold(self, image, low_ratio=0.05, high_ratio=0.15):
+    def double_threshold(self, image, low_ratio=0.1, high_ratio=0.2):
         """이중 임계값 적용"""
         high_threshold = image.max() * high_ratio
-        low_threshold = high_threshold * low_ratio
+        low_threshold = image.max() * low_ratio
         
         strong = 255
         weak = 75
@@ -142,10 +156,25 @@ class SobelEdgeDetector:
         
         return result
     
-    def detect_edges(self, image_path, use_nms=True, use_hysteresis=True):
+    def detect_edges(
+        self,
+        image_path,
+        use_nms=True,
+        use_hysteresis=True,
+        use_blur=True,
+        blur_kernel_size=5,
+        blur_sigma=1.2,
+        low_ratio=0.1,
+        high_ratio=0.2,
+    ):
         """전체 에지 검출 파이프라인"""
         # 1. 이미지 로드
         image = self.load_image(image_path)
+        original = image.copy()
+
+        # 1-1. 블러로 노이즈 완화
+        if use_blur:
+            image = self.apply_gaussian_blur(image, blur_kernel_size, blur_sigma)
         
         # 2. Sobel 필터 적용
         magnitude, direction, grad_x, grad_y = self.compute_gradient(image)
@@ -158,7 +187,9 @@ class SobelEdgeDetector:
         
         # 4. 이중 임계값 및 에지 추적 (연결된 에지)
         if use_hysteresis:
-            edges_threshold, weak, strong = self.double_threshold(edges)
+            edges_threshold, weak, strong = self.double_threshold(
+                edges, low_ratio=low_ratio, high_ratio=high_ratio
+            )
             edges_final = self.edge_tracking(edges_threshold, weak, strong)
         else:
             # 단순 임계값
@@ -167,7 +198,7 @@ class SobelEdgeDetector:
         
         edges_final = edges_final.astype(np.uint8)
         return {
-            'original': image,
+            'original': original,
             'magnitude': magnitude,
             'grad_x': grad_x,
             'grad_y': grad_y,

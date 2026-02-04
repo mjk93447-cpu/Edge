@@ -347,6 +347,43 @@ class SobelEdgeDetector:
         windows = sliding_window_view(padded, (3, 3))
         local_max = magnitude >= windows.max(axis=(-2, -1))
         return refined | (uncovered & local_max)
+
+    def filter_edge_polarity(
+        self,
+        edge_mask,
+        image,
+        grad_x,
+        grad_y,
+        min_diff=1.0,
+        min_support=50,
+        drop_margin=0.0,
+    ):
+        """그라디언트 방향의 밝기 변화로 내부 에지를 제거"""
+        if not np.any(edge_mask):
+            return edge_mask
+
+        h, w = image.shape
+        ys, xs = np.where(edge_mask)
+        step_x = np.sign(grad_x).astype(np.int32)
+        step_y = np.sign(grad_y).astype(np.int32)
+
+        y_plus = np.clip(ys + step_y[ys, xs], 0, h - 1)
+        x_plus = np.clip(xs + step_x[ys, xs], 0, w - 1)
+        y_minus = np.clip(ys - step_y[ys, xs], 0, h - 1)
+        x_minus = np.clip(xs - step_x[ys, xs], 0, w - 1)
+
+        diff = image[y_plus, x_plus] - image[y_minus, x_minus]
+        strong = np.abs(diff) >= min_diff
+        if int(strong.sum()) < int(min_support):
+            return edge_mask
+
+        median_diff = float(np.median(diff[strong]))
+        sign = 1.0 if median_diff >= 0 else -1.0
+        keep = diff * sign >= -float(drop_margin)
+
+        filtered = edge_mask.copy()
+        filtered[ys, xs] = keep
+        return filtered
     
     def detect_edges(
         self,
@@ -385,6 +422,10 @@ class SobelEdgeDetector:
         closing_iterations=1,
         use_peak_refine=False,
         peak_fill_radius=1,
+        use_polarity_filter=True,
+        polarity_min_diff=1.0,
+        polarity_min_support=50,
+        polarity_drop_margin=0.0,
         use_thinning=True,
         thinning_max_iter=15,
     ):
@@ -473,6 +514,19 @@ class SobelEdgeDetector:
         if use_peak_refine:
             edge_mask = edges_final > 0
             edge_mask = self.refine_edge_peaks(edge_mask, magnitude, direction, peak_fill_radius)
+            edges_final = np.where(edge_mask, 255, 0)
+
+        if use_polarity_filter:
+            edge_mask = edges_final > 0
+            edge_mask = self.filter_edge_polarity(
+                edge_mask,
+                original,
+                grad_x,
+                grad_y,
+                min_diff=polarity_min_diff,
+                min_support=polarity_min_support,
+                drop_margin=polarity_drop_margin,
+            )
             edges_final = np.where(edge_mask, 255, 0)
 
         if use_thinning:

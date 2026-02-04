@@ -216,6 +216,10 @@ def _run_case(
         closing_iterations=settings["closing_iterations"],
         use_peak_refine=settings["use_peak_refine"],
         peak_fill_radius=settings["peak_fill_radius"],
+        use_polarity_filter=settings["use_polarity_filter"],
+        polarity_min_diff=settings["polarity_min_diff"],
+        polarity_min_support=settings["polarity_min_support"],
+        polarity_drop_margin=settings["polarity_drop_margin"],
         use_thinning=settings["use_thinning"],
         thinning_max_iter=settings["thinning_max_iter"],
     )
@@ -294,6 +298,10 @@ def main():
         "closing_iterations": 1,
         "use_peak_refine": False,
         "peak_fill_radius": 1,
+        "use_polarity_filter": True,
+        "polarity_min_diff": 1.0,
+        "polarity_min_support": 50,
+        "polarity_drop_margin": 0.5,
         "use_thinning": True,
         "thinning_max_iter": 15,
     }
@@ -359,7 +367,7 @@ def main():
         avg_recall = total_recall / len(cases)
         avg_intrusion = total_intrusion / len(cases)
         avg_precision = total_precision / len(cases)
-        score = avg_recall - 0.5 * avg_intrusion
+        score = avg_recall - 1.0 * avg_intrusion
         search_results.append((relax, avg_recall, avg_intrusion, avg_precision, score))
         print(
             f"relax={relax:.2f} avg_recall={avg_recall:.4f} "

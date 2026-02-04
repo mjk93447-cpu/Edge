@@ -36,6 +36,23 @@ python sobel_edge_detection.py
 
 > `tkinter`는 파이썬 기본 내장 모듈입니다.
 
+## Edge 성능 평가 (합성 이미지)
+
+OLED FCB 벤딩 루프 형태의 합성 이미지를 생성하고 에지 검출 성능을 평가합니다.
+
+```bash
+python3 edge_performance_eval.py
+```
+
+출력 폴더:
+- `outputs/perf_eval_YYYYMMDD_HHMMSS/`
+  - `bending_loop_input.png`
+  - `bending_loop_mask.png`
+  - `bending_loop_edges_green.png`
+  - `bending_loop_edges_binary.png`
+  - `bending_loop_edges_gt.png`
+  - `edge_metrics.txt`
+
 ### exe 빌드 (오프라인 배포용)
 아래 명령으로 단일 실행 파일을 생성할 수 있습니다.
 

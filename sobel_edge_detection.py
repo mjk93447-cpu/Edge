@@ -481,7 +481,7 @@ class SobelEdgeDetector:
         contrast_low_pct=2.0,
         contrast_high_pct=98.0,
         magnitude_gamma=1.0,
-        nms_relax=0.96,
+        nms_relax=0.95,
         low_ratio=0.04,
         high_ratio=0.12,
         auto_threshold=True,

@@ -154,6 +154,8 @@ class SobelEdgeDetector:
         low_percentile=35.0,
         high_percentile=80.0,
         min_threshold=1.0,
+        mad_low_k=1.5,
+        mad_high_k=3.0,
     ):
         """이중 임계값 적용"""
         if method == "percentile":
@@ -164,6 +166,15 @@ class SobelEdgeDetector:
             else:
                 high_threshold = np.percentile(sample, high_percentile)
                 low_threshold = np.percentile(sample, low_percentile)
+        elif method == "mad":
+            sample = image[image > 0]
+            if sample.size < 10:
+                sample = image
+            median = float(np.median(sample))
+            mad = float(np.median(np.abs(sample - median)))
+            sigma = 1.4826 * mad
+            high_threshold = median + mad_high_k * sigma
+            low_threshold = median + mad_low_k * sigma
         else:
             high_threshold = image.max() * high_ratio
             low_threshold = image.max() * low_ratio
@@ -250,6 +261,8 @@ class SobelEdgeDetector:
         low_percentile=35.0,
         high_percentile=80.0,
         min_threshold=1.0,
+        mad_low_k=1.5,
+        mad_high_k=3.0,
         use_soft_linking=True,
         soft_low_ratio=0.03,
         soft_high_ratio=0.1,
@@ -296,6 +309,8 @@ class SobelEdgeDetector:
                 low_percentile=low_percentile,
                 high_percentile=high_percentile,
                 min_threshold=min_threshold,
+                mad_low_k=mad_low_k,
+                mad_high_k=mad_high_k,
             )
             edges_strong = self.edge_tracking(edges_threshold, weak, strong)
 
@@ -308,6 +323,8 @@ class SobelEdgeDetector:
                     low_percentile=low_percentile,
                     high_percentile=high_percentile,
                     min_threshold=min_threshold,
+                    mad_low_k=mad_low_k,
+                    mad_high_k=mad_high_k,
                 )
                 edges_soft = self.edge_tracking(edges_threshold_soft, weak_soft, strong_soft)
                 strong_mask = edges_strong > 0

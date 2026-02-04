@@ -211,6 +211,15 @@ class SobelEdgeDetector:
 
         result[weak_mask] = 0
         return result
+
+    def dilate_binary(self, binary, radius=1):
+        """이진 이미지 팽창 (연결 보강용)"""
+        if radius <= 0:
+            return binary
+        size = radius * 2 + 1
+        padded = np.pad(binary, radius, mode="constant", constant_values=False)
+        windows = sliding_window_view(padded, (size, size))
+        return np.any(windows, axis=(-2, -1))
     
     def detect_edges(
         self,
@@ -232,6 +241,10 @@ class SobelEdgeDetector:
         low_percentile=35.0,
         high_percentile=80.0,
         min_threshold=1.0,
+        use_soft_linking=True,
+        soft_low_ratio=0.03,
+        soft_high_ratio=0.1,
+        link_radius=2,
     ):
         """전체 에지 검출 파이프라인"""
         # 1. 이미지 로드
@@ -272,7 +285,29 @@ class SobelEdgeDetector:
                 high_percentile=high_percentile,
                 min_threshold=min_threshold,
             )
-            edges_final = self.edge_tracking(edges_threshold, weak, strong)
+            edges_strong = self.edge_tracking(edges_threshold, weak, strong)
+
+            if use_soft_linking:
+                edges_threshold_soft, weak_soft, strong_soft = self.double_threshold(
+                    edges,
+                    low_ratio=soft_low_ratio,
+                    high_ratio=soft_high_ratio,
+                    method=threshold_method,
+                    low_percentile=low_percentile,
+                    high_percentile=high_percentile,
+                    min_threshold=min_threshold,
+                )
+                edges_soft = self.edge_tracking(edges_threshold_soft, weak_soft, strong_soft)
+                strong_mask = edges_strong > 0
+                soft_mask = edges_soft > 0
+                if link_radius > 0:
+                    near_strong = self.dilate_binary(strong_mask, link_radius)
+                    combined = strong_mask | (soft_mask & near_strong)
+                else:
+                    combined = strong_mask | soft_mask
+                edges_final = np.where(combined, 255, 0)
+            else:
+                edges_final = edges_strong
         else:
             # 단순 임계값
             threshold = edges.max() * 0.15

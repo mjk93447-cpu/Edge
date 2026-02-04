@@ -247,7 +247,7 @@ def main():
     detector = SobelEdgeDetector()
     strategies = [
         {
-            "name": "strict_no_thin",
+            "name": "strict_low_no_thin",
             "settings": {
                 "use_median_filter": False,
                 "median_kernel_size": 3,
@@ -259,8 +259,8 @@ def main():
                 "contrast_high_pct": 98.0,
                 "magnitude_gamma": 1.0,
                 "nms_relax": 1.0,
-                "low_ratio": 0.06,
-                "high_ratio": 0.18,
+                "low_ratio": 0.04,
+                "high_ratio": 0.12,
                 "threshold_method": "ratio",
                 "low_percentile": 35.0,
                 "high_percentile": 80.0,
@@ -284,7 +284,7 @@ def main():
             },
         },
         {
-            "name": "relaxed_no_thin",
+            "name": "strict_low_thin",
             "settings": {
                 "use_median_filter": False,
                 "median_kernel_size": 3,
@@ -295,9 +295,9 @@ def main():
                 "contrast_low_pct": 2.0,
                 "contrast_high_pct": 98.0,
                 "magnitude_gamma": 1.0,
-                "nms_relax": 0.9,
-                "low_ratio": 0.06,
-                "high_ratio": 0.18,
+                "nms_relax": 1.0,
+                "low_ratio": 0.04,
+                "high_ratio": 0.12,
                 "threshold_method": "ratio",
                 "low_percentile": 35.0,
                 "high_percentile": 80.0,
@@ -316,7 +316,7 @@ def main():
                 "use_closing": False,
                 "closing_radius": 1,
                 "closing_iterations": 1,
-                "use_thinning": False,
+                "use_thinning": True,
                 "thinning_max_iter": 15,
             },
         },
@@ -333,8 +333,8 @@ def main():
                 "contrast_high_pct": 98.0,
                 "magnitude_gamma": 1.0,
                 "nms_relax": 0.9,
-                "low_ratio": 0.06,
-                "high_ratio": 0.18,
+                "low_ratio": 0.04,
+                "high_ratio": 0.12,
                 "threshold_method": "ratio",
                 "low_percentile": 35.0,
                 "high_percentile": 80.0,

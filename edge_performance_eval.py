@@ -3,7 +3,7 @@ import time
 from datetime import datetime
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from sobel_edge_detection import SobelEdgeDetector, _make_overlay_image
 
@@ -38,6 +38,8 @@ def render_image_from_mask(
     seed=7,
     gradient_strength=0.0,
     gradient_axis="x",
+    blur_radius=0.0,
+    downscale_factor=1,
 ):
     """Render a grayscale image from a mask with mild noise."""
     image = np.full(mask.shape, background, dtype=np.float32)
@@ -54,6 +56,19 @@ def render_image_from_mask(
     rng = np.random.default_rng(seed)
     noise = rng.normal(0, noise_sigma, size=mask.shape)
     image = np.clip(image + noise, 0, 255).astype(np.uint8)
+
+    if blur_radius > 0 or downscale_factor > 1:
+        pil_img = Image.fromarray(image)
+        if downscale_factor > 1:
+            w, h = pil_img.size
+            small = pil_img.resize(
+                (max(1, w // downscale_factor), max(1, h // downscale_factor)),
+                resample=Image.BILINEAR,
+            )
+            pil_img = small.resize((w, h), resample=Image.BILINEAR)
+        if blur_radius > 0:
+            pil_img = pil_img.filter(ImageFilter.GaussianBlur(blur_radius))
+        image = np.array(pil_img, dtype=np.uint8)
     return image
 
 
@@ -127,6 +142,23 @@ def compute_intrusion(pred_edges, mask, boundary, band_radius=1):
     return intrusion_pixels, intrusion_ratio
 
 
+def compute_alignment_metrics(pred_edges, mask, boundary, band_radius=1):
+    """Measure how well edges align to boundary band."""
+    boundary_band = dilate(boundary, band_radius)
+    pred_pixels = int(pred_edges.sum())
+    if pred_pixels == 0:
+        return 0, 0.0, 0, 0.0
+
+    within_band = pred_edges & boundary_band
+    band_pixels = int(within_band.sum())
+    band_ratio = band_pixels / pred_pixels
+
+    outside = pred_edges & (~mask) & (~boundary_band)
+    outside_pixels = int(outside.sum())
+    outside_ratio = outside_pixels / pred_pixels
+    return band_pixels, band_ratio, outside_pixels, outside_ratio
+
+
 def ensure_output_dir(root="outputs"):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_dir = os.path.join(root, f"perf_eval_{timestamp}")
@@ -161,6 +193,8 @@ def _run_case(
     foreground,
     gradient_strength,
     gradient_axis,
+    blur_radius,
+    downscale_factor,
     settings,
 ):
     mask = create_bending_loop_mask(line_width=line_width)
@@ -172,6 +206,8 @@ def _run_case(
         seed=7,
         gradient_strength=gradient_strength,
         gradient_axis=gradient_axis,
+        blur_radius=blur_radius,
+        downscale_factor=downscale_factor,
     )
 
     input_path = os.path.join(output_dir, f"{name}_input.png")
@@ -220,6 +256,11 @@ def _run_case(
         polarity_min_diff=settings["polarity_min_diff"],
         polarity_min_support=settings["polarity_min_support"],
         polarity_drop_margin=settings["polarity_drop_margin"],
+        use_boundary_band_filter=settings["use_boundary_band_filter"],
+        boundary_band_radius=settings["boundary_band_radius"],
+        mask_min_area=settings["mask_min_area"],
+        mask_max_area=settings["mask_max_area"],
+        object_is_dark=settings["object_is_dark"],
         use_thinning=settings["use_thinning"],
         thinning_max_iter=settings["thinning_max_iter"],
     )
@@ -245,6 +286,13 @@ def _run_case(
     intrusion_pixels, intrusion_ratio = compute_intrusion(pred_edges, mask, gt_edges, band_radius=1)
     metrics["intrusion_pixels"] = intrusion_pixels
     metrics["intrusion_ratio"] = intrusion_ratio
+    band_pixels, band_ratio, outside_pixels, outside_ratio = compute_alignment_metrics(
+        pred_edges, mask, gt_edges, band_radius=1
+    )
+    metrics["band_pixels"] = band_pixels
+    metrics["band_ratio"] = band_ratio
+    metrics["outside_pixels"] = outside_pixels
+    metrics["outside_ratio"] = outside_ratio
     metrics["elapsed_sec"] = elapsed
     metrics["line_width"] = line_width
     metrics["noise_sigma"] = noise_sigma
@@ -252,6 +300,8 @@ def _run_case(
     metrics["foreground"] = foreground
     metrics["gradient_strength"] = gradient_strength
     metrics["gradient_axis"] = gradient_axis
+    metrics["blur_radius"] = blur_radius
+    metrics["downscale_factor"] = downscale_factor
     for key, value in settings.items():
         metrics[f"setting_{key}"] = value
 
@@ -302,6 +352,11 @@ def main():
         "polarity_min_diff": 1.0,
         "polarity_min_support": 50,
         "polarity_drop_margin": 0.5,
+        "use_boundary_band_filter": True,
+        "boundary_band_radius": 2,
+        "mask_min_area": 0.05,
+        "mask_max_area": 0.95,
+        "object_is_dark": None,
         "use_thinning": True,
         "thinning_max_iter": 15,
     }
@@ -315,6 +370,8 @@ def main():
             "foreground": 45,
             "gradient_strength": 0.0,
             "gradient_axis": "x",
+            "blur_radius": 0.0,
+            "downscale_factor": 1,
         },
         {
             "name": "bending_loop_thin",
@@ -324,6 +381,8 @@ def main():
             "foreground": 45,
             "gradient_strength": 0.0,
             "gradient_axis": "x",
+            "blur_radius": 0.0,
+            "downscale_factor": 1,
         },
         {
             "name": "fcb_side_like",
@@ -333,6 +392,19 @@ def main():
             "foreground": 155,
             "gradient_strength": 30.0,
             "gradient_axis": "y",
+            "blur_radius": 0.8,
+            "downscale_factor": 1,
+        },
+        {
+            "name": "fcb_side_low_quality",
+            "line_width": 18,
+            "noise_sigma": 8,
+            "background": 200,
+            "foreground": 175,
+            "gradient_strength": 40.0,
+            "gradient_axis": "y",
+            "blur_radius": 1.5,
+            "downscale_factor": 2,
         },
     ]
 
@@ -347,6 +419,8 @@ def main():
         total_recall = 0.0
         total_intrusion = 0.0
         total_precision = 0.0
+        total_band_ratio = 0.0
+        total_outside_ratio = 0.0
         for case in cases:
             metrics, _, _ = _run_case(
                 detector,
@@ -358,20 +432,27 @@ def main():
                 case["foreground"],
                 case["gradient_strength"],
                 case["gradient_axis"],
+                case["blur_radius"],
+                case["downscale_factor"],
                 settings,
             )
             total_recall += metrics["recall"]
             total_intrusion += metrics["intrusion_ratio"]
             total_precision += metrics["precision"]
+            total_band_ratio += metrics["band_ratio"]
+            total_outside_ratio += metrics["outside_ratio"]
 
         avg_recall = total_recall / len(cases)
         avg_intrusion = total_intrusion / len(cases)
         avg_precision = total_precision / len(cases)
-        score = avg_recall - 1.0 * avg_intrusion
+        avg_band_ratio = total_band_ratio / len(cases)
+        avg_outside_ratio = total_outside_ratio / len(cases)
+        score = avg_recall + 0.3 * avg_band_ratio - 1.2 * avg_intrusion - 0.7 * avg_outside_ratio
         search_results.append((relax, avg_recall, avg_intrusion, avg_precision, score))
         print(
             f"relax={relax:.2f} avg_recall={avg_recall:.4f} "
-            f"avg_intrusion={avg_intrusion:.4f} avg_precision={avg_precision:.4f} score={score:.4f}"
+            f"avg_intrusion={avg_intrusion:.4f} avg_band={avg_band_ratio:.4f} "
+            f"avg_outside={avg_outside_ratio:.4f} avg_precision={avg_precision:.4f} score={score:.4f}"
         )
 
     search_results.sort(key=lambda x: (x[4], x[1]), reverse=True)
@@ -380,16 +461,16 @@ def main():
 
     strategies = [
         {
-            "name": f"best_relax_{best_relax:.2f}",
-            "settings": dict(base_settings, nms_relax=best_relax),
+            "name": f"best_relax_{best_relax:.2f}_band2",
+            "settings": dict(base_settings, nms_relax=best_relax, boundary_band_radius=2),
         },
         {
-            "name": "strict_baseline",
-            "settings": dict(base_settings, nms_relax=1.0),
+            "name": f"best_relax_{best_relax:.2f}_band3",
+            "settings": dict(base_settings, nms_relax=best_relax, boundary_band_radius=3),
         },
         {
-            "name": "relaxed_090",
-            "settings": dict(base_settings, nms_relax=0.9),
+            "name": f"best_relax_{best_relax:.2f}_no_band",
+            "settings": dict(base_settings, nms_relax=best_relax, use_boundary_band_filter=False),
         },
     ]
 
@@ -412,6 +493,8 @@ def main():
                 case["foreground"],
                 case["gradient_strength"],
                 case["gradient_axis"],
+                case["blur_radius"],
+                case["downscale_factor"],
                 settings,
             )
             print(f"\nCase: {case_tag}")

@@ -384,6 +384,77 @@ class SobelEdgeDetector:
         filtered = edge_mask.copy()
         filtered[ys, xs] = keep
         return filtered
+
+    def otsu_threshold(self, image):
+        """Otsu 임계값 계산"""
+        values = image.astype(np.uint8, copy=False).ravel()
+        hist = np.bincount(values, minlength=256).astype(np.float64)
+        total = values.size
+        if total == 0:
+            return 0
+
+        sum_total = float(np.dot(np.arange(256), hist))
+        sum_b = 0.0
+        w_b = 0.0
+        max_var = -1.0
+        threshold = 0
+
+        for t in range(256):
+            w_b += hist[t]
+            if w_b == 0:
+                continue
+            w_f = total - w_b
+            if w_f == 0:
+                break
+            sum_b += t * hist[t]
+            m_b = sum_b / w_b
+            m_f = (sum_total - sum_b) / w_f
+            var_between = w_b * w_f * (m_b - m_f) ** 2
+            if var_between > max_var:
+                max_var = var_between
+                threshold = t
+        return int(threshold)
+
+    def estimate_object_mask(self, image, object_is_dark=None):
+        """Otsu 기반 마스크 추정"""
+        threshold = self.otsu_threshold(image)
+        low_mask = image <= threshold
+        high_mask = ~low_mask
+
+        if object_is_dark is None:
+            low_mean = float(image[low_mask].mean()) if np.any(low_mask) else 0.0
+            high_mean = float(image[high_mask].mean()) if np.any(high_mask) else 0.0
+            object_is_dark = low_mean < high_mean
+
+        return low_mask if object_is_dark else high_mask
+
+    def boundary_band_filter(
+        self,
+        edge_mask,
+        image,
+        band_radius=2,
+        mask_min_area=0.05,
+        mask_max_area=0.95,
+        object_is_dark=None,
+    ):
+        """경계 대역만 남겨 내부 곡선 제거"""
+        mask = self.estimate_object_mask(image, object_is_dark)
+        area_ratio = float(mask.mean())
+        if area_ratio < mask_min_area or area_ratio > mask_max_area:
+            return edge_mask
+
+        boundary = np.zeros_like(mask, dtype=bool)
+        padded = np.pad(mask, 1, mode="edge")
+        center = padded[1:-1, 1:-1]
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                neighbor = padded[1 + dy : 1 + dy + center.shape[0], 1 + dx : 1 + dx + center.shape[1]]
+                boundary |= neighbor != center
+
+        band = self.dilate_binary(boundary, band_radius)
+        return edge_mask & band
     
     def detect_edges(
         self,
@@ -426,6 +497,11 @@ class SobelEdgeDetector:
         polarity_min_diff=1.0,
         polarity_min_support=50,
         polarity_drop_margin=0.0,
+        use_boundary_band_filter=True,
+        boundary_band_radius=2,
+        mask_min_area=0.05,
+        mask_max_area=0.95,
+        object_is_dark=None,
         use_thinning=True,
         thinning_max_iter=15,
     ):
@@ -526,6 +602,18 @@ class SobelEdgeDetector:
                 min_diff=polarity_min_diff,
                 min_support=polarity_min_support,
                 drop_margin=polarity_drop_margin,
+            )
+            edges_final = np.where(edge_mask, 255, 0)
+
+        if use_boundary_band_filter:
+            edge_mask = edges_final > 0
+            edge_mask = self.boundary_band_filter(
+                edge_mask,
+                original,
+                band_radius=boundary_band_radius,
+                mask_min_area=mask_min_area,
+                mask_max_area=mask_max_area,
+                object_is_dark=object_is_dark,
             )
             edges_final = np.where(edge_mask, 255, 0)
 

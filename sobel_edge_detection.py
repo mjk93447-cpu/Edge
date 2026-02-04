@@ -836,6 +836,12 @@ class EdgeBatchGUI:
             variable=self.param_vars["auto_threshold"],
         ).grid(row=1, column=4, sticky="w", padx=(4, 0))
 
+        ttk.Checkbutton(
+            param_frame,
+            text="Use blur",
+            variable=self.param_vars["use_blur"],
+        ).grid(row=1, column=5, sticky="w", padx=(6, 0))
+
         ttk.Label(param_frame, text="Contrast ref").grid(row=2, column=0, sticky="w")
         ttk.Spinbox(
             param_frame,

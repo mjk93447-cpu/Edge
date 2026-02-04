@@ -329,6 +329,24 @@ class SobelEdgeDetector:
                 break
 
         return img.astype(bool)
+
+    def refine_edge_peaks(self, edge_mask, magnitude, direction, fill_radius=1):
+        """완화된 에지를 엄격한 피크에 맞춰 얇게 보정"""
+        strict_peaks = self.non_maximum_suppression(magnitude, direction, relax=1.0) > 0
+        refined = strict_peaks & edge_mask
+
+        if fill_radius <= 0:
+            return refined
+
+        near_refined = self.dilate_binary(refined, fill_radius)
+        uncovered = edge_mask & ~near_refined
+        if not np.any(uncovered):
+            return refined
+
+        padded = np.pad(magnitude, 1, mode="edge")
+        windows = sliding_window_view(padded, (3, 3))
+        local_max = magnitude >= windows.max(axis=(-2, -1))
+        return refined | (uncovered & local_max)
     
     def detect_edges(
         self,
@@ -344,7 +362,7 @@ class SobelEdgeDetector:
         contrast_low_pct=2.0,
         contrast_high_pct=98.0,
         magnitude_gamma=1.0,
-        nms_relax=1.0,
+        nms_relax=0.9,
         low_ratio=0.04,
         high_ratio=0.12,
         threshold_method="ratio",
@@ -365,6 +383,8 @@ class SobelEdgeDetector:
         use_closing=False,
         closing_radius=1,
         closing_iterations=1,
+        use_peak_refine=True,
+        peak_fill_radius=1,
         use_thinning=False,
         thinning_max_iter=15,
     ):
@@ -448,6 +468,11 @@ class SobelEdgeDetector:
             edge_mask = edges_final > 0
             for _ in range(max(int(closing_iterations), 1)):
                 edge_mask = self.erode_binary(self.dilate_binary(edge_mask, closing_radius), closing_radius)
+            edges_final = np.where(edge_mask, 255, 0)
+
+        if use_peak_refine:
+            edge_mask = edges_final > 0
+            edge_mask = self.refine_edge_peaks(edge_mask, magnitude, direction, peak_fill_radius)
             edges_final = np.where(edge_mask, 255, 0)
 
         if use_thinning:

@@ -278,7 +278,7 @@ class SobelEdgeDetector:
         soft_high_percentile=None,
         soft_mad_low_k=None,
         soft_mad_high_k=None,
-        use_closing=True,
+        use_closing=False,
         closing_radius=1,
         closing_iterations=1,
     ):

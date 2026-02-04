@@ -195,6 +195,7 @@ def _run_case(
     gradient_axis,
     blur_radius,
     downscale_factor,
+    seed,
     settings,
 ):
     mask = create_bending_loop_mask(line_width=line_width)
@@ -203,7 +204,7 @@ def _run_case(
         background=background,
         foreground=foreground,
         noise_sigma=noise_sigma,
-        seed=7,
+        seed=seed,
         gradient_strength=gradient_strength,
         gradient_axis=gradient_axis,
         blur_radius=blur_radius,
@@ -448,6 +449,7 @@ def main():
                 case["gradient_axis"],
                 case["blur_radius"],
                 case["downscale_factor"],
+                7,
                 settings,
             )
             total_recall += metrics["recall"]
@@ -503,6 +505,7 @@ def main():
         },
     ]
 
+    seeds = [7, 19, 42]
     print("\nPerformance evaluation complete.")
     print(f"Output directory: {output_dir}")
 
@@ -511,29 +514,45 @@ def main():
         settings = strategy["settings"]
         print(f"\n=== Strategy: {strategy_name} ===")
         for case in cases:
-            case_tag = f"{strategy_name}_{case['name']}"
-            metrics, overlay_path, missing_overlay_path = _run_case(
-                detector,
-                output_dir,
-                case_tag,
-                case["line_width"],
-                case["noise_sigma"],
-                case["background"],
-                case["foreground"],
-                case["gradient_strength"],
-                case["gradient_axis"],
-                case["blur_radius"],
-                case["downscale_factor"],
-                settings,
-            )
-            print(f"\nCase: {case_tag}")
-            print(f"- overlay: {overlay_path}")
-            print(f"- missing: {missing_overlay_path}")
-            for key, value in metrics.items():
-                if isinstance(value, float):
-                    print(f"{key}: {value:.4f}")
-                else:
-                    print(f"{key}: {value}")
+            aggregates = {}
+            for seed in seeds:
+                case_tag = f"{strategy_name}_{case['name']}_s{seed}"
+                metrics, overlay_path, missing_overlay_path = _run_case(
+                    detector,
+                    output_dir,
+                    case_tag,
+                    case["line_width"],
+                    case["noise_sigma"],
+                    case["background"],
+                    case["foreground"],
+                    case["gradient_strength"],
+                    case["gradient_axis"],
+                    case["blur_radius"],
+                    case["downscale_factor"],
+                    seed,
+                    settings,
+                )
+                print(f"\nCase: {case_tag}")
+                print(f"- overlay: {overlay_path}")
+                print(f"- missing: {missing_overlay_path}")
+                for key, value in metrics.items():
+                    if isinstance(value, float):
+                        aggregates[key] = aggregates.get(key, 0.0) + value
+                    elif isinstance(value, int):
+                        aggregates[key] = aggregates.get(key, 0) + value
+                for key, value in metrics.items():
+                    if isinstance(value, float):
+                        print(f"{key}: {value:.4f}")
+                    else:
+                        print(f"{key}: {value}")
+
+            if aggregates:
+                print(f"\nCase Average: {strategy_name}_{case['name']}")
+                for key, value in aggregates.items():
+                    if isinstance(value, float):
+                        print(f"{key}: {value / len(seeds):.4f}")
+                    else:
+                        print(f"{key}: {value / len(seeds):.2f}")
 
 
 if __name__ == "__main__":

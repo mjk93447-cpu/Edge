@@ -676,9 +676,15 @@ def _make_overlay_image(original_gray, edges):
     return overlay, edge_mask
 
 
-def process_image_file(image_path, output_dir, detector):
+def process_image_file(image_path, output_dir, detector, settings=None):
     """단일 이미지 처리 및 결과 저장"""
-    results = detector.detect_edges(image_path, use_nms=True, use_hysteresis=True)
+    settings = settings or {}
+    results = detector.detect_edges(
+        image_path,
+        use_nms=True,
+        use_hysteresis=True,
+        **settings,
+    )
     overlay, edge_mask = _make_overlay_image(results['original'], results['edges'])
 
     base_name = os.path.splitext(os.path.basename(image_path))[0]
@@ -702,7 +708,7 @@ class EdgeBatchGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Sobel Edge Batch Processor")
-        self.root.geometry("720x480")
+        self.root.geometry("920x720")
 
         self.detector = SobelEdgeDetector()
         self.selected_files = []
@@ -711,8 +717,36 @@ class EdgeBatchGUI:
 
         self._message_queue = queue.Queue()
         self._worker_thread = None
+        self._auto_thread = None
+        self.param_vars = self._init_param_vars()
+        self.auto_mode = tk.StringVar(value="빠름")
+        self.log_text = None
 
         self._build_ui()
+
+    def _init_param_vars(self):
+        return {
+            "nms_relax": tk.DoubleVar(value=0.95),
+            "low_ratio": tk.DoubleVar(value=0.04),
+            "high_ratio": tk.DoubleVar(value=0.12),
+            "use_blur": tk.BooleanVar(value=True),
+            "blur_sigma": tk.DoubleVar(value=1.2),
+            "blur_kernel_size": tk.IntVar(value=5),
+            "auto_threshold": tk.BooleanVar(value=True),
+            "contrast_ref": tk.DoubleVar(value=80.0),
+            "min_threshold_scale": tk.DoubleVar(value=0.5),
+            "use_thinning": tk.BooleanVar(value=True),
+            "thinning_max_iter": tk.IntVar(value=15),
+            "use_boundary_band_filter": tk.BooleanVar(value=True),
+            "boundary_band_radius": tk.IntVar(value=2),
+            "object_is_dark": tk.BooleanVar(value=True),
+            "use_mask_blur": tk.BooleanVar(value=True),
+            "mask_blur_sigma": tk.DoubleVar(value=1.0),
+            "mask_blur_kernel_size": tk.IntVar(value=5),
+            "mask_close_radius": tk.IntVar(value=1),
+            "use_polarity_filter": tk.BooleanVar(value=True),
+            "polarity_drop_margin": tk.DoubleVar(value=0.5),
+        }
 
     def _build_ui(self):
         main_frame = ttk.Frame(self.root, padding=12)
@@ -736,24 +770,429 @@ class EdgeBatchGUI:
         list_frame = ttk.Frame(main_frame)
         list_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.file_listbox = tk.Listbox(list_frame, height=12)
+        self.file_listbox = tk.Listbox(list_frame, height=8)
         self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.file_listbox.config(yscrollcommand=scrollbar.set)
 
+        param_frame = ttk.LabelFrame(main_frame, text="파라미터 설정")
+        param_frame.pack(fill=tk.X, pady=(8, 6))
+
+        ttk.Label(param_frame, text="NMS relax").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.85,
+            to=1.0,
+            increment=0.01,
+            textvariable=self.param_vars["nms_relax"],
+            width=6,
+        ).grid(row=0, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(param_frame, text="Low ratio").grid(row=0, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.01,
+            to=0.2,
+            increment=0.01,
+            textvariable=self.param_vars["low_ratio"],
+            width=6,
+        ).grid(row=0, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(param_frame, text="High ratio").grid(row=0, column=4, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.05,
+            to=0.4,
+            increment=0.01,
+            textvariable=self.param_vars["high_ratio"],
+            width=6,
+        ).grid(row=0, column=5, sticky="w", padx=(4, 0))
+
+        ttk.Label(param_frame, text="Blur sigma").grid(row=1, column=0, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.3,
+            to=3.0,
+            increment=0.1,
+            textvariable=self.param_vars["blur_sigma"],
+            width=6,
+        ).grid(row=1, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(param_frame, text="Blur kernel").grid(row=1, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=3,
+            to=9,
+            increment=2,
+            textvariable=self.param_vars["blur_kernel_size"],
+            width=6,
+        ).grid(row=1, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Auto threshold",
+            variable=self.param_vars["auto_threshold"],
+        ).grid(row=1, column=4, sticky="w", padx=(4, 0))
+
+        ttk.Label(param_frame, text="Contrast ref").grid(row=2, column=0, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=20,
+            to=160,
+            increment=5,
+            textvariable=self.param_vars["contrast_ref"],
+            width=6,
+        ).grid(row=2, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(param_frame, text="Min scale").grid(row=2, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.2,
+            to=1.0,
+            increment=0.1,
+            textvariable=self.param_vars["min_threshold_scale"],
+            width=6,
+        ).grid(row=2, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Thinning (1px)",
+            variable=self.param_vars["use_thinning"],
+        ).grid(row=2, column=4, sticky="w", padx=(4, 0))
+
+        ttk.Label(param_frame, text="Thinning iters").grid(row=2, column=5, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=5,
+            to=30,
+            increment=1,
+            textvariable=self.param_vars["thinning_max_iter"],
+            width=5,
+        ).grid(row=2, column=6, sticky="w")
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Boundary band",
+            variable=self.param_vars["use_boundary_band_filter"],
+        ).grid(row=3, column=0, sticky="w")
+
+        ttk.Label(param_frame, text="Band radius").grid(row=3, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["boundary_band_radius"],
+            width=6,
+        ).grid(row=3, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Object dark",
+            variable=self.param_vars["object_is_dark"],
+        ).grid(row=3, column=4, sticky="w", padx=(4, 0))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Mask blur",
+            variable=self.param_vars["use_mask_blur"],
+        ).grid(row=4, column=0, sticky="w")
+
+        ttk.Label(param_frame, text="Mask sigma").grid(row=4, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.5,
+            to=3.0,
+            increment=0.1,
+            textvariable=self.param_vars["mask_blur_sigma"],
+            width=6,
+        ).grid(row=4, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(param_frame, text="Mask close").grid(row=4, column=4, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0,
+            to=3,
+            increment=1,
+            textvariable=self.param_vars["mask_close_radius"],
+            width=6,
+        ).grid(row=4, column=5, sticky="w", padx=(4, 0))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Polarity filter",
+            variable=self.param_vars["use_polarity_filter"],
+        ).grid(row=5, column=0, sticky="w")
+
+        ttk.Label(param_frame, text="Polarity margin").grid(row=5, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.1,
+            textvariable=self.param_vars["polarity_drop_margin"],
+            width=6,
+        ).grid(row=5, column=3, sticky="w", padx=(4, 12))
+
+        guide_frame = ttk.LabelFrame(main_frame, text="튜닝 가이드")
+        guide_frame.pack(fill=tk.X, pady=(6, 6))
+        guide_text = tk.Text(guide_frame, height=6, wrap="word")
+        guide_text.insert(
+            "1.0",
+            "- NMS relax 낮추면 끊김 감소, 너무 낮으면 두꺼워짐\n"
+            "- Low/High ratio 낮추면 검출율 증가, 내부 침범/노이즈 증가\n"
+            "- Boundary band는 내부 침범 억제 (작을수록 바깥 테두리 엄격)\n"
+            "- Polarity filter는 내부 곡선 제거에 도움\n"
+            "- Thinning은 1픽셀 두께 유지, 끊김이 있으면 NMS relax 조정\n"
+            "- Auto threshold는 저대비 이미지에서 임계값 자동 보정\n",
+        )
+        guide_text.configure(state="disabled")
+        guide_text.pack(fill=tk.X)
+        self.log_text = tk.Text(main_frame, height=6, wrap="word")
+        self.log_text.pack(fill=tk.BOTH, pady=(6, 6))
+
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(10, 6))
 
         ttk.Button(button_frame, text="파일 추가", command=self._add_files).pack(side=tk.LEFT)
         ttk.Button(button_frame, text="목록 비우기", command=self._clear_files).pack(side=tk.LEFT, padx=6)
+        ttk.Label(button_frame, text="자동탐색 모드").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Combobox(
+            button_frame,
+            textvariable=self.auto_mode,
+            values=["빠름", "정밀"],
+            width=6,
+            state="readonly",
+        ).pack(side=tk.LEFT)
+        self.auto_button = ttk.Button(button_frame, text="자동 최적화", command=self._start_auto_optimize)
+        self.auto_button.pack(side=tk.LEFT, padx=6)
         self.start_button = ttk.Button(button_frame, text="처리 시작", command=self._start_processing)
         self.start_button.pack(side=tk.RIGHT)
 
         self.status_var = tk.StringVar(value="대기 중...")
         status_label = ttk.Label(main_frame, textvariable=self.status_var)
         status_label.pack(anchor="w", pady=(6, 0))
+
+    def _log(self, message):
+        if not self.log_text:
+            return
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+
+    def _get_param_settings(self):
+        def get_float(key):
+            return float(self.param_vars[key].get())
+
+        def get_int(key):
+            return int(self.param_vars[key].get())
+
+        nms_relax = get_float("nms_relax")
+        low_ratio = get_float("low_ratio")
+        high_ratio = get_float("high_ratio")
+        if high_ratio <= 0 or low_ratio <= 0:
+            raise ValueError("Low/High ratio는 0보다 커야 합니다.")
+        if low_ratio >= high_ratio:
+            low_ratio = high_ratio * 0.5
+
+        settings = {
+            "nms_relax": nms_relax,
+            "low_ratio": low_ratio,
+            "high_ratio": high_ratio,
+            "use_blur": bool(self.param_vars["use_blur"].get()),
+            "blur_sigma": get_float("blur_sigma"),
+            "blur_kernel_size": max(3, get_int("blur_kernel_size")),
+            "auto_threshold": bool(self.param_vars["auto_threshold"].get()),
+            "contrast_ref": get_float("contrast_ref"),
+            "min_threshold_scale": get_float("min_threshold_scale"),
+            "use_thinning": bool(self.param_vars["use_thinning"].get()),
+            "thinning_max_iter": max(1, get_int("thinning_max_iter")),
+            "use_boundary_band_filter": bool(self.param_vars["use_boundary_band_filter"].get()),
+            "boundary_band_radius": max(1, get_int("boundary_band_radius")),
+            "object_is_dark": bool(self.param_vars["object_is_dark"].get()),
+            "use_mask_blur": bool(self.param_vars["use_mask_blur"].get()),
+            "mask_blur_sigma": get_float("mask_blur_sigma"),
+            "mask_blur_kernel_size": max(3, get_int("mask_blur_kernel_size")),
+            "mask_close_radius": max(0, get_int("mask_close_radius")),
+            "use_polarity_filter": bool(self.param_vars["use_polarity_filter"].get()),
+            "polarity_drop_margin": get_float("polarity_drop_margin"),
+            "polarity_min_diff": 1.0,
+            "polarity_min_support": 50,
+            "mask_min_area": 0.05,
+            "mask_max_area": 0.95,
+            "use_peak_refine": False,
+            "peak_fill_radius": 1,
+        }
+        return settings
+
+    def _apply_settings(self, settings):
+        for key, var in self.param_vars.items():
+            if key in settings:
+                var.set(settings[key])
+
+    def _compute_boundary(self, mask):
+        padded = np.pad(mask, 1, mode="edge")
+        center = padded[1:-1, 1:-1]
+        boundary = np.zeros_like(center, dtype=bool)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dy == 0 and dx == 0:
+                    continue
+                neighbor = padded[1 + dy : 1 + dy + center.shape[0], 1 + dx : 1 + dx + center.shape[1]]
+                boundary |= neighbor != center
+        return boundary
+
+    def _evaluate_settings(self, files, settings, max_files):
+        subset = files[:max_files]
+        total_score = 0.0
+        total_coverage = 0.0
+        total_intrusion = 0.0
+        total_outside = 0.0
+        total_edges = 0
+
+        for path in subset:
+            image = self.detector.load_image(path)
+            mask_source = image
+            if settings["use_mask_blur"]:
+                mask_source = self.detector.apply_gaussian_blur(
+                    image, settings["mask_blur_kernel_size"], settings["mask_blur_sigma"]
+                )
+            mask = self.detector.estimate_object_mask(mask_source, settings["object_is_dark"])
+            if settings["mask_close_radius"] > 0:
+                mask = self.detector.erode_binary(
+                    self.detector.dilate_binary(mask, settings["mask_close_radius"]),
+                    settings["mask_close_radius"],
+                )
+
+            boundary = self._compute_boundary(mask)
+            band = self.detector.dilate_binary(boundary, settings["boundary_band_radius"])
+
+            results = self.detector.detect_edges(
+                path,
+                use_nms=True,
+                use_hysteresis=True,
+                **settings,
+            )
+            edges = results["edges"] > 0
+            edge_pixels = int(edges.sum())
+            if edge_pixels == 0:
+                continue
+
+            band_pixels = int(band.sum())
+            edges_in_band = int((edges & band).sum())
+            intrusion = int((edges & mask & ~band).sum())
+            outside = int((edges & ~mask & ~band).sum())
+
+            coverage = edges_in_band / band_pixels if band_pixels else 0.0
+            intrusion_ratio = intrusion / edge_pixels
+            outside_ratio = outside / edge_pixels
+
+            score = coverage - 1.2 * intrusion_ratio - 0.7 * outside_ratio
+            total_score += score
+            total_coverage += coverage
+            total_intrusion += intrusion_ratio
+            total_outside += outside_ratio
+            total_edges += 1
+
+        if total_edges == 0:
+            return -1.0, {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0}
+
+        avg_score = total_score / total_edges
+        summary = {
+            "coverage": total_coverage / total_edges,
+            "intrusion": total_intrusion / total_edges,
+            "outside": total_outside / total_edges,
+        }
+        return avg_score, summary
+
+    def _build_candidates(self, base_settings, mode):
+        nms_current = base_settings["nms_relax"]
+        if mode == "정밀":
+            nms_list = [nms_current - 0.04, nms_current - 0.02, nms_current, nms_current + 0.02, nms_current + 0.04]
+            band_list = [1, 2, 3]
+            high_list = [0.10, 0.12, 0.14]
+            margin_list = [0.0, base_settings["polarity_drop_margin"], 0.8]
+        else:
+            nms_list = [nms_current - 0.02, nms_current, nms_current + 0.02]
+            band_list = [1, 2]
+            high_list = [0.10, 0.12]
+            margin_list = [0.0, base_settings["polarity_drop_margin"]]
+
+        candidates = []
+        for nms_relax in nms_list:
+            if nms_relax < 0.88 or nms_relax > 1.0:
+                continue
+            for high_ratio in high_list:
+                low_ratio = max(0.02, high_ratio * 0.33)
+                for band_radius in band_list:
+                    for margin in margin_list:
+                        settings = dict(base_settings)
+                        settings.update(
+                            {
+                                "nms_relax": round(nms_relax, 2),
+                                "high_ratio": high_ratio,
+                                "low_ratio": low_ratio,
+                                "boundary_band_radius": band_radius,
+                                "polarity_drop_margin": margin,
+                            }
+                        )
+                        candidates.append(settings)
+        return candidates
+
+    def _start_auto_optimize(self):
+        if self._worker_thread and self._worker_thread.is_alive():
+            messagebox.showwarning("진행 중", "현재 처리 중입니다.")
+            return
+        if not self.selected_files:
+            self._add_files()
+        if not self.selected_files:
+            return
+
+        try:
+            base_settings = self._get_param_settings()
+        except ValueError as exc:
+            messagebox.showerror("파라미터 오류", str(exc))
+            return
+
+        mode = self.auto_mode.get()
+        self.status_var.set("자동 최적화 시작...")
+        self.start_button.config(state=tk.DISABLED)
+        self.auto_button.config(state=tk.DISABLED)
+        self._worker_thread = threading.Thread(
+            target=self._auto_optimize_worker,
+            args=(list(self.selected_files), base_settings, mode),
+            daemon=True,
+        )
+        self._worker_thread.start()
+        self.root.after(100, self._poll_messages)
+
+    def _auto_optimize_worker(self, files, base_settings, mode):
+        candidates = self._build_candidates(base_settings, mode)
+        max_files = 8 if mode == "빠름" else 15
+        best = None
+        best_score = -1e9
+        report_lines = []
+
+        for idx, settings in enumerate(candidates, start=1):
+            score, summary = self._evaluate_settings(files, settings, max_files)
+            report_lines.append(
+                f"{idx:03d} score={score:.4f} coverage={summary['coverage']:.4f} "
+                f"intrusion={summary['intrusion']:.4f} outside={summary['outside']:.4f} "
+                f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
+                f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
+            )
+            if score > best_score:
+                best_score = score
+                best = settings
+            self._message_queue.put(("auto_progress", idx, len(candidates), best_score))
+
+        report_dir = self._create_batch_output_dir()
+        report_path = os.path.join(report_dir, "auto_optimize_report.txt")
+        with open(report_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(report_lines))
+
+        self._message_queue.put(("auto_done", best, report_path))
 
     def _choose_output_dir(self):
         selected = filedialog.askdirectory(title="출력 폴더 선택")
@@ -799,13 +1238,20 @@ class EdgeBatchGUI:
             messagebox.showwarning("진행 중", "현재 처리 중입니다.")
             return
 
+        try:
+            settings = self._get_param_settings()
+        except ValueError as exc:
+            messagebox.showerror("파라미터 오류", str(exc))
+            return
+
         batch_dir = self._create_batch_output_dir()
         self.status_var.set(f"처리 시작... (저장 위치: {batch_dir})")
         self.start_button.config(state=tk.DISABLED)
+        self.auto_button.config(state=tk.DISABLED)
 
         self._worker_thread = threading.Thread(
             target=self._process_batch,
-            args=(batch_dir, list(self.selected_files)),
+            args=(batch_dir, list(self.selected_files), settings),
             daemon=True,
         )
         self._worker_thread.start()
@@ -822,11 +1268,11 @@ class EdgeBatchGUI:
         os.makedirs(candidate, exist_ok=True)
         return candidate
 
-    def _process_batch(self, batch_dir, files):
+    def _process_batch(self, batch_dir, files, settings):
         total = len(files)
         for idx, path in enumerate(files, start=1):
             try:
-                process_image_file(path, batch_dir, self.detector)
+                process_image_file(path, batch_dir, self.detector, settings)
                 self._message_queue.put(("progress", idx, total, os.path.basename(path)))
             except Exception as exc:
                 self._message_queue.put(("error", path, str(exc)))
@@ -844,6 +1290,8 @@ class EdgeBatchGUI:
             self.root.after(120, self._poll_messages)
         else:
             self.start_button.config(state=tk.NORMAL)
+            if self.auto_button:
+                self.auto_button.config(state=tk.NORMAL)
 
     def _handle_message(self, msg):
         msg_type = msg[0]
@@ -856,6 +1304,15 @@ class EdgeBatchGUI:
         elif msg_type == "done":
             batch_dir = msg[1]
             self.status_var.set(f"완료! 결과 저장 위치: {batch_dir}")
+        elif msg_type == "auto_progress":
+            idx, total, best_score = msg[1], msg[2], msg[3]
+            self.status_var.set(f"자동 최적화 중... ({idx}/{total}) best={best_score:.4f}")
+        elif msg_type == "auto_done":
+            settings, report_path = msg[1], msg[2]
+            if settings:
+                self._apply_settings(settings)
+            self.status_var.set(f"자동 최적화 완료! 보고서: {report_path}")
+            self._log(f"[AUTO] 최적화 완료: {report_path}")
 
 
 def main():

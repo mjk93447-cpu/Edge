@@ -66,6 +66,19 @@ class SobelEdgeDetector:
         kernel /= np.sum(kernel)
         return self.apply_convolution(image, kernel)
 
+    def apply_median_filter(self, image, kernel_size=3):
+        """메디안 필터로 노이즈를 줄이고 경계를 보존"""
+        if kernel_size < 3:
+            return image
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+
+        radius = kernel_size // 2
+        padded = np.pad(image, radius, mode="edge")
+        windows = sliding_window_view(padded, (kernel_size, kernel_size))
+        median = np.median(windows, axis=(-2, -1))
+        return median.astype(np.float32, copy=False)
+
     def contrast_stretch(self, image, low_pct=2.0, high_pct=98.0):
         """저대비 영역을 늘려 약한 에지를 강화"""
         low_pct = float(low_pct)
@@ -204,16 +217,18 @@ class SobelEdgeDetector:
         image_path,
         use_nms=True,
         use_hysteresis=True,
+        use_median_filter=True,
+        median_kernel_size=3,
         use_blur=True,
         blur_kernel_size=3,
-        blur_sigma=0.9,
-        use_contrast_stretch=True,
+        blur_sigma=0.7,
+        use_contrast_stretch=False,
         contrast_low_pct=2.0,
         contrast_high_pct=98.0,
         magnitude_gamma=1.0,
-        low_ratio=0.06,
-        high_ratio=0.18,
-        threshold_method="percentile",
+        low_ratio=0.04,
+        high_ratio=0.12,
+        threshold_method="ratio",
         low_percentile=35.0,
         high_percentile=80.0,
         min_threshold=1.0,
@@ -223,11 +238,15 @@ class SobelEdgeDetector:
         image = self.load_image(image_path)
         original = image.copy()
 
-        # 1-1. 블러로 노이즈 완화
+        # 1-1. 메디안 필터로 약한 노이즈 제거
+        if use_median_filter:
+            image = self.apply_median_filter(image, median_kernel_size)
+
+        # 1-2. 블러로 노이즈 완화
         if use_blur:
             image = self.apply_gaussian_blur(image, blur_kernel_size, blur_sigma)
 
-        # 1-2. 저대비 보정
+        # 1-3. 저대비 보정
         if use_contrast_stretch:
             image = self.contrast_stretch(image, contrast_low_pct, contrast_high_pct)
         

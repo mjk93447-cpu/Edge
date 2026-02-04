@@ -261,6 +261,10 @@ def _run_case(
         mask_min_area=settings["mask_min_area"],
         mask_max_area=settings["mask_max_area"],
         object_is_dark=settings["object_is_dark"],
+        use_mask_blur=settings["use_mask_blur"],
+        mask_blur_kernel_size=settings["mask_blur_kernel_size"],
+        mask_blur_sigma=settings["mask_blur_sigma"],
+        mask_close_radius=settings["mask_close_radius"],
         use_thinning=settings["use_thinning"],
         thinning_max_iter=settings["thinning_max_iter"],
     )
@@ -356,7 +360,11 @@ def main():
         "boundary_band_radius": 2,
         "mask_min_area": 0.05,
         "mask_max_area": 0.95,
-        "object_is_dark": None,
+        "object_is_dark": True,
+        "use_mask_blur": True,
+        "mask_blur_kernel_size": 5,
+        "mask_blur_sigma": 1.0,
+        "mask_close_radius": 1,
         "use_thinning": True,
         "thinning_max_iter": 15,
     }

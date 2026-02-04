@@ -435,13 +435,24 @@ class SobelEdgeDetector:
         band_radius=2,
         mask_min_area=0.05,
         mask_max_area=0.95,
-        object_is_dark=None,
+        object_is_dark=True,
+        use_mask_blur=True,
+        mask_blur_kernel_size=5,
+        mask_blur_sigma=1.0,
+        mask_close_radius=1,
     ):
         """경계 대역만 남겨 내부 곡선 제거"""
-        mask = self.estimate_object_mask(image, object_is_dark)
+        mask_source = image
+        if use_mask_blur:
+            mask_source = self.apply_gaussian_blur(image, mask_blur_kernel_size, mask_blur_sigma)
+
+        mask = self.estimate_object_mask(mask_source, object_is_dark)
         area_ratio = float(mask.mean())
         if area_ratio < mask_min_area or area_ratio > mask_max_area:
             return edge_mask
+
+        if mask_close_radius > 0:
+            mask = self.erode_binary(self.dilate_binary(mask, mask_close_radius), mask_close_radius)
 
         boundary = np.zeros_like(mask, dtype=bool)
         padded = np.pad(mask, 1, mode="edge")
@@ -501,7 +512,11 @@ class SobelEdgeDetector:
         boundary_band_radius=2,
         mask_min_area=0.05,
         mask_max_area=0.95,
-        object_is_dark=None,
+        object_is_dark=True,
+        use_mask_blur=True,
+        mask_blur_kernel_size=5,
+        mask_blur_sigma=1.0,
+        mask_close_radius=1,
         use_thinning=True,
         thinning_max_iter=15,
     ):
@@ -614,6 +629,10 @@ class SobelEdgeDetector:
                 mask_min_area=mask_min_area,
                 mask_max_area=mask_max_area,
                 object_is_dark=object_is_dark,
+                use_mask_blur=use_mask_blur,
+                mask_blur_kernel_size=mask_blur_kernel_size,
+                mask_blur_sigma=mask_blur_sigma,
+                mask_close_radius=mask_close_radius,
             )
             edges_final = np.where(edge_mask, 255, 0)
 

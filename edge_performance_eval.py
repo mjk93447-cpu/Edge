@@ -30,10 +30,26 @@ def create_bending_loop_mask(width=640, height=480, line_width=42):
     return np.array(mask_img, dtype=np.uint8)
 
 
-def render_image_from_mask(mask, background=230, foreground=45, noise_sigma=4, seed=7):
+def render_image_from_mask(
+    mask,
+    background=230,
+    foreground=45,
+    noise_sigma=4,
+    seed=7,
+    gradient_strength=0.0,
+    gradient_axis="x",
+):
     """Render a grayscale image from a mask with mild noise."""
     image = np.full(mask.shape, background, dtype=np.float32)
     image[mask > 0] = foreground
+
+    if gradient_strength:
+        if gradient_axis == "y":
+            grad = np.linspace(-gradient_strength / 2, gradient_strength / 2, mask.shape[0])
+            image += grad[:, None]
+        else:
+            grad = np.linspace(-gradient_strength / 2, gradient_strength / 2, mask.shape[1])
+            image += grad[None, :]
 
     rng = np.random.default_rng(seed)
     noise = rng.normal(0, noise_sigma, size=mask.shape)
@@ -132,6 +148,8 @@ def _run_case(
     noise_sigma,
     background,
     foreground,
+    gradient_strength,
+    gradient_axis,
     settings,
 ):
     mask = create_bending_loop_mask(line_width=line_width)
@@ -141,6 +159,8 @@ def _run_case(
         foreground=foreground,
         noise_sigma=noise_sigma,
         seed=7,
+        gradient_strength=gradient_strength,
+        gradient_axis=gradient_axis,
     )
 
     input_path = os.path.join(output_dir, f"{name}_input.png")
@@ -183,6 +203,8 @@ def _run_case(
         use_closing=settings["use_closing"],
         closing_radius=settings["closing_radius"],
         closing_iterations=settings["closing_iterations"],
+        use_thinning=settings["use_thinning"],
+        thinning_max_iter=settings["thinning_max_iter"],
     )
     elapsed = time.perf_counter() - start
 
@@ -208,6 +230,8 @@ def _run_case(
     metrics["noise_sigma"] = noise_sigma
     metrics["background"] = background
     metrics["foreground"] = foreground
+    metrics["gradient_strength"] = gradient_strength
+    metrics["gradient_axis"] = gradient_axis
     for key, value in settings.items():
         metrics[f"setting_{key}"] = value
 
@@ -223,7 +247,7 @@ def main():
     detector = SobelEdgeDetector()
     strategies = [
         {
-            "name": "ratio_strict",
+            "name": "strict_no_thin",
             "settings": {
                 "use_median_filter": False,
                 "median_kernel_size": 3,
@@ -255,10 +279,12 @@ def main():
                 "use_closing": False,
                 "closing_radius": 1,
                 "closing_iterations": 1,
+                "use_thinning": False,
+                "thinning_max_iter": 15,
             },
         },
         {
-            "name": "ratio_relaxed_nms",
+            "name": "relaxed_no_thin",
             "settings": {
                 "use_median_filter": False,
                 "median_kernel_size": 3,
@@ -290,10 +316,12 @@ def main():
                 "use_closing": False,
                 "closing_radius": 1,
                 "closing_iterations": 1,
+                "use_thinning": False,
+                "thinning_max_iter": 15,
             },
         },
         {
-            "name": "ratio_relaxed_nms_closing",
+            "name": "relaxed_thin",
             "settings": {
                 "use_median_filter": False,
                 "median_kernel_size": 3,
@@ -322,17 +350,43 @@ def main():
                 "soft_high_percentile": None,
                 "soft_mad_low_k": None,
                 "soft_mad_high_k": None,
-                "use_closing": True,
+                "use_closing": False,
                 "closing_radius": 1,
                 "closing_iterations": 1,
+                "use_thinning": True,
+                "thinning_max_iter": 15,
             },
         },
     ]
 
     cases = [
-        {"name": "bending_loop", "line_width": 42, "noise_sigma": 4, "background": 230, "foreground": 45},
-        {"name": "bending_loop_thin", "line_width": 24, "noise_sigma": 5, "background": 230, "foreground": 45},
-        {"name": "bending_loop_faint_thin", "line_width": 18, "noise_sigma": 6, "background": 190, "foreground": 155},
+        {
+            "name": "bending_loop",
+            "line_width": 42,
+            "noise_sigma": 4,
+            "background": 230,
+            "foreground": 45,
+            "gradient_strength": 0.0,
+            "gradient_axis": "x",
+        },
+        {
+            "name": "bending_loop_thin",
+            "line_width": 24,
+            "noise_sigma": 5,
+            "background": 230,
+            "foreground": 45,
+            "gradient_strength": 0.0,
+            "gradient_axis": "x",
+        },
+        {
+            "name": "fcb_side_like",
+            "line_width": 18,
+            "noise_sigma": 6,
+            "background": 190,
+            "foreground": 155,
+            "gradient_strength": 30.0,
+            "gradient_axis": "y",
+        },
     ]
 
     print("Performance evaluation complete.")
@@ -352,6 +406,8 @@ def main():
                 case["noise_sigma"],
                 case["background"],
                 case["foreground"],
+                case["gradient_strength"],
+                case["gradient_axis"],
                 settings,
             )
             print(f"\nCase: {case_tag}")

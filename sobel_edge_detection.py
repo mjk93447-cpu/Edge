@@ -245,6 +245,90 @@ class SobelEdgeDetector:
         padded = np.pad(binary, radius, mode="constant", constant_values=False)
         windows = sliding_window_view(padded, (size, size))
         return np.all(windows, axis=(-2, -1))
+
+    def thin_edges_zhang_suen(self, binary, max_iter=20):
+        """Zhang-Suen 알고리즘으로 1픽셀 두께로 박리"""
+        img = binary.astype(np.uint8, copy=True)
+        if img.size == 0:
+            return binary
+
+        for _ in range(max(int(max_iter), 1)):
+            changed = False
+
+            P2 = img[:-2, 1:-1] == 1
+            P3 = img[:-2, 2:] == 1
+            P4 = img[1:-1, 2:] == 1
+            P5 = img[2:, 2:] == 1
+            P6 = img[2:, 1:-1] == 1
+            P7 = img[2:, :-2] == 1
+            P8 = img[1:-1, :-2] == 1
+            P9 = img[:-2, :-2] == 1
+
+            B = (
+                P2.astype(np.uint8)
+                + P3.astype(np.uint8)
+                + P4.astype(np.uint8)
+                + P5.astype(np.uint8)
+                + P6.astype(np.uint8)
+                + P7.astype(np.uint8)
+                + P8.astype(np.uint8)
+                + P9.astype(np.uint8)
+            )
+            A = (
+                (~P2 & P3).astype(np.uint8)
+                + (~P3 & P4).astype(np.uint8)
+                + (~P4 & P5).astype(np.uint8)
+                + (~P5 & P6).astype(np.uint8)
+                + (~P6 & P7).astype(np.uint8)
+                + (~P7 & P8).astype(np.uint8)
+                + (~P8 & P9).astype(np.uint8)
+                + (~P9 & P2).astype(np.uint8)
+            )
+
+            m1 = (A == 1) & (B >= 2) & (B <= 6) & ~(P2 & P4 & P6) & ~(P4 & P6 & P8)
+            if np.any(m1):
+                img[1:-1, 1:-1][m1] = 0
+                changed = True
+
+            P2 = img[:-2, 1:-1] == 1
+            P3 = img[:-2, 2:] == 1
+            P4 = img[1:-1, 2:] == 1
+            P5 = img[2:, 2:] == 1
+            P6 = img[2:, 1:-1] == 1
+            P7 = img[2:, :-2] == 1
+            P8 = img[1:-1, :-2] == 1
+            P9 = img[:-2, :-2] == 1
+
+            B = (
+                P2.astype(np.uint8)
+                + P3.astype(np.uint8)
+                + P4.astype(np.uint8)
+                + P5.astype(np.uint8)
+                + P6.astype(np.uint8)
+                + P7.astype(np.uint8)
+                + P8.astype(np.uint8)
+                + P9.astype(np.uint8)
+            )
+            A = (
+                (~P2 & P3).astype(np.uint8)
+                + (~P3 & P4).astype(np.uint8)
+                + (~P4 & P5).astype(np.uint8)
+                + (~P5 & P6).astype(np.uint8)
+                + (~P6 & P7).astype(np.uint8)
+                + (~P7 & P8).astype(np.uint8)
+                + (~P8 & P9).astype(np.uint8)
+                + (~P9 & P2).astype(np.uint8)
+            )
+
+            m2 = (A == 1) & (B >= 2) & (B <= 6) & ~(P2 & P4 & P8) & ~(P2 & P6 & P8)
+            if np.any(m2):
+                img[1:-1, 1:-1][m2] = 0
+                changed = True
+
+            if not changed:
+                break
+
+        return img.astype(bool)
     
     def detect_edges(
         self,
@@ -281,6 +365,8 @@ class SobelEdgeDetector:
         use_closing=False,
         closing_radius=1,
         closing_iterations=1,
+        use_thinning=True,
+        thinning_max_iter=15,
     ):
         """전체 에지 검출 파이프라인"""
         # 1. 이미지 로드
@@ -362,6 +448,11 @@ class SobelEdgeDetector:
             edge_mask = edges_final > 0
             for _ in range(max(int(closing_iterations), 1)):
                 edge_mask = self.erode_binary(self.dilate_binary(edge_mask, closing_radius), closing_radius)
+            edges_final = np.where(edge_mask, 255, 0)
+
+        if use_thinning:
+            edge_mask = edges_final > 0
+            edge_mask = self.thin_edges_zhang_suen(edge_mask, thinning_max_iter)
             edges_final = np.where(edge_mask, 255, 0)
 
         edges_final = edges_final.astype(np.uint8)

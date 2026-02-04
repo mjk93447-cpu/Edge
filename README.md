@@ -63,3 +63,11 @@ pyinstaller --onefile --windowed --name edge_batch_gui.exe sobel_edge_detection.
 
 생성된 실행 파일:
 - `dist/edge_batch_gui.exe`
+
+### Windows EXE 자동 빌드 & 다운로드
+GitHub Actions에서 Windows 실행 파일을 자동으로 빌드하고 아티팩트로 제공합니다.
+
+1. GitHub 저장소의 **Actions** 탭으로 이동
+2. 워크플로우 **Build Windows EXE** 선택
+3. **Run workflow** 실행
+4. 실행 완료 후 **Artifacts**에서 `edge_batch_gui_windows` 다운로드

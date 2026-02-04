@@ -116,6 +116,17 @@ def evaluate_edges(pred_edges, gt_edges, tolerance=1):
     }
 
 
+def compute_intrusion(pred_edges, mask, boundary, band_radius=1):
+    """Measure how much edges intrude into object interior."""
+    boundary_band = dilate(boundary, band_radius)
+    interior = (mask > 0) & ~boundary_band
+    intrusion = pred_edges & interior
+    intrusion_pixels = int(intrusion.sum())
+    pred_pixels = int(pred_edges.sum())
+    intrusion_ratio = intrusion_pixels / pred_pixels if pred_pixels else 0.0
+    return intrusion_pixels, intrusion_ratio
+
+
 def ensure_output_dir(root="outputs"):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_dir = os.path.join(root, f"perf_eval_{timestamp}")
@@ -227,6 +238,9 @@ def _run_case(
     _save_debug_overlay(results["original"], pred_edges, missing_edges, missing_overlay_path)
 
     metrics = evaluate_edges(pred_edges, gt_edges, tolerance=1)
+    intrusion_pixels, intrusion_ratio = compute_intrusion(pred_edges, mask, gt_edges, band_radius=1)
+    metrics["intrusion_pixels"] = intrusion_pixels
+    metrics["intrusion_ratio"] = intrusion_ratio
     metrics["elapsed_sec"] = elapsed
     metrics["line_width"] = line_width
     metrics["noise_sigma"] = noise_sigma
@@ -247,125 +261,42 @@ def main():
     output_dir = ensure_output_dir()
 
     detector = SobelEdgeDetector()
-    strategies = [
-        {
-            "name": "strict_no_refine",
-            "settings": {
-                "use_median_filter": False,
-                "median_kernel_size": 3,
-                "use_blur": True,
-                "blur_kernel_size": 5,
-                "blur_sigma": 1.2,
-                "use_contrast_stretch": False,
-                "contrast_low_pct": 2.0,
-                "contrast_high_pct": 98.0,
-                "magnitude_gamma": 1.0,
-                "nms_relax": 1.0,
-                "low_ratio": 0.04,
-                "high_ratio": 0.12,
-                "threshold_method": "ratio",
-                "low_percentile": 35.0,
-                "high_percentile": 80.0,
-                "min_threshold": 1.0,
-                "mad_low_k": 1.5,
-                "mad_high_k": 3.0,
-                "use_soft_linking": False,
-                "soft_low_ratio": 0.03,
-                "soft_high_ratio": 0.1,
-                "link_radius": 2,
-                "soft_threshold_method": None,
-                "soft_low_percentile": None,
-                "soft_high_percentile": None,
-                "soft_mad_low_k": None,
-                "soft_mad_high_k": None,
-                "use_closing": False,
-                "closing_radius": 1,
-                "closing_iterations": 1,
-                "use_peak_refine": False,
-                "peak_fill_radius": 1,
-                "use_thinning": False,
-                "thinning_max_iter": 15,
-            },
-        },
-        {
-            "name": "relax_095_no_refine",
-            "settings": {
-                "use_median_filter": False,
-                "median_kernel_size": 3,
-                "use_blur": True,
-                "blur_kernel_size": 5,
-                "blur_sigma": 1.2,
-                "use_contrast_stretch": False,
-                "contrast_low_pct": 2.0,
-                "contrast_high_pct": 98.0,
-                "magnitude_gamma": 1.0,
-                "nms_relax": 0.95,
-                "low_ratio": 0.04,
-                "high_ratio": 0.12,
-                "threshold_method": "ratio",
-                "low_percentile": 35.0,
-                "high_percentile": 80.0,
-                "min_threshold": 1.0,
-                "mad_low_k": 1.5,
-                "mad_high_k": 3.0,
-                "use_soft_linking": False,
-                "soft_low_ratio": 0.03,
-                "soft_high_ratio": 0.1,
-                "link_radius": 2,
-                "soft_threshold_method": None,
-                "soft_low_percentile": None,
-                "soft_high_percentile": None,
-                "soft_mad_low_k": None,
-                "soft_mad_high_k": None,
-                "use_closing": False,
-                "closing_radius": 1,
-                "closing_iterations": 1,
-                "use_peak_refine": False,
-                "peak_fill_radius": 1,
-                "use_thinning": False,
-                "thinning_max_iter": 15,
-            },
-        },
-        {
-            "name": "relax_095_thin",
-            "settings": {
-                "use_median_filter": False,
-                "median_kernel_size": 3,
-                "use_blur": True,
-                "blur_kernel_size": 5,
-                "blur_sigma": 1.2,
-                "use_contrast_stretch": False,
-                "contrast_low_pct": 2.0,
-                "contrast_high_pct": 98.0,
-                "magnitude_gamma": 1.0,
-                "nms_relax": 0.95,
-                "low_ratio": 0.04,
-                "high_ratio": 0.12,
-                "threshold_method": "ratio",
-                "low_percentile": 35.0,
-                "high_percentile": 80.0,
-                "min_threshold": 1.0,
-                "mad_low_k": 1.5,
-                "mad_high_k": 3.0,
-                "use_soft_linking": False,
-                "soft_low_ratio": 0.03,
-                "soft_high_ratio": 0.1,
-                "link_radius": 2,
-                "soft_threshold_method": None,
-                "soft_low_percentile": None,
-                "soft_high_percentile": None,
-                "soft_mad_low_k": None,
-                "soft_mad_high_k": None,
-                "use_closing": False,
-                "closing_radius": 1,
-                "closing_iterations": 1,
-                "use_peak_refine": False,
-                "peak_fill_radius": 1,
-                "use_thinning": True,
-                "thinning_max_iter": 15,
-            },
-        },
-    ]
+    base_settings = {
+        "use_median_filter": False,
+        "median_kernel_size": 3,
+        "use_blur": True,
+        "blur_kernel_size": 5,
+        "blur_sigma": 1.2,
+        "use_contrast_stretch": False,
+        "contrast_low_pct": 2.0,
+        "contrast_high_pct": 98.0,
+        "magnitude_gamma": 1.0,
+        "nms_relax": 1.0,
+        "low_ratio": 0.04,
+        "high_ratio": 0.12,
+        "threshold_method": "ratio",
+        "low_percentile": 35.0,
+        "high_percentile": 80.0,
+        "min_threshold": 1.0,
+        "mad_low_k": 1.5,
+        "mad_high_k": 3.0,
+        "use_soft_linking": False,
+        "soft_low_ratio": 0.03,
+        "soft_high_ratio": 0.1,
+        "link_radius": 2,
+        "soft_threshold_method": None,
+        "soft_low_percentile": None,
+        "soft_high_percentile": None,
+        "soft_mad_low_k": None,
+        "soft_mad_high_k": None,
+        "use_closing": False,
+        "closing_radius": 1,
+        "closing_iterations": 1,
+        "use_peak_refine": False,
+        "peak_fill_radius": 1,
+        "use_thinning": True,
+        "thinning_max_iter": 15,
+    }
 
     cases = [
         {
@@ -397,7 +328,64 @@ def main():
         },
     ]
 
-    print("Performance evaluation complete.")
+    candidate_relax = [1.0, 0.98, 0.96, 0.95, 0.94, 0.92, 0.9]
+    search_results = []
+
+    print("Auto-searching nms_relax values...")
+    for relax in candidate_relax:
+        settings = dict(base_settings)
+        settings["nms_relax"] = relax
+
+        total_recall = 0.0
+        total_intrusion = 0.0
+        total_precision = 0.0
+        for case in cases:
+            metrics, _, _ = _run_case(
+                detector,
+                output_dir,
+                f"search_relax_{relax:.2f}_{case['name']}",
+                case["line_width"],
+                case["noise_sigma"],
+                case["background"],
+                case["foreground"],
+                case["gradient_strength"],
+                case["gradient_axis"],
+                settings,
+            )
+            total_recall += metrics["recall"]
+            total_intrusion += metrics["intrusion_ratio"]
+            total_precision += metrics["precision"]
+
+        avg_recall = total_recall / len(cases)
+        avg_intrusion = total_intrusion / len(cases)
+        avg_precision = total_precision / len(cases)
+        score = avg_recall - 0.5 * avg_intrusion
+        search_results.append((relax, avg_recall, avg_intrusion, avg_precision, score))
+        print(
+            f"relax={relax:.2f} avg_recall={avg_recall:.4f} "
+            f"avg_intrusion={avg_intrusion:.4f} avg_precision={avg_precision:.4f} score={score:.4f}"
+        )
+
+    search_results.sort(key=lambda x: (x[4], x[1]), reverse=True)
+    best_relax = search_results[0][0]
+    print(f"\nBest nms_relax: {best_relax:.2f}")
+
+    strategies = [
+        {
+            "name": f"best_relax_{best_relax:.2f}",
+            "settings": dict(base_settings, nms_relax=best_relax),
+        },
+        {
+            "name": "strict_baseline",
+            "settings": dict(base_settings, nms_relax=1.0),
+        },
+        {
+            "name": "relaxed_090",
+            "settings": dict(base_settings, nms_relax=0.9),
+        },
+    ]
+
+    print("\nPerformance evaluation complete.")
     print(f"Output directory: {output_dir}")
 
     for strategy in strategies:

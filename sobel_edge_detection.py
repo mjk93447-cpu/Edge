@@ -17,6 +17,63 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image, ImageTk, ImageDraw
 
+PARAM_DEFAULTS = {
+    "nms_relax": 0.95,
+    "low_ratio": 0.04,
+    "high_ratio": 0.12,
+    "use_blur": True,
+    "blur_sigma": 1.2,
+    "blur_kernel_size": 5,
+    "auto_threshold": True,
+    "contrast_ref": 80.0,
+    "min_threshold_scale": 0.5,
+    "use_thinning": True,
+    "thinning_max_iter": 15,
+    "use_boundary_band_filter": True,
+    "boundary_band_radius": 2,
+    "object_is_dark": True,
+    "use_mask_blur": True,
+    "mask_blur_sigma": 1.0,
+    "mask_blur_kernel_size": 5,
+    "mask_close_radius": 1,
+    "use_polarity_filter": True,
+    "polarity_drop_margin": 0.5,
+}
+
+AUTO_DEFAULTS = {
+    "auto_nms_min": 0.90,
+    "auto_nms_max": 1.00,
+    "auto_nms_step": 0.02,
+    "auto_high_min": 0.08,
+    "auto_high_max": 0.16,
+    "auto_high_step": 0.02,
+    "auto_low_factor": 0.33,
+    "auto_band_min": 1,
+    "auto_band_max": 3,
+    "auto_margin_min": 0.0,
+    "auto_margin_max": 0.8,
+    "auto_margin_step": 0.2,
+    "weight_coverage": 1.0,
+    "weight_intrusion": 1.2,
+    "weight_outside": 0.7,
+    "weight_gap": 1.0,
+    "weight_thickness": 0.5,
+    "weight_low_quality": 0.5,
+}
+
+PARAM_KEYS = tuple(PARAM_DEFAULTS.keys())
+AUTO_KEYS = tuple(AUTO_DEFAULTS.keys())
+
+
+def save_json_config(path, payload):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True, indent=2)
+
+
+def load_json_config(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
 class SobelEdgeDetector:
     """Sobel 필터 기반 에지 검출 클래스"""
     
@@ -730,52 +787,25 @@ class EdgeBatchGUI:
         self._worker_thread = None
         self._auto_thread = None
         self.param_vars = self._init_param_vars()
-        self.auto_mode = tk.StringVar(value="빠름")
+        self.auto_mode = tk.StringVar(value="Fast")
         self.log_text = None
+        self.score_graph_label = None
+        self.best_graph_label = None
+        self._auto_scores = []
+        self._auto_best_scores = []
 
         self._build_ui()
 
     def _init_param_vars(self):
-        return {
-            "nms_relax": tk.DoubleVar(value=0.95),
-            "low_ratio": tk.DoubleVar(value=0.04),
-            "high_ratio": tk.DoubleVar(value=0.12),
-            "use_blur": tk.BooleanVar(value=True),
-            "blur_sigma": tk.DoubleVar(value=1.2),
-            "blur_kernel_size": tk.IntVar(value=5),
-            "auto_threshold": tk.BooleanVar(value=True),
-            "contrast_ref": tk.DoubleVar(value=80.0),
-            "min_threshold_scale": tk.DoubleVar(value=0.5),
-            "use_thinning": tk.BooleanVar(value=True),
-            "thinning_max_iter": tk.IntVar(value=15),
-            "use_boundary_band_filter": tk.BooleanVar(value=True),
-            "boundary_band_radius": tk.IntVar(value=2),
-            "object_is_dark": tk.BooleanVar(value=True),
-            "use_mask_blur": tk.BooleanVar(value=True),
-            "mask_blur_sigma": tk.DoubleVar(value=1.0),
-            "mask_blur_kernel_size": tk.IntVar(value=5),
-            "mask_close_radius": tk.IntVar(value=1),
-            "use_polarity_filter": tk.BooleanVar(value=True),
-            "polarity_drop_margin": tk.DoubleVar(value=0.5),
-            "auto_nms_min": tk.DoubleVar(value=0.90),
-            "auto_nms_max": tk.DoubleVar(value=1.00),
-            "auto_nms_step": tk.DoubleVar(value=0.02),
-            "auto_high_min": tk.DoubleVar(value=0.08),
-            "auto_high_max": tk.DoubleVar(value=0.16),
-            "auto_high_step": tk.DoubleVar(value=0.02),
-            "auto_low_factor": tk.DoubleVar(value=0.33),
-            "auto_band_min": tk.IntVar(value=1),
-            "auto_band_max": tk.IntVar(value=3),
-            "auto_margin_min": tk.DoubleVar(value=0.0),
-            "auto_margin_max": tk.DoubleVar(value=0.8),
-            "auto_margin_step": tk.DoubleVar(value=0.2),
-            "weight_coverage": tk.DoubleVar(value=1.0),
-            "weight_intrusion": tk.DoubleVar(value=1.2),
-            "weight_outside": tk.DoubleVar(value=0.7),
-            "weight_gap": tk.DoubleVar(value=1.0),
-            "weight_thickness": tk.DoubleVar(value=0.5),
-            "weight_low_quality": tk.DoubleVar(value=0.5),
-        }
+        vars_map = {}
+        for key, value in {**PARAM_DEFAULTS, **AUTO_DEFAULTS}.items():
+            if isinstance(value, bool):
+                vars_map[key] = tk.BooleanVar(value=value)
+            elif isinstance(value, int):
+                vars_map[key] = tk.IntVar(value=value)
+            else:
+                vars_map[key] = tk.DoubleVar(value=value)
+        return vars_map
 
     def _build_ui(self):
         main_frame = ttk.Frame(self.root, padding=12)
@@ -783,7 +813,7 @@ class EdgeBatchGUI:
 
         header = ttk.Label(
             main_frame,
-            text="최대 100개 이미지 파일을 선택하여 연속 처리합니다.",
+            text="Select up to 100 images and process sequentially.",
             font=("Arial", 12, "bold"),
         )
         header.pack(anchor="w")
@@ -791,10 +821,10 @@ class EdgeBatchGUI:
         output_frame = ttk.Frame(main_frame)
         output_frame.pack(fill=tk.X, pady=(10, 6))
 
-        ttk.Label(output_frame, text="출력 폴더:").pack(side=tk.LEFT)
+        ttk.Label(output_frame, text="Output folder:").pack(side=tk.LEFT)
         self.output_label = ttk.Label(output_frame, text=self.output_root)
         self.output_label.pack(side=tk.LEFT, padx=(6, 12))
-        ttk.Button(output_frame, text="폴더 변경", command=self._choose_output_dir).pack(side=tk.RIGHT)
+        ttk.Button(output_frame, text="Change", command=self._choose_output_dir).pack(side=tk.RIGHT)
 
         list_frame = ttk.Frame(main_frame)
         list_frame.pack(fill=tk.BOTH, expand=True)
@@ -806,7 +836,7 @@ class EdgeBatchGUI:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.file_listbox.config(yscrollcommand=scrollbar.set)
 
-        param_frame = ttk.LabelFrame(main_frame, text="파라미터 설정")
+        param_frame = ttk.LabelFrame(main_frame, text="Parameter Settings")
         param_frame.pack(fill=tk.X, pady=(8, 6))
 
         ttk.Label(param_frame, text="NMS relax").grid(row=0, column=0, sticky="w")
@@ -971,7 +1001,7 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=5, column=3, sticky="w", padx=(4, 12))
 
-        auto_frame = ttk.LabelFrame(main_frame, text="자동탐색 범위/평가")
+        auto_frame = ttk.LabelFrame(main_frame, text="Auto Search Range / Scoring")
         auto_frame.pack(fill=tk.X, pady=(6, 6))
 
         ttk.Label(auto_frame, text="NMS min").grid(row=0, column=0, sticky="w")
@@ -1156,48 +1186,63 @@ class EdgeBatchGUI:
 
         auto_btn_frame = ttk.Frame(auto_frame)
         auto_btn_frame.grid(row=6, column=0, columnspan=6, sticky="w", pady=(4, 0))
-        ttk.Button(auto_btn_frame, text="평가 저장", command=self._save_eval_config).pack(side=tk.LEFT, padx=4)
-        ttk.Button(auto_btn_frame, text="평가 불러오기", command=self._load_eval_config).pack(side=tk.LEFT, padx=4)
+        ttk.Button(auto_btn_frame, text="Save Auto Config", command=self._save_auto_config).pack(side=tk.LEFT, padx=4)
+        ttk.Button(auto_btn_frame, text="Load Auto Config", command=self._load_auto_config).pack(side=tk.LEFT, padx=4)
 
-        guide_frame = ttk.LabelFrame(main_frame, text="튜닝 가이드")
+        param_btn_frame = ttk.Frame(param_frame)
+        param_btn_frame.grid(row=6, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ttk.Button(param_btn_frame, text="Save Params", command=self._save_param_config).pack(side=tk.LEFT, padx=4)
+        ttk.Button(param_btn_frame, text="Load Params", command=self._load_param_config).pack(side=tk.LEFT, padx=4)
+
+        guide_frame = ttk.LabelFrame(main_frame, text="Tuning Guide")
         guide_frame.pack(fill=tk.X, pady=(6, 6))
-        guide_text = tk.Text(guide_frame, height=6, wrap="word")
+        guide_text = tk.Text(guide_frame, height=9, wrap="word")
         guide_text.insert(
             "1.0",
-            "- ROI 설정: 자동 최적화에 사용할 영역을 사각형으로 지정\n"
-            "- NMS relax 낮추면 끊김 감소, 너무 낮으면 두꺼워짐\n"
-            "- Low/High ratio 낮추면 검출율 증가, 내부 침범/노이즈 증가\n"
-            "- Boundary band는 내부 침범 억제 (작을수록 바깥 테두리 엄격)\n"
-            "- Polarity filter는 내부 곡선 제거에 도움\n"
-            "- Thinning은 1픽셀 두께 유지, 끊김이 있으면 NMS relax 조정\n"
-            "- Auto threshold는 저대비 이미지에서 임계값 자동 보정\n",
+            "- ROI: Draw a rectangle to focus auto-optimization on the true boundary area.\n"
+            "- Auto Optimize uses the average score across multiple images (Precise mode uses all).\n"
+            "- NMS relax: Lower reduces gaps, too low can thicken edges or create inner curl.\n"
+            "- Low/High ratio: Lower increases recall but can add intrusion/noise.\n"
+            "- Boundary band radius: Smaller forces edges to stay on the outer boundary.\n"
+            "- Polarity filter: Removes inner curves by checking edge brightness direction.\n"
+            "- Thinning: Keeps a single-pixel contour; adjust NMS relax if gaps appear.\n"
+            "- Auto threshold: Adapts to low-contrast images automatically.\n"
+            "- Weights: Raise intrusion/outside to penalize inner or external edges.\n"
+            "- Save Params stores detection settings; Save Auto Config stores search ranges/weights.\n",
         )
         guide_text.configure(state="disabled")
         guide_text.pack(fill=tk.X)
+        graph_frame = ttk.LabelFrame(main_frame, text="Auto Optimization Progress")
+        graph_frame.pack(fill=tk.X, pady=(6, 6))
+        self.score_graph_label = ttk.Label(graph_frame)
+        self.score_graph_label.pack(side=tk.LEFT, padx=6)
+        self.best_graph_label = ttk.Label(graph_frame)
+        self.best_graph_label.pack(side=tk.LEFT, padx=6)
+
         self.log_text = tk.Text(main_frame, height=6, wrap="word")
         self.log_text.pack(fill=tk.BOTH, pady=(6, 6))
 
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(10, 6))
 
-        ttk.Button(button_frame, text="파일 추가", command=self._add_files).pack(side=tk.LEFT)
-        ttk.Button(button_frame, text="목록 비우기", command=self._clear_files).pack(side=tk.LEFT, padx=6)
-        ttk.Button(button_frame, text="ROI 설정", command=self._open_roi_editor).pack(side=tk.LEFT, padx=6)
-        ttk.Button(button_frame, text="ROI 초기화", command=self._clear_roi).pack(side=tk.LEFT, padx=6)
-        ttk.Label(button_frame, text="자동탐색 모드").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Button(button_frame, text="Add Files", command=self._add_files).pack(side=tk.LEFT)
+        ttk.Button(button_frame, text="Clear List", command=self._clear_files).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_frame, text="Set ROI", command=self._open_roi_editor).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_frame, text="Clear ROI", command=self._clear_roi).pack(side=tk.LEFT, padx=6)
+        ttk.Label(button_frame, text="Auto mode").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Combobox(
             button_frame,
             textvariable=self.auto_mode,
-            values=["빠름", "정밀"],
+            values=["Fast", "Precise"],
             width=6,
             state="readonly",
         ).pack(side=tk.LEFT)
-        self.auto_button = ttk.Button(button_frame, text="자동 최적화", command=self._start_auto_optimize)
+        self.auto_button = ttk.Button(button_frame, text="Auto Optimize", command=self._start_auto_optimize)
         self.auto_button.pack(side=tk.LEFT, padx=6)
-        self.start_button = ttk.Button(button_frame, text="처리 시작", command=self._start_processing)
+        self.start_button = ttk.Button(button_frame, text="Start Processing", command=self._start_processing)
         self.start_button.pack(side=tk.RIGHT)
 
-        self.status_var = tk.StringVar(value="대기 중...")
+        self.status_var = tk.StringVar(value="Idle...")
         status_label = ttk.Label(main_frame, textvariable=self.status_var)
         status_label.pack(anchor="w", pady=(6, 0))
 
@@ -1216,10 +1261,10 @@ class EdgeBatchGUI:
     def _open_roi_editor(self):
         path = self._get_selected_file()
         if not path:
-            messagebox.showinfo("알림", "ROI를 지정할 파일을 선택해주세요.")
+            messagebox.showinfo("Info", "Select a file to set ROI.")
             return
         if not os.path.exists(path):
-            messagebox.showerror("오류", "파일을 찾을 수 없습니다.")
+            messagebox.showerror("Error", "File not found.")
             return
 
         img = Image.open(path).convert("L")
@@ -1230,7 +1275,7 @@ class EdgeBatchGUI:
         display = img.resize((disp_w, disp_h), resample=Image.BILINEAR)
 
         win = tk.Toplevel(self.root)
-        win.title("ROI 설정")
+        win.title("Set ROI")
         canvas = tk.Canvas(win, width=disp_w, height=disp_h)
         canvas.pack()
         tk_img = ImageTk.PhotoImage(display)
@@ -1239,7 +1284,7 @@ class EdgeBatchGUI:
 
         roi_rect = None
         start = {"x": 0, "y": 0}
-        roi_label = ttk.Label(win, text="드래그하여 ROI를 지정하세요.")
+        roi_label = ttk.Label(win, text="Drag to draw a rectangular ROI.")
         roi_label.pack(pady=4)
 
         if path in self.roi_map:
@@ -1276,10 +1321,10 @@ class EdgeBatchGUI:
             x2 = int(max(1, min(img.width, x2)))
             y2 = int(max(1, min(img.height, y2)))
             if x2 <= x1 + 1 or y2 <= y1 + 1:
-                roi_label.config(text="ROI가 너무 작습니다.")
+                roi_label.config(text="ROI is too small.")
                 return
             self.roi_map[path] = (x1, y1, x2, y2)
-            roi_label.config(text=f"ROI 저장됨: ({x1},{y1})-({x2},{y2})")
+            roi_label.config(text=f"ROI saved: ({x1},{y1})-({x2},{y2})")
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
@@ -1290,23 +1335,35 @@ class EdgeBatchGUI:
                 del self.roi_map[path]
             if roi_rect:
                 canvas.delete(roi_rect)
-            roi_label.config(text="ROI 초기화됨.")
+            roi_label.config(text="ROI cleared.")
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(pady=6)
-        ttk.Button(btn_frame, text="ROI 초기화", command=clear_roi).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="닫기", command=win.destroy).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Clear ROI", command=clear_roi).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side=tk.LEFT, padx=4)
 
     def _clear_roi(self):
         path = self._get_selected_file()
         if not path:
-            messagebox.showinfo("알림", "ROI를 초기화할 파일을 선택해주세요.")
+            messagebox.showinfo("Info", "Select a file to clear ROI.")
             return
         if path in self.roi_map:
             del self.roi_map[path]
-            self._log(f"[ROI] {os.path.basename(path)} 초기화 완료")
+            self._log(f"[ROI] Cleared: {os.path.basename(path)}")
         else:
-            messagebox.showinfo("알림", "설정된 ROI가 없습니다.")
+            messagebox.showinfo("Info", "No ROI is set.")
+
+    def _collect_values(self, keys):
+        return {key: self.param_vars[key].get() for key in keys if key in self.param_vars}
+
+    def _apply_values(self, values, defaults):
+        merged = dict(defaults)
+        for key, value in values.items():
+            if key in defaults:
+                merged[key] = value
+        for key, value in merged.items():
+            if key in self.param_vars:
+                self.param_vars[key].set(value)
 
     def _get_param_settings(self):
         def get_float(key):
@@ -1319,7 +1376,7 @@ class EdgeBatchGUI:
         low_ratio = get_float("low_ratio")
         high_ratio = get_float("high_ratio")
         if high_ratio <= 0 or low_ratio <= 0:
-            raise ValueError("Low/High ratio는 0보다 커야 합니다.")
+            raise ValueError("Low/High ratio must be greater than 0.")
         if low_ratio >= high_ratio:
             low_ratio = high_ratio * 0.5
 
@@ -1354,56 +1411,55 @@ class EdgeBatchGUI:
         return settings
 
     def _get_auto_config(self):
-        return {
-            "auto_nms_min": float(self.param_vars["auto_nms_min"].get()),
-            "auto_nms_max": float(self.param_vars["auto_nms_max"].get()),
-            "auto_nms_step": float(self.param_vars["auto_nms_step"].get()),
-            "auto_high_min": float(self.param_vars["auto_high_min"].get()),
-            "auto_high_max": float(self.param_vars["auto_high_max"].get()),
-            "auto_high_step": float(self.param_vars["auto_high_step"].get()),
-            "auto_low_factor": float(self.param_vars["auto_low_factor"].get()),
-            "auto_band_min": int(self.param_vars["auto_band_min"].get()),
-            "auto_band_max": int(self.param_vars["auto_band_max"].get()),
-            "auto_margin_min": float(self.param_vars["auto_margin_min"].get()),
-            "auto_margin_max": float(self.param_vars["auto_margin_max"].get()),
-            "auto_margin_step": float(self.param_vars["auto_margin_step"].get()),
-            "weight_coverage": float(self.param_vars["weight_coverage"].get()),
-            "weight_intrusion": float(self.param_vars["weight_intrusion"].get()),
-            "weight_outside": float(self.param_vars["weight_outside"].get()),
-            "weight_gap": float(self.param_vars.get("weight_gap", tk.DoubleVar(value=1.0)).get()),
-            "weight_thickness": float(self.param_vars.get("weight_thickness", tk.DoubleVar(value=0.5)).get()),
-            "weight_low_quality": float(self.param_vars.get("weight_low_quality", tk.DoubleVar(value=0.5)).get()),
-        }
+        return self._collect_values(AUTO_KEYS)
 
-    def _save_eval_config(self):
-        config = {
-            "params": {key: var.get() for key, var in self.param_vars.items()},
-        }
+    def _save_param_config(self):
+        config = {"params": self._collect_values(PARAM_KEYS)}
         path = filedialog.asksaveasfilename(
-            title="평가 함수 저장",
+            title="Save Parameters",
             defaultextension=".json",
             filetypes=[("JSON", "*.json")],
         )
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(config, handle, ensure_ascii=True, indent=2)
-        self._log(f"[CONFIG] 저장됨: {path}")
+        save_json_config(path, config)
+        self._log(f"[PARAMS] Saved: {path}")
 
-    def _load_eval_config(self):
+    def _load_param_config(self):
         path = filedialog.askopenfilename(
-            title="평가 함수 불러오기",
+            title="Load Parameters",
             filetypes=[("JSON", "*.json")],
         )
         if not path:
             return
-        with open(path, "r", encoding="utf-8") as handle:
-            config = json.load(handle)
+        config = load_json_config(path)
         params = config.get("params", {})
-        for key, value in params.items():
-            if key in self.param_vars:
-                self.param_vars[key].set(value)
-        self._log(f"[CONFIG] 불러옴: {path}")
+        self._apply_values(params, PARAM_DEFAULTS)
+        self._log(f"[PARAMS] Loaded: {path}")
+
+    def _save_auto_config(self):
+        config = {"auto": self._collect_values(AUTO_KEYS)}
+        path = filedialog.asksaveasfilename(
+            title="Save Auto Config",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        save_json_config(path, config)
+        self._log(f"[AUTO] Config saved: {path}")
+
+    def _load_auto_config(self):
+        path = filedialog.askopenfilename(
+            title="Load Auto Config",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        config = load_json_config(path)
+        auto_values = config.get("auto", {})
+        self._apply_values(auto_values, AUTO_DEFAULTS)
+        self._log(f"[AUTO] Config loaded: {path}")
 
     def _apply_settings(self, settings):
         for key, var in self.param_vars.items():
@@ -1422,14 +1478,46 @@ class EdgeBatchGUI:
                 boundary |= neighbor != center
         return boundary
 
+    def _count_components(self, mask):
+        if mask is None or not mask.any():
+            return 0
+        visited = np.zeros(mask.shape, dtype=bool)
+        coords = np.argwhere(mask)
+        components = 0
+        for y, x in coords:
+            if visited[y, x]:
+                continue
+            components += 1
+            stack = [(y, x)]
+            visited[y, x] = True
+            while stack:
+                cy, cx = stack.pop()
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dy == 0 and dx == 0:
+                            continue
+                        ny = cy + dy
+                        nx = cx + dx
+                        if ny < 0 or nx < 0 or ny >= mask.shape[0] or nx >= mask.shape[1]:
+                            continue
+                        if mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+        return components
+
     def _evaluate_settings(self, files, settings, max_files, auto_config, roi_map):
-        subset = files[:max_files]
+        if max_files >= len(files):
+            subset = list(files)
+        else:
+            step = max(1, len(files) // max_files)
+            subset = list(files)[::step][:max_files]
         total_score = 0.0
         total_coverage = 0.0
         total_intrusion = 0.0
         total_outside = 0.0
         total_gap = 0.0
         total_thickness = 0.0
+        total_continuity = 0.0
         total_edges = 0
 
         for path in subset:
@@ -1473,6 +1561,9 @@ class EdgeBatchGUI:
             intrusion_ratio = intrusion / edge_pixels
             outside_ratio = outside / edge_pixels
             gap_ratio = max(0.0, 1.0 - coverage)
+            components = self._count_components(edges & band)
+            components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
+            continuity_penalty = min(1.0, components_penalty * 5.0)
             edge_density = edge_pixels / max(band_pixels, 1)
             thickness_penalty = max(0.0, edge_density - 1.2)
             w_cov = auto_config["weight_coverage"]
@@ -1482,7 +1573,7 @@ class EdgeBatchGUI:
             w_thick = auto_config["weight_thickness"]
             score = (
                 w_cov * coverage
-                - w_gap * gap_ratio
+                - w_gap * (gap_ratio + continuity_penalty)
                 - w_intr * intrusion_ratio
                 - w_out * outside_ratio
                 - w_thick * thickness_penalty
@@ -1493,24 +1584,27 @@ class EdgeBatchGUI:
             if contrast < settings["contrast_ref"] * 0.6:
                 score *= (1.0 + auto_config["weight_low_quality"])
 
+            score = max(0.0, score)
             total_score += score
             total_coverage += coverage
             total_intrusion += intrusion_ratio
             total_outside += outside_ratio
             total_gap += gap_ratio
             total_thickness += thickness_penalty
+            total_continuity += continuity_penalty
             total_edges += 1
 
         if total_edges == 0:
-            return -1.0, {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0}
+            return 0.0, {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0, "gap": 1.0, "thickness": 1.0}
 
-        avg_score = total_score / total_edges
+        avg_score = max(0.0, total_score / total_edges)
         summary = {
             "coverage": total_coverage / total_edges,
             "intrusion": total_intrusion / total_edges,
             "outside": total_outside / total_edges,
             "gap": total_gap / total_edges,
             "thickness": total_thickness / total_edges,
+            "continuity": total_continuity / total_edges,
         }
         return avg_score, summary
 
@@ -1533,7 +1627,7 @@ class EdgeBatchGUI:
         band_min = auto_config["auto_band_min"]
         band_max = auto_config["auto_band_max"]
 
-        if mode == "빠름":
+        if mode == "Fast":
             nms_list = nms_list[::2] if len(nms_list) > 2 else nms_list
             high_list = high_list[::2] if len(high_list) > 2 else high_list
             margin_list = margin_list[::2] if len(margin_list) > 2 else margin_list
@@ -1562,7 +1656,7 @@ class EdgeBatchGUI:
 
     def _start_auto_optimize(self):
         if self._worker_thread and self._worker_thread.is_alive():
-            messagebox.showwarning("진행 중", "현재 처리 중입니다.")
+            messagebox.showwarning("In Progress", "Processing is already running.")
             return
         if not self.selected_files:
             self._add_files()
@@ -1572,14 +1666,17 @@ class EdgeBatchGUI:
         try:
             base_settings = self._get_param_settings()
         except ValueError as exc:
-            messagebox.showerror("파라미터 오류", str(exc))
+            messagebox.showerror("Parameter Error", str(exc))
             return
         auto_config = self._get_auto_config()
 
         mode = self.auto_mode.get()
-        self.status_var.set("자동 최적화 시작...")
+        self.status_var.set("Auto optimization started...")
         self.start_button.config(state=tk.DISABLED)
         self.auto_button.config(state=tk.DISABLED)
+        self._auto_scores = []
+        self._auto_best_scores = []
+        self._refresh_auto_graphs()
         self._worker_thread = threading.Thread(
             target=self._auto_optimize_worker,
             args=(list(self.selected_files), base_settings, auto_config, mode, dict(self.roi_map)),
@@ -1590,9 +1687,9 @@ class EdgeBatchGUI:
 
     def _auto_optimize_worker(self, files, base_settings, auto_config, mode, roi_map):
         candidates = self._build_candidates(base_settings, mode)
-        max_files = 8 if mode == "빠름" else 15
+        max_files = min(8, len(files)) if mode == "Fast" else len(files)
         best = None
-        best_score = -1e9
+        best_score = 0.0
         report_lines = []
         scores = []
         best_progress = []
@@ -1601,18 +1698,19 @@ class EdgeBatchGUI:
             score, summary = self._evaluate_settings(files, settings, max_files, auto_config, roi_map)
             report_lines.append(
                 f"{idx:03d} score={score:.4f} coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                f"intrusion={summary['intrusion']:.4f} outside={summary['outside']:.4f} thickness={summary['thickness']:.4f} "
-                f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
-                f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
+                f"cont={summary['continuity']:.4f} intrusion={summary['intrusion']:.4f} outside={summary['outside']:.4f} "
+                f"thickness={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} "
+                f"high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} "
+                f"margin={settings['polarity_drop_margin']:.2f}"
             )
             scores.append(score)
             if score > best_score:
                 best_score = score
                 best = settings
             best_progress.append(best_score)
-            self._message_queue.put(("auto_progress", idx, len(candidates), best_score))
+            self._message_queue.put(("auto_progress", idx, len(candidates), score, best_score))
 
-        if best and mode != "빠름":
+        if best and mode != "Fast":
             refine_step = max(auto_config["auto_nms_step"] * 0.5, 0.005)
             high_step = max(auto_config["auto_high_step"] * 0.5, 0.005)
             margin_step = max(auto_config["auto_margin_step"] * 0.5, 0.05)
@@ -1634,7 +1732,8 @@ class EdgeBatchGUI:
                 score, summary = self._evaluate_settings(files, settings, max_files, auto_config, roi_map)
                 report_lines.append(
                     f"refine {idx:03d} score={score:.4f} coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                    f"intrusion={summary['intrusion']:.4f} outside={summary['outside']:.4f} thickness={summary['thickness']:.4f} "
+                    f"cont={summary['continuity']:.4f} intrusion={summary['intrusion']:.4f} "
+                    f"outside={summary['outside']:.4f} thickness={summary['thickness']:.4f} "
                     f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
                     f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
                 )
@@ -1643,7 +1742,7 @@ class EdgeBatchGUI:
                     best_score = score
                     best = settings
                 best_progress.append(best_score)
-                self._message_queue.put(("auto_progress", idx, len(refine_candidates), best_score))
+                self._message_queue.put(("auto_progress", idx, len(refine_candidates), score, best_score))
 
         report_dir = self._create_batch_output_dir()
         report_path = os.path.join(report_dir, "auto_optimize_report.txt")
@@ -1666,40 +1765,74 @@ class EdgeBatchGUI:
 
         self._message_queue.put(("auto_done", best, report_path))
 
-    def _draw_score_graph(self, values, path, title):
-        if not values:
-            return
-        width, height = 800, 300
-        margin = 40
+    def _render_graph(self, values, title, width=400, height=220):
+        margin = 36
         img = Image.new("RGB", (width, height), "white")
         draw = ImageDraw.Draw(img)
-        draw.rectangle([margin, margin, width - margin, height - margin], outline="black")
-        draw.text((margin, 10), title, fill="black")
 
-        min_val = min(values)
-        max_val = max(values)
-        if max_val == min_val:
-            max_val += 1.0
+        left = margin
+        top = margin
+        right = width - margin
+        bottom = height - margin
+        draw.rectangle([left, top, right, bottom], outline="black")
+        draw.text((left, 8), title, fill="black")
+
+        if not values:
+            return img
+
+        min_val = min(0.0, float(min(values)))
+        max_val = float(max(values))
+        if max_val <= min_val:
+            max_val = min_val + 1.0
 
         def scale_x(idx):
-            return margin + idx * (width - 2 * margin) / max(1, len(values) - 1)
+            return left + idx * (right - left) / max(1, len(values) - 1)
 
         def scale_y(val):
-            return height - margin - (val - min_val) * (height - 2 * margin) / (max_val - min_val)
+            return bottom - (val - min_val) * (bottom - top) / (max_val - min_val)
+
+        ticks = 4
+        for i in range(ticks + 1):
+            tx = left + i * (right - left) / ticks
+            tick_val = int(round(1 + i * (len(values) - 1) / ticks))
+            draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
+            draw.text((tx - 6, bottom + 6), str(tick_val), fill="black")
+
+            ty = bottom - i * (bottom - top) / ticks
+            y_val = min_val + i * (max_val - min_val) / ticks
+            draw.line([(left - 4, ty), (left, ty)], fill="black")
+            draw.text((4, ty - 6), f"{y_val:.2f}", fill="black")
 
         points = [(scale_x(i), scale_y(v)) for i, v in enumerate(values)]
-        draw.line(points, fill="blue", width=2)
+        if len(points) >= 2:
+            draw.line(points, fill="blue", width=2)
+        else:
+            draw.ellipse([points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2], fill="blue")
+        return img
+
+    def _draw_score_graph(self, values, path, title):
+        img = self._render_graph(values, title, width=800, height=300)
         img.save(path)
 
+    def _refresh_auto_graphs(self):
+        if not self.score_graph_label or not self.best_graph_label:
+            return
+        score_img = self._render_graph(self._auto_scores, "Score (current)", width=400, height=220)
+        best_img = self._render_graph(self._auto_best_scores, "Best score", width=400, height=220)
+        self._score_graph_photo = ImageTk.PhotoImage(score_img)
+        self._best_graph_photo = ImageTk.PhotoImage(best_img)
+        self.score_graph_label.config(image=self._score_graph_photo)
+        self.best_graph_label.config(image=self._best_graph_photo)
+
     def _choose_output_dir(self):
-        selected = filedialog.askdirectory(title="출력 폴더 선택")
+        selected = filedialog.askdirectory(title="Select output folder")
         if selected:
             self.output_root = selected
             self.output_label.config(text=self.output_root)
 
     def _add_files(self):
         files = filedialog.askopenfilenames(
-            title="이미지 파일 선택 (최대 100개)",
+            title="Select image files (up to 100)",
             filetypes=[
                 ("Image Files", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff"),
                 ("All Files", "*.*"),
@@ -1710,12 +1843,12 @@ class EdgeBatchGUI:
 
         remaining = self.max_files - len(self.selected_files)
         if remaining <= 0:
-            messagebox.showwarning("제한 초과", "이미 최대 100개 파일이 선택되었습니다.")
+            messagebox.showwarning("Limit Reached", "You already selected 100 files.")
             return
 
         files = list(files)
         if len(files) > remaining:
-            messagebox.showwarning("파일 제한", f"{remaining}개까지만 추가됩니다.")
+            messagebox.showwarning("File Limit", f"Only {remaining} more files can be added.")
             files = files[:remaining]
 
         for path in files:
@@ -1725,24 +1858,24 @@ class EdgeBatchGUI:
     def _clear_files(self):
         self.selected_files = []
         self.file_listbox.delete(0, tk.END)
-        self.status_var.set("대기 중...")
+        self.status_var.set("Idle...")
 
     def _start_processing(self):
         if not self.selected_files:
-            messagebox.showinfo("알림", "처리할 파일을 먼저 선택해주세요.")
+            messagebox.showinfo("Info", "Select files to process first.")
             return
         if self._worker_thread and self._worker_thread.is_alive():
-            messagebox.showwarning("진행 중", "현재 처리 중입니다.")
+            messagebox.showwarning("In Progress", "Processing is already running.")
             return
 
         try:
             settings = self._get_param_settings()
         except ValueError as exc:
-            messagebox.showerror("파라미터 오류", str(exc))
+            messagebox.showerror("Parameter Error", str(exc))
             return
 
         batch_dir = self._create_batch_output_dir()
-        self.status_var.set(f"처리 시작... (저장 위치: {batch_dir})")
+        self.status_var.set(f"Processing started... (Output: {batch_dir})")
         self.start_button.config(state=tk.DISABLED)
         self.auto_button.config(state=tk.DISABLED)
 
@@ -1794,27 +1927,32 @@ class EdgeBatchGUI:
         msg_type = msg[0]
         if msg_type == "progress":
             idx, total, name = msg[1], msg[2], msg[3]
-            self.status_var.set(f"처리 중... ({idx}/{total}) {name}")
+            self.status_var.set(f"Processing... ({idx}/{total}) {name}")
         elif msg_type == "error":
             path, detail = msg[1], msg[2]
-            messagebox.showerror("처리 실패", f"{path}\n{detail}")
+            messagebox.showerror("Processing Failed", f"{path}\n{detail}")
         elif msg_type == "done":
             batch_dir = msg[1]
-            self.status_var.set(f"완료! 결과 저장 위치: {batch_dir}")
+            self.status_var.set(f"Done! Output: {batch_dir}")
         elif msg_type == "auto_progress":
-            idx, total, best_score = msg[1], msg[2], msg[3]
-            self.status_var.set(f"자동 최적화 중... ({idx}/{total}) best={best_score:.4f}")
+            idx, total, score, best_score = msg[1], msg[2], msg[3], msg[4]
+            self._auto_scores.append(score)
+            self._auto_best_scores.append(best_score)
+            self._refresh_auto_graphs()
+            self.status_var.set(
+                f"Auto optimizing... ({idx}/{total}) score={score:.4f} best={best_score:.4f}"
+            )
         elif msg_type == "auto_done":
             settings, report_path = msg[1], msg[2]
             if settings:
                 self._apply_settings(settings)
-            self.status_var.set(f"자동 최적화 완료! 보고서: {report_path}")
-            self._log(f"[AUTO] 최적화 완료: {report_path}")
+            self.status_var.set(f"Auto optimization complete! Report: {report_path}")
+            self._log(f"[AUTO] Completed: {report_path}")
 
 
 def main():
     if tk is None:
-        raise RuntimeError("tkinter가 설치되어 있지 않습니다. GUI 실행을 위해 설치하세요.")
+        raise RuntimeError("tkinter is not installed. Install it to run the GUI.")
     root = tk.Tk()
     EdgeBatchGUI(root)
     root.mainloop()

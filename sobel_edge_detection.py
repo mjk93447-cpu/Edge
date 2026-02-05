@@ -2,6 +2,7 @@ import json
 import os
 import queue
 import threading
+import time
 from collections import deque
 from datetime import datetime
 try:
@@ -59,6 +60,8 @@ AUTO_DEFAULTS = {
     "weight_gap": 1.0,
     "weight_thickness": 0.5,
     "weight_low_quality": 0.5,
+    "early_stop_enabled": True,
+    "early_stop_minutes": 10.0,
 }
 
 PARAM_KEYS = tuple(PARAM_DEFAULTS.keys())
@@ -73,6 +76,30 @@ def save_json_config(path, payload):
 def load_json_config(path):
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def compute_auto_score(metrics, weights):
+    coverage = float(metrics.get("coverage", 0.0))
+    gap_ratio = float(metrics.get("gap", 1.0))
+    continuity = float(metrics.get("continuity", 1.0))
+    intrusion = float(metrics.get("intrusion", 1.0))
+    outside = float(metrics.get("outside", 1.0))
+    thickness = float(metrics.get("thickness", 1.0))
+
+    w_cov = float(weights.get("weight_coverage", 1.0))
+    w_gap = float(weights.get("weight_gap", 1.0))
+    w_intr = float(weights.get("weight_intrusion", 1.0))
+    w_out = float(weights.get("weight_outside", 1.0))
+    w_thick = float(weights.get("weight_thickness", 1.0))
+
+    penalty = (
+        w_gap * (gap_ratio + continuity)
+        + w_intr * intrusion
+        + w_out * outside
+        + w_thick * thickness
+    )
+    score = (w_cov * coverage + 1.0) / (1.0 + penalty)
+    return max(0.0, score)
 
 class SobelEdgeDetector:
     """Sobel 필터 기반 에지 검출 클래스"""
@@ -793,6 +820,13 @@ class EdgeBatchGUI:
         self.best_graph_label = None
         self._auto_scores = []
         self._auto_best_scores = []
+        self._auto_best_time_series = []
+        self._auto_start_time = None
+        self._auto_last_best_time = None
+        self._auto_pause_event = threading.Event()
+        self._auto_stop_event = threading.Event()
+        self.pause_button = None
+        self.stop_button = None
 
         self._build_ui()
 
@@ -1184,8 +1218,22 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=5, column=5, sticky="w", padx=(4, 12))
 
+        ttk.Checkbutton(
+            auto_frame,
+            text="Early stop on stagnation (min)",
+            variable=self.param_vars["early_stop_enabled"],
+        ).grid(row=6, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=60,
+            increment=1,
+            textvariable=self.param_vars["early_stop_minutes"],
+            width=6,
+        ).grid(row=6, column=1, sticky="w", padx=(4, 12))
+
         auto_btn_frame = ttk.Frame(auto_frame)
-        auto_btn_frame.grid(row=6, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        auto_btn_frame.grid(row=7, column=0, columnspan=6, sticky="w", pady=(4, 0))
         ttk.Button(auto_btn_frame, text="Save Auto Config", command=self._save_auto_config).pack(side=tk.LEFT, padx=4)
         ttk.Button(auto_btn_frame, text="Load Auto Config", command=self._load_auto_config).pack(side=tk.LEFT, padx=4)
 
@@ -1208,6 +1256,7 @@ class EdgeBatchGUI:
             "- Thinning: Keeps a single-pixel contour; adjust NMS relax if gaps appear.\n"
             "- Auto threshold: Adapts to low-contrast images automatically.\n"
             "- Weights: Raise intrusion/outside to penalize inner or external edges.\n"
+            "- Early stop ends optimization when best score stalls for N minutes.\n"
             "- Save Params stores detection settings; Save Auto Config stores search ranges/weights.\n",
         )
         guide_text.configure(state="disabled")
@@ -1239,6 +1288,14 @@ class EdgeBatchGUI:
         ).pack(side=tk.LEFT)
         self.auto_button = ttk.Button(button_frame, text="Auto Optimize", command=self._start_auto_optimize)
         self.auto_button.pack(side=tk.LEFT, padx=6)
+        self.pause_button = ttk.Button(
+            button_frame, text="Pause", command=self._toggle_auto_pause, state=tk.DISABLED
+        )
+        self.pause_button.pack(side=tk.LEFT, padx=4)
+        self.stop_button = ttk.Button(
+            button_frame, text="Stop", command=self._stop_auto_optimize, state=tk.DISABLED
+        )
+        self.stop_button.pack(side=tk.LEFT, padx=4)
         self.start_button = ttk.Button(button_frame, text="Start Processing", command=self._start_processing)
         self.start_button.pack(side=tk.RIGHT)
 
@@ -1352,6 +1409,89 @@ class EdgeBatchGUI:
             self._log(f"[ROI] Cleared: {os.path.basename(path)}")
         else:
             messagebox.showinfo("Info", "No ROI is set.")
+
+    def _toggle_auto_pause(self):
+        if not self.pause_button:
+            return
+        if self._auto_pause_event.is_set():
+            self._auto_pause_event.clear()
+            self.pause_button.config(text="Pause")
+            self._log("[AUTO] Resumed")
+        else:
+            self._auto_pause_event.set()
+            self.pause_button.config(text="Resume")
+            self._log("[AUTO] Paused")
+
+    def _stop_auto_optimize(self):
+        if not self.stop_button:
+            return
+        self._auto_stop_event.set()
+        self._auto_pause_event.clear()
+        if self.pause_button:
+            self.pause_button.config(text="Pause")
+        self._log("[AUTO] Stop requested")
+
+    def _format_eta(self, seconds):
+        seconds = max(0, int(seconds))
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _select_auto_subset(self, files, max_files):
+        if max_files >= len(files):
+            return list(files)
+        step = max(1, len(files) // max_files)
+        return list(files)[::step][:max_files]
+
+    def _prepare_auto_data(self, files, settings, auto_config, roi_map, max_files):
+        subset = self._select_auto_subset(files, max_files)
+        band_radii = list(range(auto_config["auto_band_min"], auto_config["auto_band_max"] + 1))
+        if not band_radii:
+            band_radii = [settings["boundary_band_radius"]]
+        data = []
+        for path in subset:
+            image = self.detector.load_image(path)
+            roi = roi_map.get(path)
+            if roi:
+                x1, y1, x2, y2 = roi
+                image = image[y1:y2, x1:x2]
+
+            mask_source = image
+            if settings["use_mask_blur"]:
+                mask_source = self.detector.apply_gaussian_blur(
+                    image, settings["mask_blur_kernel_size"], settings["mask_blur_sigma"]
+                )
+            mask = self.detector.estimate_object_mask(mask_source, settings["object_is_dark"])
+            if settings["mask_close_radius"] > 0:
+                mask = self.detector.erode_binary(
+                    self.detector.dilate_binary(mask, settings["mask_close_radius"]),
+                    settings["mask_close_radius"],
+                )
+            boundary = self._compute_boundary(mask)
+            bands = {}
+            band_pixels = {}
+            for radius in band_radii:
+                if radius <= 0:
+                    band = boundary.copy()
+                else:
+                    band = self.detector.dilate_binary(boundary, radius)
+                bands[radius] = band
+                band_pixels[radius] = int(band.sum())
+
+            data.append(
+                {
+                    "path": path,
+                    "image": image,
+                    "mask": mask,
+                    "boundary": boundary,
+                    "bands": bands,
+                    "band_pixels": band_pixels,
+                }
+            )
+        return data
 
     def _collect_values(self, keys):
         return {key: self.param_vars[key].get() for key in keys if key in self.param_vars}
@@ -1505,12 +1645,7 @@ class EdgeBatchGUI:
                             stack.append((ny, nx))
         return components
 
-    def _evaluate_settings(self, files, settings, max_files, auto_config, roi_map):
-        if max_files >= len(files):
-            subset = list(files)
-        else:
-            step = max(1, len(files) // max_files)
-            subset = list(files)[::step][:max_files]
+    def _evaluate_settings(self, data, settings, auto_config):
         total_score = 0.0
         total_coverage = 0.0
         total_intrusion = 0.0
@@ -1518,73 +1653,67 @@ class EdgeBatchGUI:
         total_gap = 0.0
         total_thickness = 0.0
         total_continuity = 0.0
-        total_edges = 0
+        total_images = 0
 
-        for path in subset:
-            image = self.detector.load_image(path)
-            roi = roi_map.get(path)
-            if roi:
-                x1, y1, x2, y2 = roi
-                image = image[y1:y2, x1:x2]
-            mask_source = image
-            if settings["use_mask_blur"]:
-                mask_source = self.detector.apply_gaussian_blur(
-                    image, settings["mask_blur_kernel_size"], settings["mask_blur_sigma"]
-                )
-            mask = self.detector.estimate_object_mask(mask_source, settings["object_is_dark"])
-            if settings["mask_close_radius"] > 0:
-                mask = self.detector.erode_binary(
-                    self.detector.dilate_binary(mask, settings["mask_close_radius"]),
-                    settings["mask_close_radius"],
-                )
+        settings_eval = dict(settings)
+        settings_eval["use_boundary_band_filter"] = False
 
-            boundary = self._compute_boundary(mask)
-            band = self.detector.dilate_binary(boundary, settings["boundary_band_radius"])
+        for item in data:
+            image = item["image"]
+            mask = item["mask"]
+            band_radius = settings["boundary_band_radius"]
+            band = item["bands"].get(band_radius)
+            if band is None:
+                if band_radius <= 0:
+                    band = item["boundary"]
+                else:
+                    band = self.detector.dilate_binary(item["boundary"], band_radius)
 
             results = self.detector.detect_edges_array(
                 image,
                 use_nms=True,
                 use_hysteresis=True,
-                **settings,
+                **settings_eval,
             )
-            edges = results["edges"] > 0
-            edge_pixels = int(edges.sum())
+            edges_raw = results["edges"] > 0
+            edge_pixels = int(edges_raw.sum())
+            band_pixels = item["band_pixels"].get(band_radius, int(band.sum()))
+            edges_in_band = int((edges_raw & band).sum()) if band_pixels else 0
+            intrusion = int((edges_raw & mask & ~band).sum())
+            outside = int((edges_raw & ~mask & ~band).sum())
+
             if edge_pixels == 0:
-                continue
+                coverage = 0.0
+                intrusion_ratio = 1.0
+                outside_ratio = 1.0
+                gap_ratio = 1.0
+                continuity_penalty = 1.0
+                thickness_penalty = 1.0
+            else:
+                coverage = edges_in_band / band_pixels if band_pixels else 0.0
+                intrusion_ratio = intrusion / edge_pixels
+                outside_ratio = outside / edge_pixels
+                gap_ratio = max(0.0, 1.0 - coverage)
+                components = self._count_components(edges_raw & band)
+                components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
+                continuity_penalty = min(1.0, components_penalty * 5.0)
+                edge_density = edge_pixels / max(band_pixels, 1)
+                thickness_penalty = max(0.0, edge_density - 1.2)
 
-            band_pixels = int(band.sum())
-            edges_in_band = int((edges & band).sum())
-            intrusion = int((edges & mask & ~band).sum())
-            outside = int((edges & ~mask & ~band).sum())
-
-            coverage = edges_in_band / band_pixels if band_pixels else 0.0
-            intrusion_ratio = intrusion / edge_pixels
-            outside_ratio = outside / edge_pixels
-            gap_ratio = max(0.0, 1.0 - coverage)
-            components = self._count_components(edges & band)
-            components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
-            continuity_penalty = min(1.0, components_penalty * 5.0)
-            edge_density = edge_pixels / max(band_pixels, 1)
-            thickness_penalty = max(0.0, edge_density - 1.2)
-            w_cov = auto_config["weight_coverage"]
-            w_gap = auto_config["weight_gap"]
-            w_intr = auto_config["weight_intrusion"]
-            w_out = auto_config["weight_outside"]
-            w_thick = auto_config["weight_thickness"]
-            score = (
-                w_cov * coverage
-                - w_gap * (gap_ratio + continuity_penalty)
-                - w_intr * intrusion_ratio
-                - w_out * outside_ratio
-                - w_thick * thickness_penalty
-            )
-
+            metrics = {
+                "coverage": coverage,
+                "gap": gap_ratio,
+                "continuity": continuity_penalty,
+                "intrusion": intrusion_ratio,
+                "outside": outside_ratio,
+                "thickness": thickness_penalty,
+            }
+            score = compute_auto_score(metrics, auto_config)
             p10, p90 = np.percentile(image, [10, 90])
             contrast = max(float(p90 - p10), 1.0)
             if contrast < settings["contrast_ref"] * 0.6:
                 score *= (1.0 + auto_config["weight_low_quality"])
 
-            score = max(0.0, score)
             total_score += score
             total_coverage += coverage
             total_intrusion += intrusion_ratio
@@ -1592,19 +1721,19 @@ class EdgeBatchGUI:
             total_gap += gap_ratio
             total_thickness += thickness_penalty
             total_continuity += continuity_penalty
-            total_edges += 1
+            total_images += 1
 
-        if total_edges == 0:
+        if total_images == 0:
             return 0.0, {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0, "gap": 1.0, "thickness": 1.0}
 
-        avg_score = max(0.0, total_score / total_edges)
+        avg_score = max(0.0, total_score / total_images)
         summary = {
-            "coverage": total_coverage / total_edges,
-            "intrusion": total_intrusion / total_edges,
-            "outside": total_outside / total_edges,
-            "gap": total_gap / total_edges,
-            "thickness": total_thickness / total_edges,
-            "continuity": total_continuity / total_edges,
+            "coverage": total_coverage / total_images,
+            "intrusion": total_intrusion / total_images,
+            "outside": total_outside / total_images,
+            "gap": total_gap / total_images,
+            "thickness": total_thickness / total_images,
+            "continuity": total_continuity / total_images,
         }
         return avg_score, summary
 
@@ -1674,8 +1803,17 @@ class EdgeBatchGUI:
         self.status_var.set("Auto optimization started...")
         self.start_button.config(state=tk.DISABLED)
         self.auto_button.config(state=tk.DISABLED)
+        if self.pause_button:
+            self.pause_button.config(state=tk.NORMAL, text="Pause")
+        if self.stop_button:
+            self.stop_button.config(state=tk.NORMAL)
+        self._auto_pause_event.clear()
+        self._auto_stop_event.clear()
+        self._auto_start_time = time.time()
+        self._auto_last_best_time = self._auto_start_time
         self._auto_scores = []
         self._auto_best_scores = []
+        self._auto_best_time_series = []
         self._refresh_auto_graphs()
         self._worker_thread = threading.Thread(
             target=self._auto_optimize_worker,
@@ -1688,16 +1826,62 @@ class EdgeBatchGUI:
     def _auto_optimize_worker(self, files, base_settings, auto_config, mode, roi_map):
         candidates = self._build_candidates(base_settings, mode)
         max_files = min(8, len(files)) if mode == "Fast" else len(files)
+        data = self._prepare_auto_data(files, base_settings, auto_config, roi_map, max_files)
         best = None
         best_score = 0.0
         report_lines = []
         scores = []
         best_progress = []
+        stop_reason = None
+        start_time = time.time()
+        last_best_time = start_time
+        early_stop_enabled = bool(auto_config.get("early_stop_enabled", True))
+        early_stop_minutes = float(auto_config.get("early_stop_minutes", 10.0))
+        processed = 0
+
+        if not data:
+            report_dir = self._create_batch_output_dir()
+            report_path = os.path.join(report_dir, "auto_optimize_report.txt")
+            with open(report_path, "w", encoding="utf-8") as handle:
+                handle.write("No data available for auto optimization.\n")
+            self._message_queue.put(("auto_done", None, report_path, "no_data"))
+            return
+
+        def wait_if_paused():
+            while self._auto_pause_event.is_set() and not self._auto_stop_event.is_set():
+                time.sleep(0.2)
+            return not self._auto_stop_event.is_set()
+
+        def check_stagnation():
+            if not early_stop_enabled:
+                return False
+            stagnant = (time.time() - last_best_time) > (early_stop_minutes * 60.0)
+            if stagnant:
+                return True
+            return False
 
         for idx, settings in enumerate(candidates, start=1):
-            score, summary = self._evaluate_settings(files, settings, max_files, auto_config, roi_map)
+            if not wait_if_paused():
+                stop_reason = "stopped"
+                break
+            if check_stagnation():
+                stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
+                break
+            score, summary = self._evaluate_settings(data, settings, auto_config)
+            processed += 1
+            elapsed = time.time() - start_time
+            avg_time = elapsed / max(1, processed)
+            eta_seconds = avg_time * max(0, len(candidates) - processed)
+            score_base = auto_config["weight_coverage"] * summary["coverage"]
+            penalty = (
+                auto_config["weight_gap"] * (summary["gap"] + summary["continuity"])
+                + auto_config["weight_intrusion"] * summary["intrusion"]
+                + auto_config["weight_outside"] * summary["outside"]
+                + auto_config["weight_thickness"] * summary["thickness"]
+            )
             report_lines.append(
-                f"{idx:03d} score={score:.4f} coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
+                f"{idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
+                f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                 f"cont={summary['continuity']:.4f} intrusion={summary['intrusion']:.4f} outside={summary['outside']:.4f} "
                 f"thickness={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} "
                 f"high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} "
@@ -1707,10 +1891,15 @@ class EdgeBatchGUI:
             if best is None or score > best_score:
                 best_score = score
                 best = settings
+                last_best_time = time.time()
+                self._message_queue.put(("auto_best", best_score, elapsed))
             best_progress.append(best_score)
-            self._message_queue.put(("auto_progress", idx, len(candidates), score, best_score))
+            self._auto_best_time_series.append((elapsed, best_score))
+            self._message_queue.put(
+                ("auto_progress", idx, len(candidates), score, best_score, eta_seconds, "coarse", elapsed)
+            )
 
-        if best and mode != "Fast":
+        if best and mode != "Fast" and not stop_reason:
             refine_step = max(auto_config["auto_nms_step"] * 0.5, 0.005)
             high_step = max(auto_config["auto_high_step"] * 0.5, 0.005)
             margin_step = max(auto_config["auto_margin_step"] * 0.5, 0.05)
@@ -1729,9 +1918,27 @@ class EdgeBatchGUI:
                             refine_candidates.append(settings)
 
             for idx, settings in enumerate(refine_candidates, start=1):
-                score, summary = self._evaluate_settings(files, settings, max_files, auto_config, roi_map)
+                if not wait_if_paused():
+                    stop_reason = "stopped"
+                    break
+                if check_stagnation():
+                    stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
+                    break
+                score, summary = self._evaluate_settings(data, settings, auto_config)
+                processed += 1
+                elapsed = time.time() - start_time
+                avg_time = elapsed / max(1, processed)
+                eta_seconds = avg_time * max(0, len(refine_candidates) - idx)
+                score_base = auto_config["weight_coverage"] * summary["coverage"]
+                penalty = (
+                    auto_config["weight_gap"] * (summary["gap"] + summary["continuity"])
+                    + auto_config["weight_intrusion"] * summary["intrusion"]
+                    + auto_config["weight_outside"] * summary["outside"]
+                    + auto_config["weight_thickness"] * summary["thickness"]
+                )
                 report_lines.append(
-                    f"refine {idx:03d} score={score:.4f} coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
+                    f"refine {idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
+                    f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                     f"cont={summary['continuity']:.4f} intrusion={summary['intrusion']:.4f} "
                     f"outside={summary['outside']:.4f} thickness={summary['thickness']:.4f} "
                     f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
@@ -1741,18 +1948,33 @@ class EdgeBatchGUI:
                 if best is None or score > best_score:
                     best_score = score
                     best = settings
+                    last_best_time = time.time()
+                    self._message_queue.put(("auto_best", best_score, elapsed))
                 best_progress.append(best_score)
-                self._message_queue.put(("auto_progress", idx, len(refine_candidates), score, best_score))
+                self._auto_best_time_series.append((elapsed, best_score))
+                self._message_queue.put(
+                    ("auto_progress", idx, len(refine_candidates), score, best_score, eta_seconds, "refine", elapsed)
+                )
+        if stop_reason:
+            report_lines.append(f"[STOP] Optimization ended: {stop_reason}")
 
         report_dir = self._create_batch_output_dir()
         report_path = os.path.join(report_dir, "auto_optimize_report.txt")
         with open(report_path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(report_lines))
 
+        time_csv = os.path.join(report_dir, "auto_optimize_best_time.csv")
+        with open(time_csv, "w", encoding="utf-8") as handle:
+            handle.write("elapsed_sec,best_score\n")
+            for elapsed, score in self._auto_best_time_series:
+                handle.write(f"{elapsed:.2f},{score:.6f}\n")
+
         graph_path = os.path.join(report_dir, "auto_optimize_scores.png")
         best_path = os.path.join(report_dir, "auto_optimize_best.png")
+        time_path = os.path.join(report_dir, "auto_optimize_best_time.png")
         self._draw_score_graph(scores, graph_path, "Score by Candidate")
         self._draw_score_graph(best_progress, best_path, "Best Score Progress")
+        self._draw_time_graph(self._auto_best_time_series, time_path, "Best Score vs Time (min)")
 
         config_path = os.path.join(report_dir, "auto_optimize_config.json")
         with open(config_path, "w", encoding="utf-8") as handle:
@@ -1763,7 +1985,7 @@ class EdgeBatchGUI:
                 indent=2,
             )
 
-        self._message_queue.put(("auto_done", best, report_path))
+        self._message_queue.put(("auto_done", best, report_path, stop_reason))
 
     def _render_graph(self, values, title, width=400, height=220):
         margin = 36
@@ -1810,15 +2032,72 @@ class EdgeBatchGUI:
             draw.ellipse([points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2], fill="blue")
         return img
 
+    def _render_time_graph(self, series, title, width=400, height=220):
+        margin = 36
+        img = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(img)
+
+        left = margin
+        top = margin
+        right = width - margin
+        bottom = height - margin
+        draw.rectangle([left, top, right, bottom], outline="black")
+        draw.text((left, 8), title, fill="black")
+
+        if not series:
+            return img
+
+        times = [float(t) for t, _ in series]
+        values = [float(v) for _, v in series]
+        min_x = min(0.0, min(times))
+        max_x = max(times)
+        if max_x <= min_x:
+            max_x = min_x + 1.0
+
+        min_y = min(0.0, min(values))
+        max_y = max(values)
+        if max_y <= min_y:
+            max_y = min_y + 1.0
+
+        def scale_x(t):
+            return left + (t - min_x) * (right - left) / (max_x - min_x)
+
+        def scale_y(val):
+            return bottom - (val - min_y) * (bottom - top) / (max_y - min_y)
+
+        ticks = 4
+        for i in range(ticks + 1):
+            tx = left + i * (right - left) / ticks
+            t_val = min_x + i * (max_x - min_x) / ticks
+            draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
+            draw.text((tx - 6, bottom + 6), f"{t_val/60.0:.1f}", fill="black")
+
+            ty = bottom - i * (bottom - top) / ticks
+            y_val = min_y + i * (max_y - min_y) / ticks
+            draw.line([(left - 4, ty), (left, ty)], fill="black")
+            draw.text((4, ty - 6), f"{y_val:.2f}", fill="black")
+
+        points = [(scale_x(t), scale_y(v)) for t, v in series]
+        if len(points) >= 2:
+            draw.line(points, fill="blue", width=2)
+        else:
+            draw.ellipse([points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2], fill="blue")
+        return img
+
     def _draw_score_graph(self, values, path, title):
         img = self._render_graph(values, title, width=800, height=300)
+        img.save(path)
+
+    def _draw_time_graph(self, series, path, title):
+        img = self._render_time_graph(series, title, width=800, height=300)
         img.save(path)
 
     def _refresh_auto_graphs(self):
         if not self.score_graph_label or not self.best_graph_label:
             return
         score_img = self._render_graph(self._auto_scores, "Score (current)", width=400, height=220)
-        best_img = self._render_graph(self._auto_best_scores, "Best score", width=400, height=220)
+        best_series = self._auto_best_time_series or [(i, v) for i, v in enumerate(self._auto_best_scores)]
+        best_img = self._render_time_graph(best_series, "Best score (min)", width=400, height=220)
         self._score_graph_photo = ImageTk.PhotoImage(score_img)
         self._best_graph_photo = ImageTk.PhotoImage(best_img)
         self.score_graph_label.config(image=self._score_graph_photo)
@@ -1922,6 +2201,10 @@ class EdgeBatchGUI:
             self.start_button.config(state=tk.NORMAL)
             if self.auto_button:
                 self.auto_button.config(state=tk.NORMAL)
+            if self.pause_button:
+                self.pause_button.config(state=tk.DISABLED, text="Pause")
+            if self.stop_button:
+                self.stop_button.config(state=tk.DISABLED)
 
     def _handle_message(self, msg):
         msg_type = msg[0]
@@ -1936,18 +2219,33 @@ class EdgeBatchGUI:
             self.status_var.set(f"Done! Output: {batch_dir}")
         elif msg_type == "auto_progress":
             idx, total, score, best_score = msg[1], msg[2], msg[3], msg[4]
+            eta_seconds = msg[5] if len(msg) > 5 else None
+            phase = msg[6] if len(msg) > 6 else "coarse"
+            elapsed = msg[7] if len(msg) > 7 else None
             self._auto_scores.append(score)
             self._auto_best_scores.append(best_score)
             self._refresh_auto_graphs()
+            eta_text = f" ETA {self._format_eta(eta_seconds)}" if eta_seconds is not None else ""
+            phase_text = f"{phase} " if phase else ""
             self.status_var.set(
-                f"Auto optimizing... ({idx}/{total}) score={score:.4f} best={best_score:.4f}"
+                f"Auto optimizing... ({phase_text}{idx}/{total}) score={score:.4f} "
+                f"best={best_score:.4f}{eta_text}"
             )
+        elif msg_type == "auto_best":
+            best_score, elapsed = msg[1], msg[2]
+            minutes = elapsed / 60.0
+            self._log(f"[AUTO] Best improved to {best_score:.4f} at {minutes:.1f} min")
         elif msg_type == "auto_done":
             settings, report_path = msg[1], msg[2]
+            stop_reason = msg[3] if len(msg) > 3 else None
             if settings:
                 self._apply_settings(settings)
-            self.status_var.set(f"Auto optimization complete! Report: {report_path}")
-            self._log(f"[AUTO] Completed: {report_path}")
+            if stop_reason:
+                self.status_var.set(f"Auto optimization stopped ({stop_reason}). Report: {report_path}")
+                self._log(f"[AUTO] Stopped ({stop_reason}): {report_path}")
+            else:
+                self.status_var.set(f"Auto optimization complete! Report: {report_path}")
+                self._log(f"[AUTO] Completed: {report_path}")
 
 
 def main():

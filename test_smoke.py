@@ -9,6 +9,7 @@ from sobel_edge_detection import (
     AUTO_DEFAULTS,
     PARAM_DEFAULTS,
     SobelEdgeDetector,
+    compute_auto_score,
     load_json_config,
     save_json_config,
 )
@@ -44,6 +45,18 @@ class SobelSmokeTest(unittest.TestCase):
             save_json_config(path, payload)
             loaded = load_json_config(path)
         self.assertEqual(loaded["auto"], payload["auto"])
+
+    def test_compute_auto_score_positive(self):
+        metrics = {
+            "coverage": 0.6,
+            "gap": 0.2,
+            "continuity": 0.1,
+            "intrusion": 0.05,
+            "outside": 0.03,
+            "thickness": 0.1,
+        }
+        score = compute_auto_score(metrics, AUTO_DEFAULTS)
+        self.assertGreater(score, 0.0)
 
 
 if __name__ == "__main__":

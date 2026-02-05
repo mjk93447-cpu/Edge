@@ -24,14 +24,31 @@ PARAM_DEFAULTS = {
     "nms_relax": 0.95,
     "low_ratio": 0.04,
     "high_ratio": 0.12,
+    "use_median_filter": True,
+    "median_kernel_size": 3,
     "use_blur": True,
     "blur_sigma": 1.2,
     "blur_kernel_size": 5,
+    "magnitude_gamma": 1.0,
+    "use_contrast_stretch": False,
+    "contrast_low_pct": 2.0,
+    "contrast_high_pct": 98.0,
     "auto_threshold": True,
     "contrast_ref": 80.0,
     "min_threshold_scale": 0.5,
+    "use_soft_linking": False,
+    "soft_low_ratio": 0.03,
+    "soft_high_ratio": 0.1,
+    "link_radius": 2,
+    "use_closing": False,
+    "closing_radius": 1,
+    "closing_iterations": 1,
     "use_thinning": True,
     "thinning_max_iter": 15,
+    "use_edge_smooth": False,
+    "edge_smooth_radius": 1,
+    "edge_smooth_iters": 1,
+    "spur_prune_iters": 0,
     "use_boundary_band_filter": True,
     "boundary_band_radius": 2,
     "object_is_dark": True,
@@ -73,6 +90,34 @@ AUTO_DEFAULTS = {
     "auto_min_scale_min": 0.4,
     "auto_min_scale_max": 0.8,
     "auto_min_scale_step": 0.1,
+    "auto_soft_high_min": 0.08,
+    "auto_soft_high_max": 0.18,
+    "auto_soft_high_step": 0.02,
+    "auto_soft_low_factor_min": 0.25,
+    "auto_soft_low_factor_max": 0.45,
+    "auto_soft_low_factor_step": 0.05,
+    "auto_link_radius_min": 1,
+    "auto_link_radius_max": 4,
+    "auto_link_radius_step": 1,
+    "auto_soft_link_prob": 0.5,
+    "auto_edge_smooth_radius_min": 0,
+    "auto_edge_smooth_radius_max": 2,
+    "auto_edge_smooth_iters_min": 1,
+    "auto_edge_smooth_iters_max": 2,
+    "auto_spur_prune_min": 0,
+    "auto_spur_prune_max": 3,
+    "auto_use_edge_smooth_prob": 0.6,
+    "auto_use_closing_prob": 0.3,
+    "auto_closing_radius_min": 1,
+    "auto_closing_radius_max": 2,
+    "auto_closing_iter_min": 1,
+    "auto_closing_iter_max": 2,
+    "auto_magnitude_gamma_min": 0.8,
+    "auto_magnitude_gamma_max": 1.4,
+    "auto_magnitude_gamma_step": 0.1,
+    "auto_median_kernel_min": 3,
+    "auto_median_kernel_max": 5,
+    "auto_median_kernel_step": 2,
     "weight_continuity": 3.0,
     "weight_band_fit": 2.4,
     "weight_coverage": 1.8,
@@ -80,6 +125,9 @@ AUTO_DEFAULTS = {
     "weight_outside": 1.6,
     "weight_thickness": 1.2,
     "weight_intrusion": 1.0,
+    "weight_endpoints": 2.2,
+    "weight_wrinkle": 1.4,
+    "weight_branch": 1.1,
     "weight_low_quality": 0.5,
     "early_stop_enabled": True,
     "early_stop_minutes": 10.0,
@@ -110,6 +158,9 @@ def compute_auto_score(metrics, weights, return_details=False):
     outside = float(metrics.get("outside", 1.0))
     thickness = float(metrics.get("thickness", 1.0))
     band_ratio = float(metrics.get("band_ratio", 0.0))
+    endpoint_ratio = float(metrics.get("endpoints", 1.0))
+    wrinkle_ratio = float(metrics.get("wrinkle", 1.0))
+    branch_ratio = float(metrics.get("branch", 1.0))
 
     w_cont = float(weights.get("weight_continuity", 3.0))
     w_band = float(weights.get("weight_band_fit", 2.4))
@@ -118,6 +169,9 @@ def compute_auto_score(metrics, weights, return_details=False):
     w_out = float(weights.get("weight_outside", 1.6))
     w_thick = float(weights.get("weight_thickness", 1.2))
     w_intr = float(weights.get("weight_intrusion", 1.0))
+    w_end = float(weights.get("weight_endpoints", 2.2))
+    w_wrinkle = float(weights.get("weight_wrinkle", 1.4))
+    w_branch = float(weights.get("weight_branch", 1.1))
 
     def sigmoid(x):
         return 1.0 / (1.0 + math.exp(-x))
@@ -129,6 +183,9 @@ def compute_auto_score(metrics, weights, return_details=False):
     q_out = sigmoid((0.05 - outside) / 0.03)
     q_thick = sigmoid((0.15 - thickness) / 0.08)
     q_intr = sigmoid((0.03 - intrusion) / 0.02)
+    q_end = sigmoid((0.05 - endpoint_ratio) / 0.02)
+    q_wrinkle = sigmoid((0.20 - wrinkle_ratio) / 0.06)
+    q_branch = sigmoid((0.08 - branch_ratio) / 0.04)
 
     score = (
         (q_cont ** w_cont)
@@ -138,7 +195,12 @@ def compute_auto_score(metrics, weights, return_details=False):
         * (q_thick ** w_thick)
         * (q_intr ** w_intr)
         * (q_out ** w_out)
+        * (q_end ** w_end)
+        * (q_wrinkle ** w_wrinkle)
+        * (q_branch ** w_branch)
     )
+    exp_penalty = math.exp(-2.5 * (endpoint_ratio + wrinkle_ratio + branch_ratio))
+    score *= exp_penalty
     score = max(0.0, score)
     if return_details:
         return score, {
@@ -149,6 +211,9 @@ def compute_auto_score(metrics, weights, return_details=False):
             "q_thick": q_thick,
             "q_intr": q_intr,
             "q_out": q_out,
+            "q_end": q_end,
+            "q_wrinkle": q_wrinkle,
+            "q_branch": q_branch,
         }
     return score
 
@@ -214,6 +279,26 @@ class SobelEdgeDetector:
         windows = sliding_window_view(padded, (kernel_size, kernel_size))
         median = np.median(windows, axis=(-2, -1))
         return median.astype(np.float32, copy=False)
+
+    def _neighbor_count(self, mask):
+        mask_u8 = mask.astype(np.uint8, copy=False)
+        padded = np.pad(mask_u8, 1, mode="constant", constant_values=0)
+        windows = sliding_window_view(padded, (3, 3))
+        counts = windows.sum(axis=(2, 3)) - mask_u8
+        return counts
+
+    def prune_spurs(self, edge_mask, iterations=1):
+        edge_mask = edge_mask.astype(bool, copy=True)
+        iterations = max(0, int(iterations))
+        if iterations <= 0:
+            return edge_mask
+        for _ in range(iterations):
+            counts = self._neighbor_count(edge_mask)
+            endpoints = edge_mask & (counts <= 1)
+            if not endpoints.any():
+                break
+            edge_mask[endpoints] = False
+        return edge_mask
 
     def contrast_stretch(self, image, low_pct=2.0, high_pct=98.0):
         """저대비 영역을 늘려 약한 에지를 강화"""
@@ -656,8 +741,12 @@ class SobelEdgeDetector:
         mask_blur_kernel_size=5,
         mask_blur_sigma=1.0,
         mask_close_radius=1,
+        use_edge_smooth=False,
+        edge_smooth_radius=1,
+        edge_smooth_iters=1,
         use_thinning=True,
         thinning_max_iter=15,
+        spur_prune_iters=0,
     ):
         """전체 에지 검출 파이프라인"""
         # 1. 입력 배열 준비
@@ -789,9 +878,20 @@ class SobelEdgeDetector:
             )
             edges_final = np.where(edge_mask, 255, 0)
 
+        if use_edge_smooth and edge_smooth_radius > 0:
+            edge_mask = edges_final > 0
+            for _ in range(max(int(edge_smooth_iters), 1)):
+                edge_mask = self.erode_binary(self.dilate_binary(edge_mask, edge_smooth_radius), edge_smooth_radius)
+            edges_final = np.where(edge_mask, 255, 0)
+
         if use_thinning:
             edge_mask = edges_final > 0
             edge_mask = self.thin_edges_zhang_suen(edge_mask, thinning_max_iter)
+            edges_final = np.where(edge_mask, 255, 0)
+
+        if spur_prune_iters > 0:
+            edge_mask = edges_final > 0
+            edge_mask = self.prune_spurs(edge_mask, spur_prune_iters)
             edges_final = np.where(edge_mask, 255, 0)
 
         edges_final = edges_final.astype(np.uint8)
@@ -871,12 +971,16 @@ class EdgeBatchGUI:
         self.score_graph_label = None
         self.best_graph_label = None
         self.metric_graph_label = None
+        self.detail_graph_label = None
         self._auto_scores = []
         self._auto_best_scores = []
         self._auto_best_time_series = []
         self._auto_cont_scores = []
         self._auto_band_scores = []
         self._auto_penalty_scores = []
+        self._auto_wrinkle_scores = []
+        self._auto_endpoint_scores = []
+        self._auto_branch_scores = []
         self._auto_start_time = None
         self._auto_last_best_time = None
         self._auto_pause_event = threading.Event()
@@ -1520,8 +1624,278 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=13, column=1, sticky="w", padx=(4, 12))
 
+        ttk.Label(auto_frame, text="Soft link prob").grid(row=14, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_soft_link_prob"],
+            width=6,
+        ).grid(row=14, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft high min").grid(row=14, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.04,
+            to=0.3,
+            increment=0.01,
+            textvariable=self.param_vars["auto_soft_high_min"],
+            width=6,
+        ).grid(row=14, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft high max").grid(row=14, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.04,
+            to=0.3,
+            increment=0.01,
+            textvariable=self.param_vars["auto_soft_high_max"],
+            width=6,
+        ).grid(row=14, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft high step").grid(row=15, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.005,
+            to=0.05,
+            increment=0.005,
+            textvariable=self.param_vars["auto_soft_high_step"],
+            width=6,
+        ).grid(row=15, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft low factor min").grid(row=15, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.1,
+            to=0.8,
+            increment=0.05,
+            textvariable=self.param_vars["auto_soft_low_factor_min"],
+            width=6,
+        ).grid(row=15, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft low factor max").grid(row=15, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.1,
+            to=0.8,
+            increment=0.05,
+            textvariable=self.param_vars["auto_soft_low_factor_max"],
+            width=6,
+        ).grid(row=15, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft low factor step").grid(row=16, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.01,
+            to=0.2,
+            increment=0.01,
+            textvariable=self.param_vars["auto_soft_low_factor_step"],
+            width=6,
+        ).grid(row=16, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Link radius min").grid(row=16, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_link_radius_min"],
+            width=6,
+        ).grid(row=16, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Link radius max").grid(row=16, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_link_radius_max"],
+            width=6,
+        ).grid(row=16, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Edge smooth prob").grid(row=17, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_use_edge_smooth_prob"],
+            width=6,
+        ).grid(row=17, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Smooth radius min").grid(row=17, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["auto_edge_smooth_radius_min"],
+            width=6,
+        ).grid(row=17, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Smooth radius max").grid(row=17, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["auto_edge_smooth_radius_max"],
+            width=6,
+        ).grid(row=17, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Smooth iters min").grid(row=18, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_edge_smooth_iters_min"],
+            width=6,
+        ).grid(row=18, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Smooth iters max").grid(row=18, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_edge_smooth_iters_max"],
+            width=6,
+        ).grid(row=18, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Spur prune min").grid(row=18, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_spur_prune_min"],
+            width=6,
+        ).grid(row=18, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Spur prune max").grid(row=19, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_spur_prune_max"],
+            width=6,
+        ).grid(row=19, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Closing prob").grid(row=19, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_use_closing_prob"],
+            width=6,
+        ).grid(row=19, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Closing radius min").grid(row=19, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["auto_closing_radius_min"],
+            width=6,
+        ).grid(row=19, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Closing radius max").grid(row=20, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["auto_closing_radius_max"],
+            width=6,
+        ).grid(row=20, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Closing iters min").grid(row=20, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=5,
+            increment=1,
+            textvariable=self.param_vars["auto_closing_iter_min"],
+            width=6,
+        ).grid(row=20, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Closing iters max").grid(row=20, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=5,
+            increment=1,
+            textvariable=self.param_vars["auto_closing_iter_max"],
+            width=6,
+        ).grid(row=20, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Gamma min").grid(row=21, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.6,
+            to=2.0,
+            increment=0.1,
+            textvariable=self.param_vars["auto_magnitude_gamma_min"],
+            width=6,
+        ).grid(row=21, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Gamma max").grid(row=21, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.6,
+            to=2.0,
+            increment=0.1,
+            textvariable=self.param_vars["auto_magnitude_gamma_max"],
+            width=6,
+        ).grid(row=21, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Gamma step").grid(row=21, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.05,
+            to=0.3,
+            increment=0.05,
+            textvariable=self.param_vars["auto_magnitude_gamma_step"],
+            width=6,
+        ).grid(row=21, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Median kernel min").grid(row=22, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=3,
+            to=7,
+            increment=2,
+            textvariable=self.param_vars["auto_median_kernel_min"],
+            width=6,
+        ).grid(row=22, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Median kernel max").grid(row=22, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=3,
+            to=9,
+            increment=2,
+            textvariable=self.param_vars["auto_median_kernel_max"],
+            width=6,
+        ).grid(row=22, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Median kernel step").grid(row=22, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=2,
+            to=4,
+            increment=2,
+            textvariable=self.param_vars["auto_median_kernel_step"],
+            width=6,
+        ).grid(row=22, column=5, sticky="w", padx=(4, 12))
+
         auto_btn_frame = ttk.Frame(auto_frame)
-        auto_btn_frame.grid(row=14, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        auto_btn_frame.grid(row=23, column=0, columnspan=6, sticky="w", pady=(4, 0))
         ttk.Button(auto_btn_frame, text="Save Auto Config", command=self._save_auto_config).pack(side=tk.LEFT, padx=4)
         ttk.Button(auto_btn_frame, text="Load Auto Config", command=self._load_auto_config).pack(side=tk.LEFT, padx=4)
 
@@ -1557,6 +1931,12 @@ class EdgeBatchGUI:
         self.best_graph_label.pack(side=tk.LEFT, padx=6)
         self.metric_graph_label = ttk.Label(graph_frame)
         self.metric_graph_label.pack(side=tk.LEFT, padx=6)
+        self.detail_graph_label = ttk.Label(graph_frame)
+        self.detail_graph_label.pack(side=tk.LEFT, padx=6)
+        self.score_graph_label.bind("<Button-1>", lambda _e: self._open_graph_window("score"))
+        self.best_graph_label.bind("<Button-1>", lambda _e: self._open_graph_window("best"))
+        self.metric_graph_label.bind("<Button-1>", lambda _e: self._open_graph_window("metric"))
+        self.detail_graph_label.bind("<Button-1>", lambda _e: self._open_graph_window("detail"))
 
         self.log_text = tk.Text(main_frame, height=6, wrap="word")
         self.log_text.pack(fill=tk.BOTH, pady=(6, 6))
@@ -1986,14 +2366,31 @@ class EdgeBatchGUI:
             "nms_relax": nms_relax,
             "low_ratio": low_ratio,
             "high_ratio": high_ratio,
+            "use_median_filter": bool(self.param_vars["use_median_filter"].get()),
+            "median_kernel_size": max(3, get_int("median_kernel_size") | 1),
             "use_blur": bool(self.param_vars["use_blur"].get()),
             "blur_sigma": get_float("blur_sigma"),
             "blur_kernel_size": max(3, get_int("blur_kernel_size")),
+            "magnitude_gamma": get_float("magnitude_gamma"),
+            "use_contrast_stretch": bool(self.param_vars["use_contrast_stretch"].get()),
+            "contrast_low_pct": get_float("contrast_low_pct"),
+            "contrast_high_pct": get_float("contrast_high_pct"),
             "auto_threshold": bool(self.param_vars["auto_threshold"].get()),
             "contrast_ref": get_float("contrast_ref"),
             "min_threshold_scale": get_float("min_threshold_scale"),
+            "use_soft_linking": bool(self.param_vars["use_soft_linking"].get()),
+            "soft_low_ratio": get_float("soft_low_ratio"),
+            "soft_high_ratio": get_float("soft_high_ratio"),
+            "link_radius": max(0, get_int("link_radius")),
+            "use_closing": bool(self.param_vars["use_closing"].get()),
+            "closing_radius": max(0, get_int("closing_radius")),
+            "closing_iterations": max(1, get_int("closing_iterations")),
             "use_thinning": bool(self.param_vars["use_thinning"].get()),
             "thinning_max_iter": max(1, get_int("thinning_max_iter")),
+            "use_edge_smooth": bool(self.param_vars["use_edge_smooth"].get()),
+            "edge_smooth_radius": max(0, get_int("edge_smooth_radius")),
+            "edge_smooth_iters": max(1, get_int("edge_smooth_iters")),
+            "spur_prune_iters": max(0, get_int("spur_prune_iters")),
             "use_boundary_band_filter": bool(self.param_vars["use_boundary_band_filter"].get()),
             "boundary_band_radius": max(1, get_int("boundary_band_radius")),
             "object_is_dark": bool(self.param_vars["object_is_dark"].get()),
@@ -2121,11 +2518,17 @@ class EdgeBatchGUI:
         total_thickness = 0.0
         total_continuity = 0.0
         total_band_ratio = 0.0
+        total_endpoints = 0.0
+        total_wrinkle = 0.0
+        total_branch = 0.0
         total_weight = 0.0
         total_q_cont = 0.0
         total_q_band = 0.0
         total_q_thick = 0.0
         total_q_intr = 0.0
+        total_q_end = 0.0
+        total_q_wrinkle = 0.0
+        total_q_branch = 0.0
 
         settings_eval = dict(settings)
         settings_eval["use_boundary_band_filter"] = False
@@ -2162,12 +2565,22 @@ class EdgeBatchGUI:
                 continuity_penalty = 1.0
                 thickness_penalty = 1.0
                 band_ratio = 0.0
+                endpoint_ratio = 1.0
+                wrinkle_ratio = 1.0
+                branch_ratio = 1.0
             else:
                 coverage = edges_in_band / band_pixels if band_pixels else 0.0
                 intrusion_ratio = intrusion / edge_pixels
                 outside_ratio = outside / edge_pixels
                 gap_ratio = max(0.0, 1.0 - coverage)
                 band_ratio = edges_in_band / edge_pixels if edge_pixels else 0.0
+                neighbor_counts = self.detector._neighbor_count(edges_raw)
+                endpoint_count = int((edges_raw & (neighbor_counts <= 1)).sum())
+                branch_count = int((edges_raw & (neighbor_counts >= 3)).sum())
+                endpoint_ratio = endpoint_count / edge_pixels
+                branch_ratio = branch_count / edge_pixels
+                smooth_mask = self.detector.erode_binary(self.detector.dilate_binary(edges_raw, 1), 1)
+                wrinkle_ratio = int((edges_raw ^ smooth_mask).sum()) / edge_pixels
                 components = self._count_components(edges_raw & band)
                 components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
                 continuity_penalty = min(1.0, components_penalty * 5.0)
@@ -2182,6 +2595,9 @@ class EdgeBatchGUI:
                 "outside": outside_ratio,
                 "thickness": thickness_penalty,
                 "band_ratio": band_ratio,
+                "endpoints": endpoint_ratio,
+                "wrinkle": wrinkle_ratio,
+                "branch": branch_ratio,
             }
             score, details = compute_auto_score(metrics, auto_config, return_details=True)
             p10, p90 = np.percentile(image, [10, 90])
@@ -2200,6 +2616,9 @@ class EdgeBatchGUI:
                 thickness_penalty,
                 continuity_penalty,
                 band_ratio,
+                endpoint_ratio,
+                wrinkle_ratio,
+                branch_ratio,
                 details,
             )
 
@@ -2223,6 +2642,9 @@ class EdgeBatchGUI:
             thickness_penalty,
             continuity_penalty,
             band_ratio,
+            endpoint_ratio,
+            wrinkle_ratio,
+            branch_ratio,
             details,
         ) in results:
             total_weight += weight
@@ -2234,16 +2656,41 @@ class EdgeBatchGUI:
             total_thickness += thickness_penalty * weight
             total_continuity += continuity_penalty * weight
             total_band_ratio += band_ratio * weight
+            total_endpoints += endpoint_ratio * weight
+            total_wrinkle += wrinkle_ratio * weight
+            total_branch += branch_ratio * weight
             total_q_cont += details["q_cont"] * weight
             total_q_band += details["q_band"] * weight
             total_q_thick += details["q_thick"] * weight
             total_q_intr += details["q_intr"] * weight
+            total_q_end += details["q_end"] * weight
+            total_q_wrinkle += details["q_wrinkle"] * weight
+            total_q_branch += details["q_branch"] * weight
 
         if total_weight <= 0:
             return (
                 0.0,
-                {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0, "gap": 1.0, "thickness": 1.0},
-                {"q_cont": 0.0, "q_band": 0.0, "q_thick": 0.0, "q_intr": 0.0},
+                {
+                    "coverage": 0.0,
+                    "intrusion": 1.0,
+                    "outside": 1.0,
+                    "gap": 1.0,
+                    "thickness": 1.0,
+                    "continuity": 1.0,
+                    "band_ratio": 0.0,
+                    "endpoints": 1.0,
+                    "wrinkle": 1.0,
+                    "branch": 1.0,
+                },
+                {
+                    "q_cont": 0.0,
+                    "q_band": 0.0,
+                    "q_thick": 0.0,
+                    "q_intr": 0.0,
+                    "q_end": 0.0,
+                    "q_wrinkle": 0.0,
+                    "q_branch": 0.0,
+                },
             )
 
         avg_score = max(0.0, total_score / total_weight)
@@ -2255,12 +2702,18 @@ class EdgeBatchGUI:
             "thickness": total_thickness / total_weight,
             "continuity": total_continuity / total_weight,
             "band_ratio": total_band_ratio / total_weight,
+            "endpoints": total_endpoints / total_weight,
+            "wrinkle": total_wrinkle / total_weight,
+            "branch": total_branch / total_weight,
         }
         qualities = {
             "q_cont": total_q_cont / total_weight,
             "q_band": total_q_band / total_weight,
             "q_thick": total_q_thick / total_weight,
             "q_intr": total_q_intr / total_weight,
+            "q_end": total_q_end / total_weight,
+            "q_wrinkle": total_q_wrinkle / total_weight,
+            "q_branch": total_q_branch / total_weight,
         }
         return avg_score, summary, qualities
 
@@ -2329,6 +2782,26 @@ class EdgeBatchGUI:
         contrast_max = max(auto_config["auto_contrast_ref_min"], auto_config["auto_contrast_ref_max"])
         min_scale_min = min(auto_config["auto_min_scale_min"], auto_config["auto_min_scale_max"])
         min_scale_max = max(auto_config["auto_min_scale_min"], auto_config["auto_min_scale_max"])
+        soft_high_min = min(auto_config["auto_soft_high_min"], auto_config["auto_soft_high_max"])
+        soft_high_max = max(auto_config["auto_soft_high_min"], auto_config["auto_soft_high_max"])
+        soft_low_min = min(auto_config["auto_soft_low_factor_min"], auto_config["auto_soft_low_factor_max"])
+        soft_low_max = max(auto_config["auto_soft_low_factor_min"], auto_config["auto_soft_low_factor_max"])
+        link_radius_min = min(auto_config["auto_link_radius_min"], auto_config["auto_link_radius_max"])
+        link_radius_max = max(auto_config["auto_link_radius_min"], auto_config["auto_link_radius_max"])
+        smooth_radius_min = min(auto_config["auto_edge_smooth_radius_min"], auto_config["auto_edge_smooth_radius_max"])
+        smooth_radius_max = max(auto_config["auto_edge_smooth_radius_min"], auto_config["auto_edge_smooth_radius_max"])
+        smooth_iters_min = min(auto_config["auto_edge_smooth_iters_min"], auto_config["auto_edge_smooth_iters_max"])
+        smooth_iters_max = max(auto_config["auto_edge_smooth_iters_min"], auto_config["auto_edge_smooth_iters_max"])
+        spur_min = min(auto_config["auto_spur_prune_min"], auto_config["auto_spur_prune_max"])
+        spur_max = max(auto_config["auto_spur_prune_min"], auto_config["auto_spur_prune_max"])
+        closing_radius_min = min(auto_config["auto_closing_radius_min"], auto_config["auto_closing_radius_max"])
+        closing_radius_max = max(auto_config["auto_closing_radius_min"], auto_config["auto_closing_radius_max"])
+        closing_iter_min = min(auto_config["auto_closing_iter_min"], auto_config["auto_closing_iter_max"])
+        closing_iter_max = max(auto_config["auto_closing_iter_min"], auto_config["auto_closing_iter_max"])
+        gamma_min = min(auto_config["auto_magnitude_gamma_min"], auto_config["auto_magnitude_gamma_max"])
+        gamma_max = max(auto_config["auto_magnitude_gamma_min"], auto_config["auto_magnitude_gamma_max"])
+        median_min = min(auto_config["auto_median_kernel_min"], auto_config["auto_median_kernel_max"])
+        median_max = max(auto_config["auto_median_kernel_min"], auto_config["auto_median_kernel_max"])
 
         def candidate_key(settings):
             return (
@@ -2342,13 +2815,23 @@ class EdgeBatchGUI:
                 int(settings["thinning_max_iter"]),
                 round(settings["contrast_ref"], 1),
                 round(settings["min_threshold_scale"], 2),
+                round(settings["magnitude_gamma"], 2),
+                int(settings["median_kernel_size"]),
+                int(settings["link_radius"]),
+                round(settings["soft_high_ratio"], 2),
+                round(settings["soft_low_ratio"], 2),
+                int(settings["edge_smooth_radius"]),
+                int(settings["edge_smooth_iters"]),
+                int(settings["spur_prune_iters"]),
+                int(settings["closing_radius"]),
+                int(settings["closing_iterations"]),
             )
 
         max_tries = max(count * 8, 200)
         tries = 0
         while len(candidates) < count and tries < max_tries:
             tries += 1
-            center = rng.choice(centers) if centers else None
+            center = centers[rng.randint(0, len(centers))] if centers else None
             nms_center = center["nms_relax"] if center else None
             high_center = center["high_ratio"] if center else None
             low_center = None
@@ -2419,6 +2902,60 @@ class EdgeBatchGUI:
                 min_scale_center,
                 step_scale,
             )
+            magnitude_gamma = self._sample_float(
+                rng,
+                gamma_min,
+                gamma_max,
+                auto_config["auto_magnitude_gamma_step"],
+                None,
+                step_scale,
+            )
+            median_kernel = self._sample_int(
+                rng,
+                median_min,
+                median_max,
+                auto_config["auto_median_kernel_step"],
+                None,
+                step_scale,
+                odd=True,
+            )
+            use_soft_linking = rng.rand() < float(auto_config["auto_soft_link_prob"])
+            soft_high = self._sample_float(
+                rng,
+                soft_high_min,
+                soft_high_max,
+                auto_config["auto_soft_high_step"],
+                None,
+                step_scale,
+            )
+            soft_factor = self._sample_float(
+                rng,
+                soft_low_min,
+                soft_low_max,
+                auto_config["auto_soft_low_factor_step"],
+                None,
+                step_scale,
+            )
+            soft_low = max(0.01, soft_high * soft_factor)
+            link_radius = self._sample_int(
+                rng,
+                link_radius_min,
+                link_radius_max,
+                auto_config["auto_link_radius_step"],
+                None,
+                step_scale,
+            )
+            use_edge_smooth = rng.rand() < float(auto_config["auto_use_edge_smooth_prob"])
+            edge_smooth_radius = self._sample_int(rng, smooth_radius_min, smooth_radius_max, 1, None, step_scale)
+            edge_smooth_iters = self._sample_int(rng, smooth_iters_min, smooth_iters_max, 1, None, step_scale)
+            spur_prune_iters = self._sample_int(rng, spur_min, spur_max, 1, None, step_scale)
+            use_closing = rng.rand() < float(auto_config["auto_use_closing_prob"])
+            closing_radius = self._sample_int(
+                rng, closing_radius_min, closing_radius_max, 1, None, step_scale
+            )
+            closing_iters = self._sample_int(
+                rng, closing_iter_min, closing_iter_max, 1, None, step_scale
+            )
 
             low_ratio = max(0.02, high_ratio * low_factor)
 
@@ -2436,6 +2973,19 @@ class EdgeBatchGUI:
                     "thinning_max_iter": int(max(1, thinning_iter)),
                     "contrast_ref": float(contrast_ref),
                     "min_threshold_scale": float(min_scale),
+                    "magnitude_gamma": float(magnitude_gamma),
+                    "median_kernel_size": int(max(3, median_kernel)),
+                    "use_soft_linking": bool(use_soft_linking),
+                    "soft_high_ratio": float(soft_high),
+                    "soft_low_ratio": float(soft_low),
+                    "link_radius": int(max(0, link_radius)),
+                    "use_edge_smooth": bool(use_edge_smooth),
+                    "edge_smooth_radius": int(edge_smooth_radius if use_edge_smooth else 0),
+                    "edge_smooth_iters": int(edge_smooth_iters),
+                    "spur_prune_iters": int(spur_prune_iters),
+                    "use_closing": bool(use_closing),
+                    "closing_radius": int(closing_radius if use_closing else 0),
+                    "closing_iterations": int(closing_iters),
                 }
             )
             key = candidate_key(settings)
@@ -2480,6 +3030,9 @@ class EdgeBatchGUI:
         self._auto_cont_scores = []
         self._auto_band_scores = []
         self._auto_penalty_scores = []
+        self._auto_wrinkle_scores = []
+        self._auto_endpoint_scores = []
+        self._auto_branch_scores = []
         self._refresh_auto_graphs()
         self._worker_thread = threading.Thread(
             target=self._auto_optimize_worker,
@@ -2544,6 +3097,16 @@ class EdgeBatchGUI:
                 int(settings["thinning_max_iter"]),
                 round(settings["contrast_ref"], 1),
                 round(settings["min_threshold_scale"], 2),
+                round(settings.get("magnitude_gamma", 1.0), 2),
+                int(settings.get("median_kernel_size", 3)),
+                int(settings.get("link_radius", 0)),
+                round(settings.get("soft_high_ratio", 0.0), 2),
+                round(settings.get("soft_low_ratio", 0.0), 2),
+                int(settings.get("edge_smooth_radius", 0)),
+                int(settings.get("edge_smooth_iters", 0)),
+                int(settings.get("spur_prune_iters", 0)),
+                int(settings.get("closing_radius", 0)),
+                int(settings.get("closing_iterations", 0)),
             )
 
         def check_stagnation():
@@ -2577,6 +3140,7 @@ class EdgeBatchGUI:
                 f"{idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
                 f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                 f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
                 f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
                 f"thick={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} "
                 f"high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} "
@@ -2651,6 +3215,7 @@ class EdgeBatchGUI:
                     f"refine {idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
                     f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                     f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                    f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
                     f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
                     f"thick={summary['thickness']:.4f} "
                     f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
@@ -2723,6 +3288,7 @@ class EdgeBatchGUI:
                         f"adaptive{round_idx} {idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
                         f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                         f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                        f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
                         f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
                         f"thick={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} "
                         f"low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
@@ -2955,24 +3521,66 @@ class EdgeBatchGUI:
     def _refresh_auto_graphs(self):
         if not self.score_graph_label or not self.best_graph_label:
             return
-        score_img = self._render_graph(self._auto_scores, "Score (current)", width=400, height=220)
+        score_img = self._render_graph(self._auto_scores, "Score (current)", width=460, height=260)
         best_series = self._auto_best_time_series or [(i, v) for i, v in enumerate(self._auto_best_scores)]
-        best_img = self._render_time_graph(best_series, "Best score (min)", width=400, height=220)
+        best_img = self._render_time_graph(best_series, "Best score (min)", width=460, height=260)
         metric_img = self._render_multi_graph(
             [self._auto_cont_scores, self._auto_band_scores],
             "Continuity & Band Fit",
             ["Continuity", "Band fit"],
             ["green", "blue"],
-            width=400,
-            height=220,
+            width=460,
+            height=260,
+        )
+        detail_img = self._render_multi_graph(
+            [self._auto_endpoint_scores, self._auto_wrinkle_scores, self._auto_branch_scores],
+            "Endpoints & Wrinkle",
+            ["Endpoints", "Wrinkle", "Branch"],
+            ["purple", "orange", "red"],
+            width=460,
+            height=260,
         )
         self._score_graph_photo = ImageTk.PhotoImage(score_img)
         self._best_graph_photo = ImageTk.PhotoImage(best_img)
         self._metric_graph_photo = ImageTk.PhotoImage(metric_img)
+        self._detail_graph_photo = ImageTk.PhotoImage(detail_img)
         self.score_graph_label.config(image=self._score_graph_photo)
         self.best_graph_label.config(image=self._best_graph_photo)
         if self.metric_graph_label:
             self.metric_graph_label.config(image=self._metric_graph_photo)
+        if self.detail_graph_label:
+            self.detail_graph_label.config(image=self._detail_graph_photo)
+
+    def _open_graph_window(self, kind):
+        win = tk.Toplevel(self.root)
+        win.title(f"Graph: {kind}")
+        if kind == "score":
+            img = self._render_graph(self._auto_scores, "Score (current)", width=900, height=520)
+        elif kind == "best":
+            series = self._auto_best_time_series or [(i, v) for i, v in enumerate(self._auto_best_scores)]
+            img = self._render_time_graph(series, "Best score (min)", width=900, height=520)
+        elif kind == "metric":
+            img = self._render_multi_graph(
+                [self._auto_cont_scores, self._auto_band_scores],
+                "Continuity & Band Fit",
+                ["Continuity", "Band fit"],
+                ["green", "blue"],
+                width=900,
+                height=520,
+            )
+        else:
+            img = self._render_multi_graph(
+                [self._auto_endpoint_scores, self._auto_wrinkle_scores, self._auto_branch_scores],
+                "Endpoints & Wrinkle",
+                ["Endpoints", "Wrinkle", "Branch"],
+                ["purple", "orange", "red"],
+                width=900,
+                height=520,
+            )
+        photo = ImageTk.PhotoImage(img)
+        label = ttk.Label(win, image=photo)
+        label.image = photo
+        label.pack()
 
     def _choose_output_dir(self):
         selected = filedialog.askdirectory(title="Select output folder")
@@ -3111,6 +3719,9 @@ class EdgeBatchGUI:
                     self._auto_band_scores.append(float(qualities.get("q_band", 0.0)))
                 if penalty is not None:
                     self._auto_penalty_scores.append(float(penalty))
+                self._auto_wrinkle_scores.append(float(summary.get("wrinkle", 0.0)))
+                self._auto_endpoint_scores.append(float(summary.get("endpoints", 0.0)))
+                self._auto_branch_scores.append(float(summary.get("branch", 0.0)))
             self._refresh_auto_graphs()
             eta_text = f" ETA {self._format_eta(eta_seconds)}" if eta_seconds is not None else ""
             phase_text = f"{phase} " if phase else ""

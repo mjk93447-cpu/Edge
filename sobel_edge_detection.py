@@ -1704,7 +1704,7 @@ class EdgeBatchGUI:
                 f"margin={settings['polarity_drop_margin']:.2f}"
             )
             scores.append(score)
-            if score > best_score:
+            if best is None or score > best_score:
                 best_score = score
                 best = settings
             best_progress.append(best_score)
@@ -1738,7 +1738,7 @@ class EdgeBatchGUI:
                     f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
                 )
                 scores.append(score)
-                if score > best_score:
+                if best is None or score > best_score:
                     best_score = score
                     best = settings
                 best_progress.append(best_score)

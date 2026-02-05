@@ -42,18 +42,18 @@ PARAM_DEFAULTS = {
 }
 
 AUTO_DEFAULTS = {
-    "auto_nms_min": 0.90,
+    "auto_nms_min": 0.88,
     "auto_nms_max": 1.00,
-    "auto_nms_step": 0.02,
-    "auto_high_min": 0.08,
-    "auto_high_max": 0.16,
-    "auto_high_step": 0.02,
+    "auto_nms_step": 0.01,
+    "auto_high_min": 0.06,
+    "auto_high_max": 0.18,
+    "auto_high_step": 0.01,
     "auto_low_factor": 0.33,
     "auto_band_min": 1,
-    "auto_band_max": 3,
+    "auto_band_max": 4,
     "auto_margin_min": 0.0,
-    "auto_margin_max": 0.8,
-    "auto_margin_step": 0.2,
+    "auto_margin_max": 0.6,
+    "auto_margin_step": 0.05,
     "weight_coverage": 1.0,
     "weight_intrusion": 1.2,
     "weight_outside": 0.7,
@@ -66,6 +66,7 @@ AUTO_DEFAULTS = {
 
 PARAM_KEYS = tuple(PARAM_DEFAULTS.keys())
 AUTO_KEYS = tuple(AUTO_DEFAULTS.keys())
+ROI_CACHE_PATH = os.path.abspath("roi_cache.json")
 
 
 def save_json_config(path, payload):
@@ -802,11 +803,12 @@ class EdgeBatchGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Sobel Edge Batch Processor")
-        self.root.geometry("920x720")
+        self.root.geometry("1920x1080")
 
         self.detector = SobelEdgeDetector()
         self.selected_files = []
         self.roi_map = {}
+        self.roi_cache = self._load_roi_cache()
         self.max_files = 100
         self.output_root = os.path.abspath("outputs")
 
@@ -818,9 +820,12 @@ class EdgeBatchGUI:
         self.log_text = None
         self.score_graph_label = None
         self.best_graph_label = None
+        self.metric_graph_label = None
         self._auto_scores = []
         self._auto_best_scores = []
         self._auto_best_time_series = []
+        self._auto_coverage_scores = []
+        self._auto_penalty_scores = []
         self._auto_start_time = None
         self._auto_last_best_time = None
         self._auto_pause_event = threading.Event()
@@ -842,8 +847,36 @@ class EdgeBatchGUI:
         return vars_map
 
     def _build_ui(self):
-        main_frame = ttk.Frame(self.root, padding=12)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        container = ttk.Frame(self.root)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
+        v_scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=v_scroll.set)
+
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        main_frame = ttk.Frame(canvas, padding=12)
+        canvas_window = canvas.create_window((0, 0), window=main_frame, anchor="nw")
+
+        def _on_frame_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+
+        main_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            delta = -1 * (event.delta // 120) if event.delta else 0
+            if delta:
+                canvas.yview_scroll(delta, "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", lambda event: canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>", lambda event: canvas.yview_scroll(1, "units"))
 
         header = ttk.Label(
             main_frame,
@@ -1267,6 +1300,8 @@ class EdgeBatchGUI:
         self.score_graph_label.pack(side=tk.LEFT, padx=6)
         self.best_graph_label = ttk.Label(graph_frame)
         self.best_graph_label.pack(side=tk.LEFT, padx=6)
+        self.metric_graph_label = ttk.Label(graph_frame)
+        self.metric_graph_label.pack(side=tk.LEFT, padx=6)
 
         self.log_text = tk.Text(main_frame, height=6, wrap="word")
         self.log_text.pack(fill=tk.BOTH, pady=(6, 6))
@@ -1309,66 +1344,133 @@ class EdgeBatchGUI:
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
 
+    def _load_roi_cache(self):
+        if not os.path.exists(ROI_CACHE_PATH):
+            return {}
+        try:
+            data = load_json_config(ROI_CACHE_PATH)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        cache = {}
+        for key, value in data.items():
+            if not isinstance(value, (list, tuple)) or len(value) != 4:
+                continue
+            try:
+                cache[str(key)] = (int(value[0]), int(value[1]), int(value[2]), int(value[3]))
+            except (ValueError, TypeError):
+                continue
+        return cache
+
+    def _save_roi_cache(self):
+        try:
+            save_json_config(ROI_CACHE_PATH, self.roi_cache)
+        except OSError:
+            self._log("[ROI] Failed to save ROI cache.")
+
+    def _format_file_label(self, path):
+        tag = "[ROI] " if path in self.roi_map else "      "
+        return f"{tag}{path}"
+
+    def _refresh_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        for path in self.selected_files:
+            self.file_listbox.insert(tk.END, self._format_file_label(path))
+
+    def _update_file_label(self, path):
+        if path not in self.selected_files:
+            return
+        idx = self.selected_files.index(path)
+        self.file_listbox.delete(idx)
+        self.file_listbox.insert(idx, self._format_file_label(path))
+
     def _get_selected_file(self):
         selection = self.file_listbox.curselection()
         if not selection:
             return None
-        return self.file_listbox.get(selection[0])
+        return self.selected_files[selection[0]]
 
     def _open_roi_editor(self):
-        path = self._get_selected_file()
-        if not path:
+        selection = self.file_listbox.curselection()
+        if not self.selected_files:
             messagebox.showinfo("Info", "Select a file to set ROI.")
             return
-        if not os.path.exists(path):
-            messagebox.showerror("Error", "File not found.")
-            return
-
-        img = Image.open(path).convert("L")
-        max_w, max_h = 800, 500
-        scale = min(max_w / img.width, max_h / img.height, 1.0)
-        disp_w = int(img.width * scale)
-        disp_h = int(img.height * scale)
-        display = img.resize((disp_w, disp_h), resample=Image.BILINEAR)
+        idx = selection[0] if selection else 0
+        idx = max(0, min(idx, len(self.selected_files) - 1))
 
         win = tk.Toplevel(self.root)
         win.title("Set ROI")
-        canvas = tk.Canvas(win, width=disp_w, height=disp_h)
+        canvas = tk.Canvas(win)
         canvas.pack()
-        tk_img = ImageTk.PhotoImage(display)
-        canvas.image = tk_img
-        canvas.create_image(0, 0, anchor="nw", image=tk_img)
-
-        roi_rect = None
-        start = {"x": 0, "y": 0}
+        file_label = ttk.Label(win, text="")
+        file_label.pack(pady=2)
         roi_label = ttk.Label(win, text="Drag to draw a rectangular ROI.")
         roi_label.pack(pady=4)
 
-        if path in self.roi_map:
-            x1, y1, x2, y2 = self.roi_map[path]
-            x1d, y1d = x1 * scale, y1 * scale
-            x2d, y2d = x2 * scale, y2 * scale
-            roi_rect = canvas.create_rectangle(x1d, y1d, x2d, y2d, outline="red", width=2)
+        state = {"idx": idx, "img": None, "scale": 1.0, "roi_rect": None, "path": None}
+        max_w, max_h = 900, 520
+
+        def load_index(new_idx):
+            if new_idx < 0 or new_idx >= len(self.selected_files):
+                roi_label.config(text="All ROI tasks are complete.")
+                return
+            state["idx"] = new_idx
+            path = self.selected_files[new_idx]
+            if not os.path.exists(path):
+                roi_label.config(text="File not found.")
+                return
+            img = Image.open(path).convert("L")
+            scale = min(max_w / img.width, max_h / img.height, 1.0)
+            disp_w = int(img.width * scale)
+            disp_h = int(img.height * scale)
+            display = img.resize((disp_w, disp_h), resample=Image.BILINEAR)
+            tk_img = ImageTk.PhotoImage(display)
+            canvas.config(width=disp_w, height=disp_h)
+            canvas.image = tk_img
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor="nw", image=tk_img)
+
+            state["img"] = img
+            state["scale"] = scale
+            state["path"] = path
+            state["roi_rect"] = None
+
+            if path in self.roi_map:
+                x1, y1, x2, y2 = self.roi_map[path]
+                x1d, y1d = x1 * scale, y1 * scale
+                x2d, y2d = x2 * scale, y2 * scale
+                state["roi_rect"] = canvas.create_rectangle(x1d, y1d, x2d, y2d, outline="red", width=2)
+                roi_label.config(text=f"ROI loaded: ({x1},{y1})-({x2},{y2})")
+            else:
+                roi_label.config(text="Drag to draw a rectangular ROI.")
+
+            file_label.config(text=f"File {new_idx + 1}/{len(self.selected_files)}: {os.path.basename(path)}")
+            self.file_listbox.selection_clear(0, tk.END)
+            self.file_listbox.selection_set(new_idx)
+            self.file_listbox.see(new_idx)
+
+        start = {"x": 0, "y": 0}
 
         def on_press(event):
             start["x"], start["y"] = event.x, event.y
-            nonlocal roi_rect
-            if roi_rect:
-                canvas.delete(roi_rect)
-                roi_rect = None
+            if state["roi_rect"]:
+                canvas.delete(state["roi_rect"])
+                state["roi_rect"] = None
 
         def on_drag(event):
-            nonlocal roi_rect
-            if roi_rect:
-                canvas.delete(roi_rect)
-            roi_rect = canvas.create_rectangle(
+            if state["roi_rect"]:
+                canvas.delete(state["roi_rect"])
+            state["roi_rect"] = canvas.create_rectangle(
                 start["x"], start["y"], event.x, event.y, outline="red", width=2
             )
 
         def on_release(event):
-            nonlocal roi_rect
-            if not roi_rect:
+            if not state["roi_rect"] or state["img"] is None:
                 return
+            img = state["img"]
+            scale = state["scale"]
+            path = state["path"]
             x1 = min(start["x"], event.x) / scale
             y1 = min(start["y"], event.y) / scale
             x2 = max(start["x"], event.x) / scale
@@ -1381,23 +1483,52 @@ class EdgeBatchGUI:
                 roi_label.config(text="ROI is too small.")
                 return
             self.roi_map[path] = (x1, y1, x2, y2)
+            self.roi_cache[path] = (x1, y1, x2, y2)
+            self.roi_cache[os.path.basename(path)] = (x1, y1, x2, y2)
+            self._save_roi_cache()
+            self._update_file_label(path)
             roi_label.config(text=f"ROI saved: ({x1},{y1})-({x2},{y2})")
+
+            next_idx = state["idx"] + 1
+            if next_idx < len(self.selected_files):
+                load_index(next_idx)
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
 
         def clear_roi():
-            if path in self.roi_map:
+            path = state["path"]
+            if path and path in self.roi_map:
                 del self.roi_map[path]
-            if roi_rect:
-                canvas.delete(roi_rect)
+            if path and path in self.roi_cache:
+                del self.roi_cache[path]
+            if path:
+                base = os.path.basename(path)
+                if base in self.roi_cache:
+                    del self.roi_cache[base]
+            self._save_roi_cache()
+            if state["roi_rect"]:
+                canvas.delete(state["roi_rect"])
+                state["roi_rect"] = None
+            if path:
+                self._update_file_label(path)
             roi_label.config(text="ROI cleared.")
+
+        def prev_image():
+            load_index(state["idx"] - 1)
+
+        def next_image():
+            load_index(state["idx"] + 1)
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(pady=6)
+        ttk.Button(btn_frame, text="Prev", command=prev_image).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Next", command=next_image).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text="Clear ROI", command=clear_roi).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side=tk.LEFT, padx=4)
+
+        load_index(idx)
 
     def _clear_roi(self):
         path = self._get_selected_file()
@@ -1406,6 +1537,13 @@ class EdgeBatchGUI:
             return
         if path in self.roi_map:
             del self.roi_map[path]
+            if path in self.roi_cache:
+                del self.roi_cache[path]
+            base = os.path.basename(path)
+            if base in self.roi_cache:
+                del self.roi_cache[base]
+            self._save_roi_cache()
+            self._update_file_label(path)
             self._log(f"[ROI] Cleared: {os.path.basename(path)}")
         else:
             messagebox.showinfo("Info", "No ROI is set.")
@@ -1448,7 +1586,9 @@ class EdgeBatchGUI:
 
     def _prepare_auto_data(self, files, settings, auto_config, roi_map, max_files):
         subset = self._select_auto_subset(files, max_files)
-        band_radii = list(range(auto_config["auto_band_min"], auto_config["auto_band_max"] + 1))
+        band_min = min(auto_config["auto_band_min"], auto_config["auto_band_max"])
+        band_max = max(auto_config["auto_band_min"], auto_config["auto_band_max"])
+        band_radii = list(range(band_min, band_max + 1))
         if not band_radii:
             band_radii = [settings["boundary_band_radius"]]
         data = []
@@ -1737,8 +1877,76 @@ class EdgeBatchGUI:
         }
         return avg_score, summary
 
-    def _build_candidates(self, base_settings, mode):
-        auto_config = self._get_auto_config()
+    def _sample_candidates(self, candidates, budget):
+        if budget <= 0 or len(candidates) <= budget:
+            return candidates
+        stride = max(1, len(candidates) // budget)
+        sampled = candidates[::stride]
+        return sampled[:budget]
+
+    def _generate_ai_candidates(self, top_settings, auto_config, mode, seen_keys):
+        if not top_settings:
+            return []
+        step_nms = max(float(auto_config["auto_nms_step"]) * 0.5, 0.005)
+        step_high = max(float(auto_config["auto_high_step"]) * 0.5, 0.005)
+        step_margin = max(float(auto_config["auto_margin_step"]) * 0.5, 0.02)
+        band_min = int(min(auto_config["auto_band_min"], auto_config["auto_band_max"]))
+        band_max = int(max(auto_config["auto_band_min"], auto_config["auto_band_max"]))
+        nms_min = float(min(auto_config["auto_nms_min"], auto_config["auto_nms_max"]))
+        nms_max = float(max(auto_config["auto_nms_min"], auto_config["auto_nms_max"]))
+        high_min = float(min(auto_config["auto_high_min"], auto_config["auto_high_max"]))
+        high_max = float(max(auto_config["auto_high_min"], auto_config["auto_high_max"]))
+
+        top_k = 3 if mode == "Fast" else 6
+        budget = 120 if mode == "Fast" else 240
+        candidates = []
+
+        def key_from(settings):
+            return (
+                round(settings["nms_relax"], 3),
+                round(settings["high_ratio"], 3),
+                int(settings["boundary_band_radius"]),
+                round(settings["polarity_drop_margin"], 3),
+            )
+
+        jitter_nms = [0.0, -step_nms, step_nms]
+        jitter_high = [0.0, -step_high, step_high]
+        margin_min = float(min(auto_config["auto_margin_min"], auto_config["auto_margin_max"]))
+        margin_max = float(max(auto_config["auto_margin_min"], auto_config["auto_margin_max"]))
+        jitter_margin = [0.0, -step_margin, step_margin]
+        jitter_band = [0, -1, 1]
+
+        for base in top_settings[:top_k]:
+            for dnms in jitter_nms:
+                for dhigh in jitter_high:
+                    for dmargin in jitter_margin:
+                        for dband in jitter_band:
+                            nms = min(nms_max, max(nms_min, base["nms_relax"] + dnms))
+                            high = min(high_max, max(high_min, base["high_ratio"] + dhigh))
+                            low = max(0.02, high * auto_config["auto_low_factor"])
+                            band = min(band_max, max(band_min, base["boundary_band_radius"] + dband))
+                            margin = min(margin_max, max(margin_min, base["polarity_drop_margin"] + dmargin))
+                            settings = dict(base)
+                            settings.update(
+                                {
+                                    "nms_relax": round(nms, 3),
+                                    "high_ratio": float(high),
+                                    "low_ratio": float(low),
+                                    "boundary_band_radius": int(band),
+                                    "polarity_drop_margin": float(margin),
+                                    "use_boundary_band_filter": int(band) > 0,
+                                }
+                            )
+                            key = key_from(settings)
+                            if key in seen_keys:
+                                continue
+                            seen_keys.add(key)
+                            candidates.append(settings)
+                            if len(candidates) >= budget:
+                                return candidates
+        return candidates
+
+    def _build_candidates(self, base_settings, mode, auto_config):
 
         def frange(start, stop, step):
             values = []
@@ -1750,11 +1958,24 @@ class EdgeBatchGUI:
                 v += step
             return values
 
-        nms_list = frange(auto_config["auto_nms_min"], auto_config["auto_nms_max"], auto_config["auto_nms_step"])
-        high_list = frange(auto_config["auto_high_min"], auto_config["auto_high_max"], auto_config["auto_high_step"])
-        margin_list = frange(auto_config["auto_margin_min"], auto_config["auto_margin_max"], auto_config["auto_margin_step"])
-        band_min = auto_config["auto_band_min"]
-        band_max = auto_config["auto_band_max"]
+        nms_min = min(auto_config["auto_nms_min"], auto_config["auto_nms_max"])
+        nms_max = max(auto_config["auto_nms_min"], auto_config["auto_nms_max"])
+        high_min = min(auto_config["auto_high_min"], auto_config["auto_high_max"])
+        high_max = max(auto_config["auto_high_min"], auto_config["auto_high_max"])
+        margin_min = min(auto_config["auto_margin_min"], auto_config["auto_margin_max"])
+        margin_max = max(auto_config["auto_margin_min"], auto_config["auto_margin_max"])
+        nms_list = frange(nms_min, nms_max, auto_config["auto_nms_step"])
+        high_list = frange(high_min, high_max, auto_config["auto_high_step"])
+        margin_list = frange(margin_min, margin_max, auto_config["auto_margin_step"])
+        band_min = min(auto_config["auto_band_min"], auto_config["auto_band_max"])
+        band_max = max(auto_config["auto_band_min"], auto_config["auto_band_max"])
+
+        if not nms_list:
+            nms_list = [round(nms_min, 4)]
+        if not high_list:
+            high_list = [round(high_min, 4)]
+        if not margin_list:
+            margin_list = [round(margin_min, 4)]
 
         if mode == "Fast":
             nms_list = nms_list[::2] if len(nms_list) > 2 else nms_list
@@ -1814,6 +2035,8 @@ class EdgeBatchGUI:
         self._auto_scores = []
         self._auto_best_scores = []
         self._auto_best_time_series = []
+        self._auto_coverage_scores = []
+        self._auto_penalty_scores = []
         self._refresh_auto_graphs()
         self._worker_thread = threading.Thread(
             target=self._auto_optimize_worker,
@@ -1824,7 +2047,7 @@ class EdgeBatchGUI:
         self.root.after(100, self._poll_messages)
 
     def _auto_optimize_worker(self, files, base_settings, auto_config, mode, roi_map):
-        candidates = self._build_candidates(base_settings, mode)
+        candidates = self._build_candidates(base_settings, mode, auto_config)
         max_files = min(8, len(files)) if mode == "Fast" else len(files)
         data = self._prepare_auto_data(files, base_settings, auto_config, roi_map, max_files)
         best = None
@@ -1832,6 +2055,8 @@ class EdgeBatchGUI:
         report_lines = []
         scores = []
         best_progress = []
+        evaluated = []
+        seen_keys = set()
         stop_reason = None
         start_time = time.time()
         last_best_time = start_time
@@ -1847,10 +2072,26 @@ class EdgeBatchGUI:
             self._message_queue.put(("auto_done", None, report_path, "no_data"))
             return
 
+        target_eval = 3000 if mode == "Fast" else 8000
+        budget = int(target_eval / max(1, len(data)))
+        budget = max(80, min(budget, 800))
+        original_count = len(candidates)
+        candidates = self._sample_candidates(candidates, budget)
+        if len(candidates) != original_count:
+            report_lines.append(f"[INFO] Coarse candidates sampled: {len(candidates)}/{original_count}")
+
         def wait_if_paused():
             while self._auto_pause_event.is_set() and not self._auto_stop_event.is_set():
                 time.sleep(0.2)
             return not self._auto_stop_event.is_set()
+
+        def key_from(settings):
+            return (
+                round(settings["nms_relax"], 3),
+                round(settings["high_ratio"], 3),
+                int(settings["boundary_band_radius"]),
+                round(settings["polarity_drop_margin"], 3),
+            )
 
         def check_stagnation():
             if not early_stop_enabled:
@@ -1879,6 +2120,8 @@ class EdgeBatchGUI:
                 + auto_config["weight_outside"] * summary["outside"]
                 + auto_config["weight_thickness"] * summary["thickness"]
             )
+            evaluated.append((score, settings, summary))
+            seen_keys.add(key_from(settings))
             report_lines.append(
                 f"{idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
                 f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
@@ -1896,7 +2139,19 @@ class EdgeBatchGUI:
             best_progress.append(best_score)
             self._auto_best_time_series.append((elapsed, best_score))
             self._message_queue.put(
-                ("auto_progress", idx, len(candidates), score, best_score, eta_seconds, "coarse", elapsed)
+                (
+                    "auto_progress",
+                    idx,
+                    len(candidates),
+                    score,
+                    best_score,
+                    eta_seconds,
+                    "coarse",
+                    elapsed,
+                    summary,
+                    score_base,
+                    penalty,
+                )
             )
 
         if best and mode != "Fast" and not stop_reason:
@@ -1936,6 +2191,8 @@ class EdgeBatchGUI:
                     + auto_config["weight_outside"] * summary["outside"]
                     + auto_config["weight_thickness"] * summary["thickness"]
                 )
+                evaluated.append((score, settings, summary))
+                seen_keys.add(key_from(settings))
                 report_lines.append(
                     f"refine {idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
                     f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
@@ -1953,8 +2210,80 @@ class EdgeBatchGUI:
                 best_progress.append(best_score)
                 self._auto_best_time_series.append((elapsed, best_score))
                 self._message_queue.put(
-                    ("auto_progress", idx, len(refine_candidates), score, best_score, eta_seconds, "refine", elapsed)
+                    (
+                        "auto_progress",
+                        idx,
+                        len(refine_candidates),
+                        score,
+                        best_score,
+                        eta_seconds,
+                        "refine",
+                        elapsed,
+                        summary,
+                        score_base,
+                        penalty,
+                    )
                 )
+        if not stop_reason:
+            evaluated_sorted = sorted(evaluated, key=lambda item: item[0], reverse=True)
+            top_settings = [item[1] for item in evaluated_sorted[:6]]
+            ai_candidates = self._generate_ai_candidates(top_settings, auto_config, mode, seen_keys)
+            if ai_candidates:
+                report_lines.append(f"[INFO] Adaptive candidates: {len(ai_candidates)}")
+                for idx, settings in enumerate(ai_candidates, start=1):
+                    if not wait_if_paused():
+                        stop_reason = "stopped"
+                        break
+                    if check_stagnation():
+                        stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
+                        break
+                    score, summary = self._evaluate_settings(data, settings, auto_config)
+                    processed += 1
+                    elapsed = time.time() - start_time
+                    avg_time = elapsed / max(1, processed)
+                    eta_seconds = avg_time * max(0, len(ai_candidates) - idx)
+                    score_base = auto_config["weight_coverage"] * summary["coverage"]
+                    penalty = (
+                        auto_config["weight_gap"] * (summary["gap"] + summary["continuity"])
+                        + auto_config["weight_intrusion"] * summary["intrusion"]
+                        + auto_config["weight_outside"] * summary["outside"]
+                        + auto_config["weight_thickness"] * summary["thickness"]
+                    )
+                    evaluated.append((score, settings, summary))
+                    seen_keys.add(key_from(settings))
+                    report_lines.append(
+                        f"adaptive {idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
+                        f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
+                        f"cont={summary['continuity']:.4f} intrusion={summary['intrusion']:.4f} "
+                        f"outside={summary['outside']:.4f} thickness={summary['thickness']:.4f} "
+                        f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} "
+                        f"high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} "
+                        f"margin={settings['polarity_drop_margin']:.2f}"
+                    )
+                    scores.append(score)
+                    if best is None or score > best_score:
+                        best_score = score
+                        best = settings
+                        last_best_time = time.time()
+                        self._message_queue.put(("auto_best", best_score, elapsed))
+                    best_progress.append(best_score)
+                    self._auto_best_time_series.append((elapsed, best_score))
+                    self._message_queue.put(
+                        (
+                            "auto_progress",
+                            idx,
+                            len(ai_candidates),
+                            score,
+                            best_score,
+                            eta_seconds,
+                            "adaptive",
+                            elapsed,
+                            summary,
+                            score_base,
+                            penalty,
+                        )
+                    )
+
         if stop_reason:
             report_lines.append(f"[STOP] Optimization ended: {stop_reason}")
 
@@ -2084,6 +2413,66 @@ class EdgeBatchGUI:
             draw.ellipse([points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2], fill="blue")
         return img
 
+    def _render_multi_graph(self, series_list, title, labels, colors, width=400, height=220):
+        margin = 36
+        img = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(img)
+
+        left = margin
+        top = margin
+        right = width - margin
+        bottom = height - margin
+        draw.rectangle([left, top, right, bottom], outline="black")
+        draw.text((left, 8), title, fill="black")
+
+        values = [v for series in series_list for v in series]
+        if not values:
+            return img
+
+        min_y = min(0.0, min(values))
+        max_y = max(values)
+        if max_y <= min_y:
+            max_y = min_y + 1.0
+
+        def scale_x(idx, total):
+            return left + idx * (right - left) / max(1, total - 1)
+
+        def scale_y(val):
+            return bottom - (val - min_y) * (bottom - top) / (max_y - min_y)
+
+        ticks = 4
+        for i in range(ticks + 1):
+            tx = left + i * (right - left) / ticks
+            tick_val = int(round(1 + i * (max(len(series) for series in series_list) - 1) / ticks))
+            draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
+            draw.text((tx - 6, bottom + 6), str(tick_val), fill="black")
+
+            ty = bottom - i * (bottom - top) / ticks
+            y_val = min_y + i * (max_y - min_y) / ticks
+            draw.line([(left - 4, ty), (left, ty)], fill="black")
+            draw.text((4, ty - 6), f"{y_val:.2f}", fill="black")
+
+        for series, label, color in zip(series_list, labels, colors):
+            if not series:
+                continue
+            points = [(scale_x(i, len(series)), scale_y(v)) for i, v in enumerate(series)]
+            if len(points) >= 2:
+                draw.line(points, fill=color, width=2)
+            else:
+                draw.ellipse(
+                    [points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2],
+                    fill=color,
+                )
+
+        legend_y = top - 22
+        legend_x = left
+        for label, color in zip(labels, colors):
+            draw.rectangle([legend_x, legend_y, legend_x + 12, legend_y + 12], fill=color)
+            draw.text((legend_x + 16, legend_y - 2), label, fill="black")
+            legend_x += 90
+
+        return img
+
     def _draw_score_graph(self, values, path, title):
         img = self._render_graph(values, title, width=800, height=300)
         img.save(path)
@@ -2098,10 +2487,21 @@ class EdgeBatchGUI:
         score_img = self._render_graph(self._auto_scores, "Score (current)", width=400, height=220)
         best_series = self._auto_best_time_series or [(i, v) for i, v in enumerate(self._auto_best_scores)]
         best_img = self._render_time_graph(best_series, "Best score (min)", width=400, height=220)
+        metric_img = self._render_multi_graph(
+            [self._auto_coverage_scores, self._auto_penalty_scores],
+            "Coverage vs Penalty",
+            ["Coverage", "Penalty"],
+            ["green", "red"],
+            width=400,
+            height=220,
+        )
         self._score_graph_photo = ImageTk.PhotoImage(score_img)
         self._best_graph_photo = ImageTk.PhotoImage(best_img)
+        self._metric_graph_photo = ImageTk.PhotoImage(metric_img)
         self.score_graph_label.config(image=self._score_graph_photo)
         self.best_graph_label.config(image=self._best_graph_photo)
+        if self.metric_graph_label:
+            self.metric_graph_label.config(image=self._metric_graph_photo)
 
     def _choose_output_dir(self):
         selected = filedialog.askdirectory(title="Select output folder")
@@ -2131,8 +2531,15 @@ class EdgeBatchGUI:
             files = files[:remaining]
 
         for path in files:
+            if path in self.selected_files:
+                continue
             self.selected_files.append(path)
-            self.file_listbox.insert(tk.END, path)
+            roi = self.roi_cache.get(path)
+            if roi is None:
+                roi = self.roi_cache.get(os.path.basename(path))
+            if roi:
+                self.roi_map[path] = tuple(roi)
+        self._refresh_file_list()
 
     def _clear_files(self):
         self.selected_files = []
@@ -2222,8 +2629,14 @@ class EdgeBatchGUI:
             eta_seconds = msg[5] if len(msg) > 5 else None
             phase = msg[6] if len(msg) > 6 else "coarse"
             elapsed = msg[7] if len(msg) > 7 else None
+            summary = msg[8] if len(msg) > 8 else None
+            penalty = msg[10] if len(msg) > 10 else None
             self._auto_scores.append(score)
             self._auto_best_scores.append(best_score)
+            if summary:
+                self._auto_coverage_scores.append(float(summary.get("coverage", 0.0)))
+                if penalty is not None:
+                    self._auto_penalty_scores.append(float(penalty))
             self._refresh_auto_graphs()
             eta_text = f" ETA {self._format_eta(eta_seconds)}" if eta_seconds is not None else ""
             phase_text = f"{phase} " if phase else ""
@@ -2241,8 +2654,9 @@ class EdgeBatchGUI:
             if settings:
                 self._apply_settings(settings)
             if stop_reason:
-                self.status_var.set(f"Auto optimization stopped ({stop_reason}). Report: {report_path}")
-                self._log(f"[AUTO] Stopped ({stop_reason}): {report_path}")
+                label = "stopped by user" if stop_reason == "stopped" else stop_reason
+                self.status_var.set(f"Auto optimization stopped ({label}). Report: {report_path}")
+                self._log(f"[AUTO] Stopped ({label}): {report_path}")
             else:
                 self.status_var.set(f"Auto optimization complete! Report: {report_path}")
                 self._log(f"[AUTO] Completed: {report_path}")

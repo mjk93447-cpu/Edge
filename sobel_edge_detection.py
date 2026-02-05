@@ -1,8 +1,10 @@
 import json
+import math
 import os
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime
 try:
@@ -48,20 +50,41 @@ AUTO_DEFAULTS = {
     "auto_high_min": 0.06,
     "auto_high_max": 0.18,
     "auto_high_step": 0.01,
-    "auto_low_factor": 0.33,
+    "auto_low_factor_min": 0.25,
+    "auto_low_factor_max": 0.45,
+    "auto_low_factor_step": 0.05,
     "auto_band_min": 1,
     "auto_band_max": 4,
     "auto_margin_min": 0.0,
     "auto_margin_max": 0.6,
     "auto_margin_step": 0.05,
-    "weight_coverage": 1.0,
-    "weight_intrusion": 1.2,
-    "weight_outside": 0.7,
-    "weight_gap": 1.0,
-    "weight_thickness": 0.5,
+    "auto_blur_sigma_min": 0.8,
+    "auto_blur_sigma_max": 1.6,
+    "auto_blur_sigma_step": 0.2,
+    "auto_blur_kernel_min": 3,
+    "auto_blur_kernel_max": 7,
+    "auto_blur_kernel_step": 2,
+    "auto_thinning_min": 8,
+    "auto_thinning_max": 20,
+    "auto_thinning_step": 4,
+    "auto_contrast_ref_min": 60.0,
+    "auto_contrast_ref_max": 120.0,
+    "auto_contrast_ref_step": 10.0,
+    "auto_min_scale_min": 0.4,
+    "auto_min_scale_max": 0.8,
+    "auto_min_scale_step": 0.1,
+    "weight_continuity": 3.0,
+    "weight_band_fit": 2.4,
+    "weight_coverage": 1.8,
+    "weight_gap": 1.2,
+    "weight_outside": 1.6,
+    "weight_thickness": 1.2,
+    "weight_intrusion": 1.0,
     "weight_low_quality": 0.5,
     "early_stop_enabled": True,
     "early_stop_minutes": 10.0,
+    "auto_parallel": True,
+    "auto_workers": max(1, (os.cpu_count() or 4) - 1),
 }
 
 PARAM_KEYS = tuple(PARAM_DEFAULTS.keys())
@@ -79,28 +102,55 @@ def load_json_config(path):
         return json.load(handle)
 
 
-def compute_auto_score(metrics, weights):
+def compute_auto_score(metrics, weights, return_details=False):
     coverage = float(metrics.get("coverage", 0.0))
     gap_ratio = float(metrics.get("gap", 1.0))
     continuity = float(metrics.get("continuity", 1.0))
     intrusion = float(metrics.get("intrusion", 1.0))
     outside = float(metrics.get("outside", 1.0))
     thickness = float(metrics.get("thickness", 1.0))
+    band_ratio = float(metrics.get("band_ratio", 0.0))
 
-    w_cov = float(weights.get("weight_coverage", 1.0))
-    w_gap = float(weights.get("weight_gap", 1.0))
+    w_cont = float(weights.get("weight_continuity", 3.0))
+    w_band = float(weights.get("weight_band_fit", 2.4))
+    w_cov = float(weights.get("weight_coverage", 1.8))
+    w_gap = float(weights.get("weight_gap", 1.2))
+    w_out = float(weights.get("weight_outside", 1.6))
+    w_thick = float(weights.get("weight_thickness", 1.2))
     w_intr = float(weights.get("weight_intrusion", 1.0))
-    w_out = float(weights.get("weight_outside", 1.0))
-    w_thick = float(weights.get("weight_thickness", 1.0))
 
-    penalty = (
-        w_gap * (gap_ratio + continuity)
-        + w_intr * intrusion
-        + w_out * outside
-        + w_thick * thickness
+    def sigmoid(x):
+        return 1.0 / (1.0 + math.exp(-x))
+
+    q_cont = sigmoid((0.12 - continuity) / 0.04)
+    q_band = sigmoid((band_ratio - 0.85) / 0.08)
+    q_cov = sigmoid((coverage - 0.85) / 0.08)
+    q_gap = sigmoid((0.18 - gap_ratio) / 0.06)
+    q_out = sigmoid((0.05 - outside) / 0.03)
+    q_thick = sigmoid((0.15 - thickness) / 0.08)
+    q_intr = sigmoid((0.03 - intrusion) / 0.02)
+
+    score = (
+        (q_cont ** w_cont)
+        * (q_band ** w_band)
+        * (q_cov ** w_cov)
+        * (q_gap ** w_gap)
+        * (q_thick ** w_thick)
+        * (q_intr ** w_intr)
+        * (q_out ** w_out)
     )
-    score = (w_cov * coverage + 1.0) / (1.0 + penalty)
-    return max(0.0, score)
+    score = max(0.0, score)
+    if return_details:
+        return score, {
+            "q_cont": q_cont,
+            "q_band": q_band,
+            "q_cov": q_cov,
+            "q_gap": q_gap,
+            "q_thick": q_thick,
+            "q_intr": q_intr,
+            "q_out": q_out,
+        }
+    return score
 
 class SobelEdgeDetector:
     """Sobel 필터 기반 에지 검출 클래스"""
@@ -824,7 +874,8 @@ class EdgeBatchGUI:
         self._auto_scores = []
         self._auto_best_scores = []
         self._auto_best_time_series = []
-        self._auto_coverage_scores = []
+        self._auto_cont_scores = []
+        self._auto_band_scores = []
         self._auto_penalty_scores = []
         self._auto_start_time = None
         self._auto_last_best_time = None
@@ -1131,17 +1182,37 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=1, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Low factor").grid(row=2, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Low factor min").grid(row=2, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.2,
             to=0.6,
             increment=0.05,
-            textvariable=self.param_vars["auto_low_factor"],
+            textvariable=self.param_vars["auto_low_factor_min"],
             width=6,
         ).grid(row=2, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Band min").grid(row=2, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Low factor max").grid(row=2, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.2,
+            to=0.8,
+            increment=0.05,
+            textvariable=self.param_vars["auto_low_factor_max"],
+            width=6,
+        ).grid(row=2, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Low factor step").grid(row=2, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.01,
+            to=0.2,
+            increment=0.01,
+            textvariable=self.param_vars["auto_low_factor_step"],
+            width=6,
+        ).grid(row=2, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Band min").grid(row=3, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0,
@@ -1149,9 +1220,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_band_min"],
             width=6,
-        ).grid(row=2, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=3, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Band max").grid(row=2, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Band max").grid(row=3, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0,
@@ -1159,49 +1230,233 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_band_max"],
             width=6,
-        ).grid(row=2, column=5, sticky="w", padx=(4, 12))
-
-        ttk.Label(auto_frame, text="Margin min").grid(row=3, column=0, sticky="w")
-        ttk.Spinbox(
-            auto_frame,
-            from_=0.0,
-            to=1.0,
-            increment=0.1,
-            textvariable=self.param_vars["auto_margin_min"],
-            width=6,
-        ).grid(row=3, column=1, sticky="w", padx=(4, 12))
-
-        ttk.Label(auto_frame, text="Margin max").grid(row=3, column=2, sticky="w")
-        ttk.Spinbox(
-            auto_frame,
-            from_=0.0,
-            to=1.0,
-            increment=0.1,
-            textvariable=self.param_vars["auto_margin_max"],
-            width=6,
         ).grid(row=3, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Margin step").grid(row=3, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Margin min").grid(row=3, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
-            from_=0.1,
+            from_=0.0,
             to=1.0,
-            increment=0.1,
-            textvariable=self.param_vars["auto_margin_step"],
+            increment=0.05,
+            textvariable=self.param_vars["auto_margin_min"],
             width=6,
         ).grid(row=3, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W coverage").grid(row=4, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Margin max").grid(row=4, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
-            from_=0.5,
-            to=2.0,
-            increment=0.1,
-            textvariable=self.param_vars["weight_coverage"],
+            from_=0.0,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_margin_max"],
             width=6,
         ).grid(row=4, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W gap").grid(row=4, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Margin step").grid(row=4, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.01,
+            to=0.5,
+            increment=0.01,
+            textvariable=self.param_vars["auto_margin_step"],
+            width=6,
+        ).grid(row=4, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur sigma min").grid(row=4, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.4,
+            to=2.5,
+            increment=0.1,
+            textvariable=self.param_vars["auto_blur_sigma_min"],
+            width=6,
+        ).grid(row=4, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur sigma max").grid(row=5, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.4,
+            to=3.0,
+            increment=0.1,
+            textvariable=self.param_vars["auto_blur_sigma_max"],
+            width=6,
+        ).grid(row=5, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur sigma step").grid(row=5, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.05,
+            to=0.5,
+            increment=0.05,
+            textvariable=self.param_vars["auto_blur_sigma_step"],
+            width=6,
+        ).grid(row=5, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur kernel min").grid(row=5, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=3,
+            to=9,
+            increment=2,
+            textvariable=self.param_vars["auto_blur_kernel_min"],
+            width=6,
+        ).grid(row=5, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur kernel max").grid(row=6, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=3,
+            to=11,
+            increment=2,
+            textvariable=self.param_vars["auto_blur_kernel_max"],
+            width=6,
+        ).grid(row=6, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur kernel step").grid(row=6, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=2,
+            to=4,
+            increment=2,
+            textvariable=self.param_vars["auto_blur_kernel_step"],
+            width=6,
+        ).grid(row=6, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Thinning min").grid(row=6, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=5,
+            to=30,
+            increment=1,
+            textvariable=self.param_vars["auto_thinning_min"],
+            width=6,
+        ).grid(row=6, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Thinning max").grid(row=7, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=5,
+            to=30,
+            increment=1,
+            textvariable=self.param_vars["auto_thinning_max"],
+            width=6,
+        ).grid(row=7, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Thinning step").grid(row=7, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_thinning_step"],
+            width=6,
+        ).grid(row=7, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Contrast ref min").grid(row=7, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=20,
+            to=160,
+            increment=5,
+            textvariable=self.param_vars["auto_contrast_ref_min"],
+            width=6,
+        ).grid(row=7, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Contrast ref max").grid(row=8, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=20,
+            to=180,
+            increment=5,
+            textvariable=self.param_vars["auto_contrast_ref_max"],
+            width=6,
+        ).grid(row=8, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Contrast ref step").grid(row=8, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=5,
+            to=20,
+            increment=5,
+            textvariable=self.param_vars["auto_contrast_ref_step"],
+            width=6,
+        ).grid(row=8, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Min scale min").grid(row=8, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.2,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_min_scale_min"],
+            width=6,
+        ).grid(row=8, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Min scale max").grid(row=9, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.2,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_min_scale_max"],
+            width=6,
+        ).grid(row=9, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Min scale step").grid(row=9, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.05,
+            to=0.3,
+            increment=0.05,
+            textvariable=self.param_vars["auto_min_scale_step"],
+            width=6,
+        ).grid(row=9, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Checkbutton(
+            auto_frame,
+            text="Parallel eval",
+            variable=self.param_vars["auto_parallel"],
+        ).grid(row=9, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=32,
+            increment=1,
+            textvariable=self.param_vars["auto_workers"],
+            width=6,
+        ).grid(row=9, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W continuity").grid(row=10, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1.0,
+            to=5.0,
+            increment=0.2,
+            textvariable=self.param_vars["weight_continuity"],
+            width=6,
+        ).grid(row=10, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W band fit").grid(row=10, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1.0,
+            to=4.0,
+            increment=0.2,
+            textvariable=self.param_vars["weight_band_fit"],
+            width=6,
+        ).grid(row=10, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W coverage").grid(row=10, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.5,
+            to=3.0,
+            increment=0.1,
+            textvariable=self.param_vars["weight_coverage"],
+            width=6,
+        ).grid(row=10, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W gap").grid(row=11, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1209,19 +1464,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_gap"],
             width=6,
-        ).grid(row=4, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W intrusion").grid(row=4, column=4, sticky="w")
-        ttk.Spinbox(
-            auto_frame,
-            from_=0.5,
-            to=3.0,
-            increment=0.1,
-            textvariable=self.param_vars["weight_intrusion"],
-            width=6,
-        ).grid(row=4, column=5, sticky="w", padx=(4, 12))
-
-        ttk.Label(auto_frame, text="W outside").grid(row=5, column=0, sticky="w")
+        ttk.Label(auto_frame, text="W outside").grid(row=11, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1229,19 +1474,29 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_outside"],
             width=6,
-        ).grid(row=5, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W thickness").grid(row=5, column=2, sticky="w")
+        ttk.Label(auto_frame, text="W thickness").grid(row=11, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
-            to=2.0,
+            to=2.5,
             increment=0.1,
             textvariable=self.param_vars["weight_thickness"],
             width=6,
-        ).grid(row=5, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W low quality").grid(row=5, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W intrusion").grid(row=12, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.5,
+            to=3.0,
+            increment=0.1,
+            textvariable=self.param_vars["weight_intrusion"],
+            width=6,
+        ).grid(row=12, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W low quality").grid(row=12, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
@@ -1249,13 +1504,13 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_low_quality"],
             width=6,
-        ).grid(row=5, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=12, column=3, sticky="w", padx=(4, 12))
 
         ttk.Checkbutton(
             auto_frame,
             text="Early stop on stagnation (min)",
             variable=self.param_vars["early_stop_enabled"],
-        ).grid(row=6, column=0, sticky="w")
+        ).grid(row=13, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1,
@@ -1263,10 +1518,10 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["early_stop_minutes"],
             width=6,
-        ).grid(row=6, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=13, column=1, sticky="w", padx=(4, 12))
 
         auto_btn_frame = ttk.Frame(auto_frame)
-        auto_btn_frame.grid(row=7, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        auto_btn_frame.grid(row=14, column=0, columnspan=6, sticky="w", pady=(4, 0))
         ttk.Button(auto_btn_frame, text="Save Auto Config", command=self._save_auto_config).pack(side=tk.LEFT, padx=4)
         ttk.Button(auto_btn_frame, text="Load Auto Config", command=self._load_auto_config).pack(side=tk.LEFT, padx=4)
 
@@ -1288,7 +1543,7 @@ class EdgeBatchGUI:
             "- Polarity filter: Removes inner curves by checking edge brightness direction.\n"
             "- Thinning: Keeps a single-pixel contour; adjust NMS relax if gaps appear.\n"
             "- Auto threshold: Adapts to low-contrast images automatically.\n"
-            "- Weights: Raise intrusion/outside to penalize inner or external edges.\n"
+            "- Weights: Continuity and band fit are highest priority for stable outer edges.\n"
             "- Early stop ends optimization when best score stalls for N minutes.\n"
             "- Save Params stores detection settings; Save Auto Config stores search ranges/weights.\n",
         )
@@ -1584,6 +1839,35 @@ class EdgeBatchGUI:
         step = max(1, len(files) // max_files)
         return list(files)[::step][:max_files]
 
+    def _compute_signature(self, image):
+        arr = np.clip(image, 0, 255).astype(np.uint8)
+        thumb = Image.fromarray(arr).resize((24, 24), resample=Image.BILINEAR)
+        small = np.asarray(thumb, dtype=np.float32) / 255.0
+        gx, gy = np.gradient(small)
+        mag = np.sqrt(gx**2 + gy**2)
+        sig = np.concatenate([small.flatten(), mag.flatten()])
+        sig = (sig - sig.mean()) / (sig.std() + 1e-6)
+        return sig
+
+    def _cluster_signatures(self, signatures, k, rng):
+        n = len(signatures)
+        if n <= k:
+            labels = np.arange(n, dtype=int)
+            centers = signatures.copy()
+            return labels, centers
+        indices = rng.choice(n, k, replace=False)
+        centers = signatures[indices].copy()
+        for _ in range(8):
+            distances = np.sum((signatures[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+            labels = np.argmin(distances, axis=1)
+            for j in range(k):
+                mask = labels == j
+                if not np.any(mask):
+                    centers[j] = signatures[rng.randint(0, n)]
+                else:
+                    centers[j] = signatures[mask].mean(axis=0)
+        return labels, centers
+
     def _prepare_auto_data(self, files, settings, auto_config, roi_map, max_files):
         subset = self._select_auto_subset(files, max_files)
         band_min = min(auto_config["auto_band_min"], auto_config["auto_band_max"])
@@ -1629,9 +1913,47 @@ class EdgeBatchGUI:
                     "boundary": boundary,
                     "bands": bands,
                     "band_pixels": band_pixels,
+                    "weight": 1.0,
                 }
             )
-        return data
+        if len(data) < 4:
+            return {"coarse": data, "mid": data, "full": data}
+
+        rng = np.random.RandomState(42)
+        signatures = np.stack([self._compute_signature(item["image"]) for item in data], axis=0)
+        k = min(max(2, int(np.sqrt(len(data)))), 12)
+        labels, centers = self._cluster_signatures(signatures, k, rng)
+        clusters = {i: [] for i in range(k)}
+        for idx, label in enumerate(labels):
+            clusters[int(label)].append(idx)
+
+        coarse = []
+        mid = []
+        full = []
+        for cluster_id, indices in clusters.items():
+            if not indices:
+                continue
+            center = centers[cluster_id]
+            dists = []
+            for idx in indices:
+                d = float(np.sum((signatures[idx] - center) ** 2))
+                dists.append((d, idx))
+            dists.sort(key=lambda x: x[0])
+            rep_idx = dists[0][1]
+            rep_item = dict(data[rep_idx])
+            rep_item["weight"] = float(len(indices))
+            coarse.append(rep_item)
+
+            take = min(3, len(dists))
+            for _, idx in dists[:take]:
+                item = dict(data[idx])
+                item["weight"] = float(len(indices)) / float(take)
+                mid.append(item)
+
+        for item in data:
+            full.append(dict(item))
+
+        return {"coarse": coarse, "mid": mid, "full": full}
 
     def _collect_values(self, keys):
         return {key: self.param_vars[key].get() for key in keys if key in self.param_vars}
@@ -1738,6 +2060,11 @@ class EdgeBatchGUI:
             return
         config = load_json_config(path)
         auto_values = config.get("auto", {})
+        if "auto_low_factor" in auto_values and "auto_low_factor_min" not in auto_values:
+            base = float(auto_values.get("auto_low_factor", AUTO_DEFAULTS["auto_low_factor_min"]))
+            auto_values["auto_low_factor_min"] = max(0.1, base - 0.1)
+            auto_values["auto_low_factor_max"] = min(0.9, base + 0.1)
+            auto_values["auto_low_factor_step"] = 0.05
         self._apply_values(auto_values, AUTO_DEFAULTS)
         self._log(f"[AUTO] Config loaded: {path}")
 
@@ -1793,12 +2120,17 @@ class EdgeBatchGUI:
         total_gap = 0.0
         total_thickness = 0.0
         total_continuity = 0.0
-        total_images = 0
+        total_band_ratio = 0.0
+        total_weight = 0.0
+        total_q_cont = 0.0
+        total_q_band = 0.0
+        total_q_thick = 0.0
+        total_q_intr = 0.0
 
         settings_eval = dict(settings)
         settings_eval["use_boundary_band_filter"] = False
 
-        for item in data:
+        def evaluate_item(item):
             image = item["image"]
             mask = item["mask"]
             band_radius = settings["boundary_band_radius"]
@@ -1829,11 +2161,13 @@ class EdgeBatchGUI:
                 gap_ratio = 1.0
                 continuity_penalty = 1.0
                 thickness_penalty = 1.0
+                band_ratio = 0.0
             else:
                 coverage = edges_in_band / band_pixels if band_pixels else 0.0
                 intrusion_ratio = intrusion / edge_pixels
                 outside_ratio = outside / edge_pixels
                 gap_ratio = max(0.0, 1.0 - coverage)
+                band_ratio = edges_in_band / edge_pixels if edge_pixels else 0.0
                 components = self._count_components(edges_raw & band)
                 components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
                 continuity_penalty = min(1.0, components_penalty * 5.0)
@@ -1847,161 +2181,269 @@ class EdgeBatchGUI:
                 "intrusion": intrusion_ratio,
                 "outside": outside_ratio,
                 "thickness": thickness_penalty,
+                "band_ratio": band_ratio,
             }
-            score = compute_auto_score(metrics, auto_config)
+            score, details = compute_auto_score(metrics, auto_config, return_details=True)
             p10, p90 = np.percentile(image, [10, 90])
             contrast = max(float(p90 - p10), 1.0)
             if contrast < settings["contrast_ref"] * 0.6:
                 score *= (1.0 + auto_config["weight_low_quality"])
 
-            total_score += score
-            total_coverage += coverage
-            total_intrusion += intrusion_ratio
-            total_outside += outside_ratio
-            total_gap += gap_ratio
-            total_thickness += thickness_penalty
-            total_continuity += continuity_penalty
-            total_images += 1
-
-        if total_images == 0:
-            return 0.0, {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0, "gap": 1.0, "thickness": 1.0}
-
-        avg_score = max(0.0, total_score / total_images)
-        summary = {
-            "coverage": total_coverage / total_images,
-            "intrusion": total_intrusion / total_images,
-            "outside": total_outside / total_images,
-            "gap": total_gap / total_images,
-            "thickness": total_thickness / total_images,
-            "continuity": total_continuity / total_images,
-        }
-        return avg_score, summary
-
-    def _sample_candidates(self, candidates, budget):
-        if budget <= 0 or len(candidates) <= budget:
-            return candidates
-        stride = max(1, len(candidates) // budget)
-        sampled = candidates[::stride]
-        return sampled[:budget]
-
-    def _generate_ai_candidates(self, top_settings, auto_config, mode, seen_keys):
-        if not top_settings:
-            return []
-        step_nms = max(float(auto_config["auto_nms_step"]) * 0.5, 0.005)
-        step_high = max(float(auto_config["auto_high_step"]) * 0.5, 0.005)
-        step_margin = max(float(auto_config["auto_margin_step"]) * 0.5, 0.02)
-        band_min = int(min(auto_config["auto_band_min"], auto_config["auto_band_max"]))
-        band_max = int(max(auto_config["auto_band_min"], auto_config["auto_band_max"]))
-        nms_min = float(min(auto_config["auto_nms_min"], auto_config["auto_nms_max"]))
-        nms_max = float(max(auto_config["auto_nms_min"], auto_config["auto_nms_max"]))
-        high_min = float(min(auto_config["auto_high_min"], auto_config["auto_high_max"]))
-        high_max = float(max(auto_config["auto_high_min"], auto_config["auto_high_max"]))
-
-        top_k = 3 if mode == "Fast" else 6
-        budget = 120 if mode == "Fast" else 240
-        candidates = []
-
-        def key_from(settings):
+            weight = float(item.get("weight", 1.0))
             return (
-                round(settings["nms_relax"], 3),
-                round(settings["high_ratio"], 3),
-                int(settings["boundary_band_radius"]),
-                round(settings["polarity_drop_margin"], 3),
+                weight,
+                score,
+                coverage,
+                intrusion_ratio,
+                outside_ratio,
+                gap_ratio,
+                thickness_penalty,
+                continuity_penalty,
+                band_ratio,
+                details,
             )
 
-        jitter_nms = [0.0, -step_nms, step_nms]
-        jitter_high = [0.0, -step_high, step_high]
-        margin_min = float(min(auto_config["auto_margin_min"], auto_config["auto_margin_max"]))
-        margin_max = float(max(auto_config["auto_margin_min"], auto_config["auto_margin_max"]))
-        jitter_margin = [0.0, -step_margin, step_margin]
-        jitter_band = [0, -1, 1]
+        use_parallel = bool(auto_config.get("auto_parallel", False))
+        max_workers = max(1, int(auto_config.get("auto_workers", 1)))
+        results = []
+        if use_parallel and len(data) > 1 and max_workers > 1:
+            workers = min(max_workers, len(data))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                results = list(executor.map(evaluate_item, data))
+        else:
+            results = [evaluate_item(item) for item in data]
 
-        for base in top_settings[:top_k]:
-            for dnms in jitter_nms:
-                for dhigh in jitter_high:
-                    for dmargin in jitter_margin:
-                        for dband in jitter_band:
-                            nms = min(nms_max, max(nms_min, base["nms_relax"] + dnms))
-                            high = min(high_max, max(high_min, base["high_ratio"] + dhigh))
-                            low = max(0.02, high * auto_config["auto_low_factor"])
-                            band = min(band_max, max(band_min, base["boundary_band_radius"] + dband))
-                            margin = min(margin_max, max(margin_min, base["polarity_drop_margin"] + dmargin))
-                            settings = dict(base)
-                            settings.update(
-                                {
-                                    "nms_relax": round(nms, 3),
-                                    "high_ratio": float(high),
-                                    "low_ratio": float(low),
-                                    "boundary_band_radius": int(band),
-                                    "polarity_drop_margin": float(margin),
-                                    "use_boundary_band_filter": int(band) > 0,
-                                }
-                            )
-                            key = key_from(settings)
-                            if key in seen_keys:
-                                continue
-                            seen_keys.add(key)
-                            candidates.append(settings)
-                            if len(candidates) >= budget:
-                                return candidates
-        return candidates
+        for (
+            weight,
+            score,
+            coverage,
+            intrusion_ratio,
+            outside_ratio,
+            gap_ratio,
+            thickness_penalty,
+            continuity_penalty,
+            band_ratio,
+            details,
+        ) in results:
+            total_weight += weight
+            total_score += score * weight
+            total_coverage += coverage * weight
+            total_intrusion += intrusion_ratio * weight
+            total_outside += outside_ratio * weight
+            total_gap += gap_ratio * weight
+            total_thickness += thickness_penalty * weight
+            total_continuity += continuity_penalty * weight
+            total_band_ratio += band_ratio * weight
+            total_q_cont += details["q_cont"] * weight
+            total_q_band += details["q_band"] * weight
+            total_q_thick += details["q_thick"] * weight
+            total_q_intr += details["q_intr"] * weight
 
-    def _build_candidates(self, base_settings, mode, auto_config):
+        if total_weight <= 0:
+            return (
+                0.0,
+                {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0, "gap": 1.0, "thickness": 1.0},
+                {"q_cont": 0.0, "q_band": 0.0, "q_thick": 0.0, "q_intr": 0.0},
+            )
 
-        def frange(start, stop, step):
-            values = []
-            if step <= 0:
-                return values
-            v = start
-            while v <= stop + 1e-6:
-                values.append(round(v, 4))
-                v += step
-            return values
+        avg_score = max(0.0, total_score / total_weight)
+        summary = {
+            "coverage": total_coverage / total_weight,
+            "intrusion": total_intrusion / total_weight,
+            "outside": total_outside / total_weight,
+            "gap": total_gap / total_weight,
+            "thickness": total_thickness / total_weight,
+            "continuity": total_continuity / total_weight,
+            "band_ratio": total_band_ratio / total_weight,
+        }
+        qualities = {
+            "q_cont": total_q_cont / total_weight,
+            "q_band": total_q_band / total_weight,
+            "q_thick": total_q_thick / total_weight,
+            "q_intr": total_q_intr / total_weight,
+        }
+        return avg_score, summary, qualities
+
+    def _sample_candidates(self, items, budget):
+        if budget <= 0 or len(items) <= budget:
+            return items
+        stride = max(1, len(items) // budget)
+        sampled = items[::stride]
+        return sampled[:budget]
+
+    def _sample_float(self, rng, min_val, max_val, step, center=None, scale=1.0):
+        min_val = float(min_val)
+        max_val = float(max_val)
+        step = float(step) if step else 0.0
+        if center is None:
+            value = rng.uniform(min_val, max_val)
+        else:
+            sigma = max(step * scale, (max_val - min_val) * 0.05 * scale)
+            value = rng.normal(center, sigma)
+        value = min(max_val, max(min_val, value))
+        if step > 0:
+            value = round(round((value - min_val) / step) * step + min_val, 4)
+        return float(value)
+
+    def _sample_int(self, rng, min_val, max_val, step, center=None, scale=1.0, odd=False):
+        min_val = int(min_val)
+        max_val = int(max_val)
+        step = max(1, int(step))
+        if center is None:
+            value = rng.randint(min_val, max_val + 1)
+        else:
+            sigma = max(step * scale, max(1, int((max_val - min_val) * 0.05 * scale)))
+            value = int(round(rng.normal(center, sigma)))
+        value = max(min_val, min(max_val, value))
+        if odd and value % 2 == 0:
+            value = value + 1 if value + 1 <= max_val else value - 1
+        if step > 1:
+            value = min_val + (int(round((value - min_val) / step)) * step)
+            value = max(min_val, min(max_val, value))
+            if odd and value % 2 == 0:
+                value = value + 1 if value + 1 <= max_val else value - 1
+        return int(value)
+
+    def _build_candidates(self, base_settings, mode, auto_config, count, rng, step_scale=1.0, centers=None):
+        candidates = []
+        seen = set()
+        centers = centers or []
 
         nms_min = min(auto_config["auto_nms_min"], auto_config["auto_nms_max"])
         nms_max = max(auto_config["auto_nms_min"], auto_config["auto_nms_max"])
         high_min = min(auto_config["auto_high_min"], auto_config["auto_high_max"])
         high_max = max(auto_config["auto_high_min"], auto_config["auto_high_max"])
+        low_min = min(auto_config["auto_low_factor_min"], auto_config["auto_low_factor_max"])
+        low_max = max(auto_config["auto_low_factor_min"], auto_config["auto_low_factor_max"])
         margin_min = min(auto_config["auto_margin_min"], auto_config["auto_margin_max"])
         margin_max = max(auto_config["auto_margin_min"], auto_config["auto_margin_max"])
-        nms_list = frange(nms_min, nms_max, auto_config["auto_nms_step"])
-        high_list = frange(high_min, high_max, auto_config["auto_high_step"])
-        margin_list = frange(margin_min, margin_max, auto_config["auto_margin_step"])
         band_min = min(auto_config["auto_band_min"], auto_config["auto_band_max"])
         band_max = max(auto_config["auto_band_min"], auto_config["auto_band_max"])
+        blur_sigma_min = min(auto_config["auto_blur_sigma_min"], auto_config["auto_blur_sigma_max"])
+        blur_sigma_max = max(auto_config["auto_blur_sigma_min"], auto_config["auto_blur_sigma_max"])
+        blur_kernel_min = min(auto_config["auto_blur_kernel_min"], auto_config["auto_blur_kernel_max"])
+        blur_kernel_max = max(auto_config["auto_blur_kernel_min"], auto_config["auto_blur_kernel_max"])
+        thinning_min = min(auto_config["auto_thinning_min"], auto_config["auto_thinning_max"])
+        thinning_max = max(auto_config["auto_thinning_min"], auto_config["auto_thinning_max"])
+        contrast_min = min(auto_config["auto_contrast_ref_min"], auto_config["auto_contrast_ref_max"])
+        contrast_max = max(auto_config["auto_contrast_ref_min"], auto_config["auto_contrast_ref_max"])
+        min_scale_min = min(auto_config["auto_min_scale_min"], auto_config["auto_min_scale_max"])
+        min_scale_max = max(auto_config["auto_min_scale_min"], auto_config["auto_min_scale_max"])
 
-        if not nms_list:
-            nms_list = [round(nms_min, 4)]
-        if not high_list:
-            high_list = [round(high_min, 4)]
-        if not margin_list:
-            margin_list = [round(margin_min, 4)]
+        def candidate_key(settings):
+            return (
+                round(settings["nms_relax"], 3),
+                round(settings["high_ratio"], 3),
+                round(settings["low_ratio"], 3),
+                int(settings["boundary_band_radius"]),
+                round(settings["polarity_drop_margin"], 3),
+                round(settings["blur_sigma"], 2),
+                int(settings["blur_kernel_size"]),
+                int(settings["thinning_max_iter"]),
+                round(settings["contrast_ref"], 1),
+                round(settings["min_threshold_scale"], 2),
+            )
 
-        if mode == "Fast":
-            nms_list = nms_list[::2] if len(nms_list) > 2 else nms_list
-            high_list = high_list[::2] if len(high_list) > 2 else high_list
-            margin_list = margin_list[::2] if len(margin_list) > 2 else margin_list
+        max_tries = max(count * 8, 200)
+        tries = 0
+        while len(candidates) < count and tries < max_tries:
+            tries += 1
+            center = rng.choice(centers) if centers else None
+            nms_center = center["nms_relax"] if center else None
+            high_center = center["high_ratio"] if center else None
+            low_center = None
+            if center:
+                low_center = center["low_ratio"] / max(center["high_ratio"], 1e-6)
+            margin_center = center["polarity_drop_margin"] if center else None
+            band_center = center["boundary_band_radius"] if center else None
+            blur_sigma_center = center["blur_sigma"] if center else None
+            blur_kernel_center = center["blur_kernel_size"] if center else None
+            thinning_center = center["thinning_max_iter"] if center else None
+            contrast_center = center["contrast_ref"] if center else None
+            min_scale_center = center["min_threshold_scale"] if center else None
 
-        candidates = []
-        for nms_relax in nms_list:
-            if nms_relax < 0.85 or nms_relax > 1.0:
+            nms_relax = self._sample_float(rng, nms_min, nms_max, auto_config["auto_nms_step"], nms_center, step_scale)
+            high_ratio = self._sample_float(rng, high_min, high_max, auto_config["auto_high_step"], high_center, step_scale)
+            low_factor = self._sample_float(
+                rng,
+                low_min,
+                low_max,
+                auto_config["auto_low_factor_step"],
+                low_center,
+                step_scale,
+            )
+            band_radius = self._sample_int(
+                rng, band_min, band_max, 1, band_center, step_scale, odd=False
+            )
+            margin = self._sample_float(
+                rng, margin_min, margin_max, auto_config["auto_margin_step"], margin_center, step_scale
+            )
+            blur_sigma = self._sample_float(
+                rng,
+                blur_sigma_min,
+                blur_sigma_max,
+                auto_config["auto_blur_sigma_step"],
+                blur_sigma_center,
+                step_scale,
+            )
+            blur_kernel = self._sample_int(
+                rng,
+                blur_kernel_min,
+                blur_kernel_max,
+                auto_config["auto_blur_kernel_step"],
+                blur_kernel_center,
+                step_scale,
+                odd=True,
+            )
+            thinning_iter = self._sample_int(
+                rng,
+                thinning_min,
+                thinning_max,
+                auto_config["auto_thinning_step"],
+                thinning_center,
+                step_scale,
+            )
+            contrast_ref = self._sample_float(
+                rng,
+                contrast_min,
+                contrast_max,
+                auto_config["auto_contrast_ref_step"],
+                contrast_center,
+                step_scale,
+            )
+            min_scale = self._sample_float(
+                rng,
+                min_scale_min,
+                min_scale_max,
+                auto_config["auto_min_scale_step"],
+                min_scale_center,
+                step_scale,
+            )
+
+            low_ratio = max(0.02, high_ratio * low_factor)
+
+            settings = dict(base_settings)
+            settings.update(
+                {
+                    "nms_relax": round(nms_relax, 3),
+                    "high_ratio": float(high_ratio),
+                    "low_ratio": float(low_ratio),
+                    "boundary_band_radius": int(band_radius),
+                    "polarity_drop_margin": float(margin),
+                    "use_boundary_band_filter": int(band_radius) > 0,
+                    "blur_sigma": float(blur_sigma),
+                    "blur_kernel_size": int(max(3, blur_kernel)),
+                    "thinning_max_iter": int(max(1, thinning_iter)),
+                    "contrast_ref": float(contrast_ref),
+                    "min_threshold_scale": float(min_scale),
+                }
+            )
+            key = candidate_key(settings)
+            if key in seen:
                 continue
-            for high_ratio in high_list:
-                low_ratio = max(0.02, high_ratio * auto_config["auto_low_factor"])
-                for band_radius in range(band_min, band_max + 1):
-                    for margin in margin_list:
-                        settings = dict(base_settings)
-                        settings.update(
-                            {
-                                "nms_relax": round(nms_relax, 3),
-                                "high_ratio": float(high_ratio),
-                                "low_ratio": float(low_ratio),
-                                "boundary_band_radius": int(band_radius),
-                                "polarity_drop_margin": float(margin),
-                                "use_boundary_band_filter": band_radius > 0,
-                            }
-                        )
-                        candidates.append(settings)
+            seen.add(key)
+            candidates.append(settings)
+
         return candidates
 
     def _start_auto_optimize(self):
@@ -2035,7 +2477,8 @@ class EdgeBatchGUI:
         self._auto_scores = []
         self._auto_best_scores = []
         self._auto_best_time_series = []
-        self._auto_coverage_scores = []
+        self._auto_cont_scores = []
+        self._auto_band_scores = []
         self._auto_penalty_scores = []
         self._refresh_auto_graphs()
         self._worker_thread = threading.Thread(
@@ -2047,9 +2490,15 @@ class EdgeBatchGUI:
         self.root.after(100, self._poll_messages)
 
     def _auto_optimize_worker(self, files, base_settings, auto_config, mode, roi_map):
-        candidates = self._build_candidates(base_settings, mode, auto_config)
         max_files = min(8, len(files)) if mode == "Fast" else len(files)
         data = self._prepare_auto_data(files, base_settings, auto_config, roi_map, max_files)
+        data_coarse = data.get("coarse", [])
+        data_mid = data.get("mid", [])
+        data_full = data.get("full", [])
+        if not data_coarse:
+            data_coarse = data_full
+        if not data_mid:
+            data_mid = data_full
         best = None
         best_score = 0.0
         report_lines = []
@@ -2064,21 +2513,19 @@ class EdgeBatchGUI:
         early_stop_minutes = float(auto_config.get("early_stop_minutes", 10.0))
         processed = 0
 
-        if not data:
+        if not data_full:
             report_dir = self._create_batch_output_dir()
             report_path = os.path.join(report_dir, "auto_optimize_report.txt")
             with open(report_path, "w", encoding="utf-8") as handle:
                 handle.write("No data available for auto optimization.\n")
             self._message_queue.put(("auto_done", None, report_path, "no_data"))
             return
-
-        target_eval = 3000 if mode == "Fast" else 8000
-        budget = int(target_eval / max(1, len(data)))
-        budget = max(80, min(budget, 800))
-        original_count = len(candidates)
-        candidates = self._sample_candidates(candidates, budget)
-        if len(candidates) != original_count:
-            report_lines.append(f"[INFO] Coarse candidates sampled: {len(candidates)}/{original_count}")
+        rng = np.random.RandomState(42)
+        target_eval = 3000 if mode == "Fast" else 9000
+        budget = int(target_eval / max(1, len(data_coarse)))
+        budget = max(80, min(budget, 600))
+        candidates = self._build_candidates(base_settings, mode, auto_config, budget, rng, step_scale=1.0)
+        report_lines.append(f"[INFO] Coarse candidates: {len(candidates)}")
 
         def wait_if_paused():
             while self._auto_pause_event.is_set() and not self._auto_stop_event.is_set():
@@ -2089,8 +2536,14 @@ class EdgeBatchGUI:
             return (
                 round(settings["nms_relax"], 3),
                 round(settings["high_ratio"], 3),
+                round(settings["low_ratio"], 3),
                 int(settings["boundary_band_radius"]),
                 round(settings["polarity_drop_margin"], 3),
+                round(settings["blur_sigma"], 2),
+                int(settings["blur_kernel_size"]),
+                int(settings["thinning_max_iter"]),
+                round(settings["contrast_ref"], 1),
+                round(settings["min_threshold_scale"], 2),
             )
 
         def check_stagnation():
@@ -2108,25 +2561,24 @@ class EdgeBatchGUI:
             if check_stagnation():
                 stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
                 break
-            score, summary = self._evaluate_settings(data, settings, auto_config)
+            key = key_from(settings)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            score, summary, qualities = self._evaluate_settings(data_coarse, settings, auto_config)
             processed += 1
             elapsed = time.time() - start_time
             avg_time = elapsed / max(1, processed)
             eta_seconds = avg_time * max(0, len(candidates) - processed)
-            score_base = auto_config["weight_coverage"] * summary["coverage"]
-            penalty = (
-                auto_config["weight_gap"] * (summary["gap"] + summary["continuity"])
-                + auto_config["weight_intrusion"] * summary["intrusion"]
-                + auto_config["weight_outside"] * summary["outside"]
-                + auto_config["weight_thickness"] * summary["thickness"]
-            )
+            score_base = qualities["q_cont"] * qualities["q_band"]
+            penalty = max(0.0, 1.0 - score)
             evaluated.append((score, settings, summary))
-            seen_keys.add(key_from(settings))
             report_lines.append(
                 f"{idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
                 f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                f"cont={summary['continuity']:.4f} intrusion={summary['intrusion']:.4f} outside={summary['outside']:.4f} "
-                f"thickness={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} "
+                f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
+                f"thick={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} "
                 f"high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} "
                 f"margin={settings['polarity_drop_margin']:.2f}"
             )
@@ -2149,6 +2601,7 @@ class EdgeBatchGUI:
                     "coarse",
                     elapsed,
                     summary,
+                    qualities,
                     score_base,
                     penalty,
                 )
@@ -2166,7 +2619,10 @@ class EdgeBatchGUI:
                             settings = dict(best)
                             settings["nms_relax"] = round(min(1.0, max(0.85, best["nms_relax"] + dnms)), 3)
                             settings["high_ratio"] = max(0.05, best["high_ratio"] + dhigh)
-                            settings["low_ratio"] = max(0.02, settings["high_ratio"] * auto_config["auto_low_factor"])
+                            low_factor = 0.5 * (
+                                auto_config["auto_low_factor_min"] + auto_config["auto_low_factor_max"]
+                            )
+                            settings["low_ratio"] = max(0.02, settings["high_ratio"] * low_factor)
                             settings["boundary_band_radius"] = max(0, best["boundary_band_radius"] + dband)
                             settings["polarity_drop_margin"] = max(0.0, best["polarity_drop_margin"] + dmargin)
                             settings["use_boundary_band_filter"] = settings["boundary_band_radius"] > 0
@@ -2179,25 +2635,24 @@ class EdgeBatchGUI:
                 if check_stagnation():
                     stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
                     break
-                score, summary = self._evaluate_settings(data, settings, auto_config)
+                key = key_from(settings)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                score, summary, qualities = self._evaluate_settings(data_mid, settings, auto_config)
                 processed += 1
                 elapsed = time.time() - start_time
                 avg_time = elapsed / max(1, processed)
                 eta_seconds = avg_time * max(0, len(refine_candidates) - idx)
-                score_base = auto_config["weight_coverage"] * summary["coverage"]
-                penalty = (
-                    auto_config["weight_gap"] * (summary["gap"] + summary["continuity"])
-                    + auto_config["weight_intrusion"] * summary["intrusion"]
-                    + auto_config["weight_outside"] * summary["outside"]
-                    + auto_config["weight_thickness"] * summary["thickness"]
-                )
+                score_base = qualities["q_cont"] * qualities["q_band"]
+                penalty = max(0.0, 1.0 - score)
                 evaluated.append((score, settings, summary))
-                seen_keys.add(key_from(settings))
                 report_lines.append(
                     f"refine {idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
                     f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                    f"cont={summary['continuity']:.4f} intrusion={summary['intrusion']:.4f} "
-                    f"outside={summary['outside']:.4f} thickness={summary['thickness']:.4f} "
+                    f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                    f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
+                    f"thick={summary['thickness']:.4f} "
                     f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
                     f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
                 )
@@ -2220,16 +2675,31 @@ class EdgeBatchGUI:
                         "refine",
                         elapsed,
                         summary,
+                        qualities,
                         score_base,
                         penalty,
                     )
                 )
         if not stop_reason:
-            evaluated_sorted = sorted(evaluated, key=lambda item: item[0], reverse=True)
-            top_settings = [item[1] for item in evaluated_sorted[:6]]
-            ai_candidates = self._generate_ai_candidates(top_settings, auto_config, mode, seen_keys)
-            if ai_candidates:
-                report_lines.append(f"[INFO] Adaptive candidates: {len(ai_candidates)}")
+            adaptive_scales = [0.6, 0.35, 0.2] if mode != "Fast" else [0.6, 0.35]
+            for round_idx, scale in enumerate(adaptive_scales, start=1):
+                evaluated_sorted = sorted(evaluated, key=lambda item: item[0], reverse=True)
+                top_settings = [item[1] for item in evaluated_sorted[:8]]
+                adaptive_count = max(40, min(220, int(budget * (0.6 / round_idx))))
+                ai_candidates = self._build_candidates(
+                    base_settings,
+                    mode,
+                    auto_config,
+                    adaptive_count,
+                    rng,
+                    step_scale=scale,
+                    centers=top_settings,
+                )
+                if not ai_candidates:
+                    continue
+                report_lines.append(
+                    f"[INFO] Adaptive round {round_idx} scale={scale:.2f} count={len(ai_candidates)}"
+                )
                 for idx, settings in enumerate(ai_candidates, start=1):
                     if not wait_if_paused():
                         stop_reason = "stopped"
@@ -2237,28 +2707,26 @@ class EdgeBatchGUI:
                     if check_stagnation():
                         stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
                         break
-                    score, summary = self._evaluate_settings(data, settings, auto_config)
+                    key = key_from(settings)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    score, summary, qualities = self._evaluate_settings(data_full, settings, auto_config)
                     processed += 1
                     elapsed = time.time() - start_time
                     avg_time = elapsed / max(1, processed)
                     eta_seconds = avg_time * max(0, len(ai_candidates) - idx)
-                    score_base = auto_config["weight_coverage"] * summary["coverage"]
-                    penalty = (
-                        auto_config["weight_gap"] * (summary["gap"] + summary["continuity"])
-                        + auto_config["weight_intrusion"] * summary["intrusion"]
-                        + auto_config["weight_outside"] * summary["outside"]
-                        + auto_config["weight_thickness"] * summary["thickness"]
-                    )
+                    score_base = qualities["q_cont"] * qualities["q_band"]
+                    penalty = max(0.0, 1.0 - score)
                     evaluated.append((score, settings, summary))
-                    seen_keys.add(key_from(settings))
                     report_lines.append(
-                        f"adaptive {idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
+                        f"adaptive{round_idx} {idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
                         f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                        f"cont={summary['continuity']:.4f} intrusion={summary['intrusion']:.4f} "
-                        f"outside={summary['outside']:.4f} thickness={summary['thickness']:.4f} "
-                        f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} "
-                        f"high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} "
-                        f"margin={settings['polarity_drop_margin']:.2f}"
+                        f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                        f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
+                        f"thick={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} "
+                        f"low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
+                        f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
                     )
                     scores.append(score)
                     if best is None or score > best_score:
@@ -2276,13 +2744,16 @@ class EdgeBatchGUI:
                             score,
                             best_score,
                             eta_seconds,
-                            "adaptive",
+                            f"adaptive{round_idx}",
                             elapsed,
                             summary,
+                            qualities,
                             score_base,
                             penalty,
                         )
                     )
+                if stop_reason:
+                    break
 
         if stop_reason:
             report_lines.append(f"[STOP] Optimization ended: {stop_reason}")
@@ -2488,10 +2959,10 @@ class EdgeBatchGUI:
         best_series = self._auto_best_time_series or [(i, v) for i, v in enumerate(self._auto_best_scores)]
         best_img = self._render_time_graph(best_series, "Best score (min)", width=400, height=220)
         metric_img = self._render_multi_graph(
-            [self._auto_coverage_scores, self._auto_penalty_scores],
-            "Coverage vs Penalty",
-            ["Coverage", "Penalty"],
-            ["green", "red"],
+            [self._auto_cont_scores, self._auto_band_scores],
+            "Continuity & Band Fit",
+            ["Continuity", "Band fit"],
+            ["green", "blue"],
             width=400,
             height=220,
         )
@@ -2630,11 +3101,14 @@ class EdgeBatchGUI:
             phase = msg[6] if len(msg) > 6 else "coarse"
             elapsed = msg[7] if len(msg) > 7 else None
             summary = msg[8] if len(msg) > 8 else None
-            penalty = msg[10] if len(msg) > 10 else None
+            qualities = msg[9] if len(msg) > 9 else None
+            penalty = msg[11] if len(msg) > 11 else None
             self._auto_scores.append(score)
             self._auto_best_scores.append(best_score)
             if summary:
-                self._auto_coverage_scores.append(float(summary.get("coverage", 0.0)))
+                if qualities:
+                    self._auto_cont_scores.append(float(qualities.get("q_cont", 0.0)))
+                    self._auto_band_scores.append(float(qualities.get("q_band", 0.0)))
                 if penalty is not None:
                     self._auto_penalty_scores.append(float(penalty))
             self._refresh_auto_graphs()

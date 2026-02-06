@@ -30,6 +30,37 @@ def create_bending_loop_mask(width=640, height=480, line_width=42):
     return np.array(mask_img, dtype=np.uint8)
 
 
+def create_complex_loop_mask(width=640, height=480, line_width=26):
+    """Create a more complex connected loop with wavy curves."""
+    mask_img = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(mask_img)
+
+    top = []
+    for i, x in enumerate(np.linspace(60, 520, 24)):
+        y = 170 + 18 * np.sin(i * 0.6) + 6 * np.sin(i * 1.6)
+        top.append((x, y))
+    right = []
+    for i, y in enumerate(np.linspace(170, 360, 14)):
+        x = 520 + 12 * np.sin(i * 0.8)
+        right.append((x, y))
+    bottom = []
+    for i, x in enumerate(np.linspace(520, 80, 24)):
+        y = 360 + 16 * np.sin(i * 0.5 + 1.2)
+        bottom.append((x, y))
+    left = []
+    for i, y in enumerate(np.linspace(360, 210, 10)):
+        x = 80 + 10 * np.sin(i * 0.7)
+        left.append((x, y))
+
+    path = top + right + bottom + left
+    draw.line(path, fill=255, width=line_width, joint="curve")
+
+    draw.rectangle([20, 150, 100, 420], fill=255)
+    draw.rectangle([470, 210, 590, 320], fill=255)
+
+    return np.array(mask_img, dtype=np.uint8)
+
+
 def render_image_from_mask(
     mask,
     background=230,
@@ -197,8 +228,10 @@ def _run_case(
     downscale_factor,
     seed,
     settings,
+    mask_fn=None,
 ):
-    mask = create_bending_loop_mask(line_width=line_width)
+    mask_fn = mask_fn or create_bending_loop_mask
+    mask = mask_fn(line_width=line_width)
     image = render_image_from_mask(
         mask,
         background=background,
@@ -269,8 +302,12 @@ def _run_case(
         mask_blur_kernel_size=settings["mask_blur_kernel_size"],
         mask_blur_sigma=settings["mask_blur_sigma"],
         mask_close_radius=settings["mask_close_radius"],
+        use_edge_smooth=settings["use_edge_smooth"],
+        edge_smooth_radius=settings["edge_smooth_radius"],
+        edge_smooth_iters=settings["edge_smooth_iters"],
         use_thinning=settings["use_thinning"],
         thinning_max_iter=settings["thinning_max_iter"],
+        spur_prune_iters=settings["spur_prune_iters"],
     )
     elapsed = time.perf_counter() - start
 
@@ -357,6 +394,9 @@ def main():
         "use_closing": False,
         "closing_radius": 1,
         "closing_iterations": 1,
+        "use_edge_smooth": False,
+        "edge_smooth_radius": 1,
+        "edge_smooth_iters": 1,
         "use_peak_refine": False,
         "peak_fill_radius": 1,
         "use_polarity_filter": True,
@@ -374,6 +414,7 @@ def main():
         "mask_close_radius": 1,
         "use_thinning": True,
         "thinning_max_iter": 15,
+        "spur_prune_iters": 0,
     }
 
     cases = [
@@ -421,6 +462,18 @@ def main():
             "blur_radius": 1.5,
             "downscale_factor": 2,
         },
+        {
+            "name": "fcb_side_complex",
+            "line_width": 16,
+            "noise_sigma": 10,
+            "background": 205,
+            "foreground": 175,
+            "gradient_strength": 50.0,
+            "gradient_axis": "y",
+            "blur_radius": 1.8,
+            "downscale_factor": 2,
+            "mask_fn": create_complex_loop_mask,
+        },
     ]
 
     candidate_relax = [1.0, 0.98, 0.96, 0.95, 0.94, 0.92, 0.9]
@@ -451,6 +504,7 @@ def main():
                 case["downscale_factor"],
                 7,
                 settings,
+                case.get("mask_fn"),
             )
             total_recall += metrics["recall"]
             total_intrusion += metrics["intrusion_ratio"]
@@ -531,6 +585,7 @@ def main():
                     case["downscale_factor"],
                     seed,
                     settings,
+                    case.get("mask_fn"),
                 )
                 print(f"\nCase: {case_tag}")
                 print(f"- overlay: {overlay_path}")

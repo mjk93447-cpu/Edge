@@ -1,7 +1,10 @@
 import json
+import math
 import os
 import queue
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime
 try:
@@ -16,6 +19,203 @@ except ModuleNotFoundError:
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image, ImageTk, ImageDraw
+
+PARAM_DEFAULTS = {
+    "nms_relax": 0.95,
+    "low_ratio": 0.04,
+    "high_ratio": 0.12,
+    "use_median_filter": True,
+    "median_kernel_size": 3,
+    "use_blur": True,
+    "blur_sigma": 1.2,
+    "blur_kernel_size": 5,
+    "magnitude_gamma": 1.0,
+    "use_contrast_stretch": False,
+    "contrast_low_pct": 2.0,
+    "contrast_high_pct": 98.0,
+    "auto_threshold": True,
+    "contrast_ref": 80.0,
+    "min_threshold_scale": 0.5,
+    "use_soft_linking": False,
+    "soft_low_ratio": 0.03,
+    "soft_high_ratio": 0.1,
+    "link_radius": 2,
+    "use_closing": False,
+    "closing_radius": 1,
+    "closing_iterations": 1,
+    "use_thinning": True,
+    "thinning_max_iter": 15,
+    "use_edge_smooth": False,
+    "edge_smooth_radius": 1,
+    "edge_smooth_iters": 1,
+    "spur_prune_iters": 0,
+    "use_boundary_band_filter": True,
+    "boundary_band_radius": 2,
+    "object_is_dark": True,
+    "use_mask_blur": True,
+    "mask_blur_sigma": 1.0,
+    "mask_blur_kernel_size": 5,
+    "mask_close_radius": 1,
+    "use_polarity_filter": True,
+    "polarity_drop_margin": 0.5,
+}
+
+AUTO_DEFAULTS = {
+    "auto_nms_min": 0.88,
+    "auto_nms_max": 1.00,
+    "auto_nms_step": 0.01,
+    "auto_high_min": 0.06,
+    "auto_high_max": 0.18,
+    "auto_high_step": 0.01,
+    "auto_low_factor_min": 0.25,
+    "auto_low_factor_max": 0.45,
+    "auto_low_factor_step": 0.05,
+    "auto_band_min": 1,
+    "auto_band_max": 4,
+    "auto_margin_min": 0.0,
+    "auto_margin_max": 0.6,
+    "auto_margin_step": 0.05,
+    "auto_blur_sigma_min": 0.8,
+    "auto_blur_sigma_max": 1.6,
+    "auto_blur_sigma_step": 0.2,
+    "auto_blur_kernel_min": 3,
+    "auto_blur_kernel_max": 7,
+    "auto_blur_kernel_step": 2,
+    "auto_thinning_min": 8,
+    "auto_thinning_max": 20,
+    "auto_thinning_step": 4,
+    "auto_contrast_ref_min": 60.0,
+    "auto_contrast_ref_max": 120.0,
+    "auto_contrast_ref_step": 10.0,
+    "auto_min_scale_min": 0.4,
+    "auto_min_scale_max": 0.8,
+    "auto_min_scale_step": 0.1,
+    "auto_soft_high_min": 0.08,
+    "auto_soft_high_max": 0.18,
+    "auto_soft_high_step": 0.02,
+    "auto_soft_low_factor_min": 0.25,
+    "auto_soft_low_factor_max": 0.45,
+    "auto_soft_low_factor_step": 0.05,
+    "auto_link_radius_min": 1,
+    "auto_link_radius_max": 4,
+    "auto_link_radius_step": 1,
+    "auto_soft_link_prob": 0.5,
+    "auto_edge_smooth_radius_min": 0,
+    "auto_edge_smooth_radius_max": 2,
+    "auto_edge_smooth_iters_min": 1,
+    "auto_edge_smooth_iters_max": 2,
+    "auto_spur_prune_min": 0,
+    "auto_spur_prune_max": 3,
+    "auto_use_edge_smooth_prob": 0.6,
+    "auto_use_closing_prob": 0.3,
+    "auto_closing_radius_min": 1,
+    "auto_closing_radius_max": 2,
+    "auto_closing_iter_min": 1,
+    "auto_closing_iter_max": 2,
+    "auto_magnitude_gamma_min": 0.8,
+    "auto_magnitude_gamma_max": 1.4,
+    "auto_magnitude_gamma_step": 0.1,
+    "auto_median_kernel_min": 3,
+    "auto_median_kernel_max": 5,
+    "auto_median_kernel_step": 2,
+    "weight_continuity": 3.0,
+    "weight_band_fit": 2.4,
+    "weight_coverage": 1.8,
+    "weight_gap": 1.2,
+    "weight_outside": 1.6,
+    "weight_thickness": 1.2,
+    "weight_intrusion": 1.0,
+    "weight_endpoints": 2.2,
+    "weight_wrinkle": 1.4,
+    "weight_branch": 1.1,
+    "weight_low_quality": 0.5,
+    "early_stop_enabled": True,
+    "early_stop_minutes": 10.0,
+    "auto_parallel": True,
+    "auto_workers": max(1, (os.cpu_count() or 4) - 1),
+}
+
+PARAM_KEYS = tuple(PARAM_DEFAULTS.keys())
+AUTO_KEYS = tuple(AUTO_DEFAULTS.keys())
+ROI_CACHE_PATH = os.path.abspath("roi_cache.json")
+
+
+def save_json_config(path, payload):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True, indent=2)
+
+
+def load_json_config(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def compute_auto_score(metrics, weights, return_details=False):
+    coverage = float(metrics.get("coverage", 0.0))
+    gap_ratio = float(metrics.get("gap", 1.0))
+    continuity = float(metrics.get("continuity", 1.0))
+    intrusion = float(metrics.get("intrusion", 1.0))
+    outside = float(metrics.get("outside", 1.0))
+    thickness = float(metrics.get("thickness", 1.0))
+    band_ratio = float(metrics.get("band_ratio", 0.0))
+    endpoint_ratio = float(metrics.get("endpoints", 1.0))
+    wrinkle_ratio = float(metrics.get("wrinkle", 1.0))
+    branch_ratio = float(metrics.get("branch", 1.0))
+
+    w_cont = float(weights.get("weight_continuity", 3.0))
+    w_band = float(weights.get("weight_band_fit", 2.4))
+    w_cov = float(weights.get("weight_coverage", 1.8))
+    w_gap = float(weights.get("weight_gap", 1.2))
+    w_out = float(weights.get("weight_outside", 1.6))
+    w_thick = float(weights.get("weight_thickness", 1.2))
+    w_intr = float(weights.get("weight_intrusion", 1.0))
+    w_end = float(weights.get("weight_endpoints", 2.2))
+    w_wrinkle = float(weights.get("weight_wrinkle", 1.4))
+    w_branch = float(weights.get("weight_branch", 1.1))
+
+    def sigmoid(x):
+        return 1.0 / (1.0 + math.exp(-x))
+
+    q_cont = sigmoid((0.12 - continuity) / 0.04)
+    q_band = sigmoid((band_ratio - 0.85) / 0.08)
+    q_cov = sigmoid((coverage - 0.85) / 0.08)
+    q_gap = sigmoid((0.18 - gap_ratio) / 0.06)
+    q_out = sigmoid((0.05 - outside) / 0.03)
+    q_thick = sigmoid((0.15 - thickness) / 0.08)
+    q_intr = sigmoid((0.03 - intrusion) / 0.02)
+    q_end = sigmoid((0.05 - endpoint_ratio) / 0.02)
+    q_wrinkle = sigmoid((0.20 - wrinkle_ratio) / 0.06)
+    q_branch = sigmoid((0.08 - branch_ratio) / 0.04)
+
+    score = (
+        (q_cont ** w_cont)
+        * (q_band ** w_band)
+        * (q_cov ** w_cov)
+        * (q_gap ** w_gap)
+        * (q_thick ** w_thick)
+        * (q_intr ** w_intr)
+        * (q_out ** w_out)
+        * (q_end ** w_end)
+        * (q_wrinkle ** w_wrinkle)
+        * (q_branch ** w_branch)
+    )
+    exp_penalty = math.exp(-2.5 * (endpoint_ratio + wrinkle_ratio + branch_ratio))
+    score *= exp_penalty
+    score = max(0.0, score)
+    if return_details:
+        return score, {
+            "q_cont": q_cont,
+            "q_band": q_band,
+            "q_cov": q_cov,
+            "q_gap": q_gap,
+            "q_thick": q_thick,
+            "q_intr": q_intr,
+            "q_out": q_out,
+            "q_end": q_end,
+            "q_wrinkle": q_wrinkle,
+            "q_branch": q_branch,
+        }
+    return score
 
 class SobelEdgeDetector:
     """Sobel 필터 기반 에지 검출 클래스"""
@@ -79,6 +279,26 @@ class SobelEdgeDetector:
         windows = sliding_window_view(padded, (kernel_size, kernel_size))
         median = np.median(windows, axis=(-2, -1))
         return median.astype(np.float32, copy=False)
+
+    def _neighbor_count(self, mask):
+        mask_u8 = mask.astype(np.uint8, copy=False)
+        padded = np.pad(mask_u8, 1, mode="constant", constant_values=0)
+        windows = sliding_window_view(padded, (3, 3))
+        counts = windows.sum(axis=(2, 3)) - mask_u8
+        return counts
+
+    def prune_spurs(self, edge_mask, iterations=1):
+        edge_mask = edge_mask.astype(bool, copy=True)
+        iterations = max(0, int(iterations))
+        if iterations <= 0:
+            return edge_mask
+        for _ in range(iterations):
+            counts = self._neighbor_count(edge_mask)
+            endpoints = edge_mask & (counts <= 1)
+            if not endpoints.any():
+                break
+            edge_mask[endpoints] = False
+        return edge_mask
 
     def contrast_stretch(self, image, low_pct=2.0, high_pct=98.0):
         """저대비 영역을 늘려 약한 에지를 강화"""
@@ -521,8 +741,12 @@ class SobelEdgeDetector:
         mask_blur_kernel_size=5,
         mask_blur_sigma=1.0,
         mask_close_radius=1,
+        use_edge_smooth=False,
+        edge_smooth_radius=1,
+        edge_smooth_iters=1,
         use_thinning=True,
         thinning_max_iter=15,
+        spur_prune_iters=0,
     ):
         """전체 에지 검출 파이프라인"""
         # 1. 입력 배열 준비
@@ -654,9 +878,20 @@ class SobelEdgeDetector:
             )
             edges_final = np.where(edge_mask, 255, 0)
 
+        if use_edge_smooth and edge_smooth_radius > 0:
+            edge_mask = edges_final > 0
+            for _ in range(max(int(edge_smooth_iters), 1)):
+                edge_mask = self.erode_binary(self.dilate_binary(edge_mask, edge_smooth_radius), edge_smooth_radius)
+            edges_final = np.where(edge_mask, 255, 0)
+
         if use_thinning:
             edge_mask = edges_final > 0
             edge_mask = self.thin_edges_zhang_suen(edge_mask, thinning_max_iter)
+            edges_final = np.where(edge_mask, 255, 0)
+
+        if spur_prune_iters > 0:
+            edge_mask = edges_final > 0
+            edge_mask = self.prune_spurs(edge_mask, spur_prune_iters)
             edges_final = np.where(edge_mask, 255, 0)
 
         edges_final = edges_final.astype(np.uint8)
@@ -718,11 +953,12 @@ class EdgeBatchGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Sobel Edge Batch Processor")
-        self.root.geometry("920x720")
+        self.root.geometry("1920x1080")
 
         self.detector = SobelEdgeDetector()
         self.selected_files = []
         self.roi_map = {}
+        self.roi_cache = self._load_roi_cache()
         self.max_files = 100
         self.output_root = os.path.abspath("outputs")
 
@@ -730,60 +966,82 @@ class EdgeBatchGUI:
         self._worker_thread = None
         self._auto_thread = None
         self.param_vars = self._init_param_vars()
-        self.auto_mode = tk.StringVar(value="빠름")
+        self.auto_mode = tk.StringVar(value="Fast")
+        self.score_display_mode = tk.StringVar(value="x1e9")
         self.log_text = None
+        self.score_graph_label = None
+        self.best_graph_label = None
+        self.metric_graph_label = None
+        self.detail_graph_label = None
+        self._auto_scores = []
+        self._auto_best_scores = []
+        self._auto_best_time_series = []
+        self._auto_cont_scores = []
+        self._auto_band_scores = []
+        self._auto_penalty_scores = []
+        self._auto_wrinkle_scores = []
+        self._auto_endpoint_scores = []
+        self._auto_branch_scores = []
+        self.score_display_mode.trace_add("write", lambda *_: self._refresh_auto_graphs())
+        self._auto_start_time = None
+        self._auto_last_best_time = None
+        self._auto_pause_event = threading.Event()
+        self._auto_stop_event = threading.Event()
+        self.pause_button = None
+        self.stop_button = None
 
         self._build_ui()
 
     def _init_param_vars(self):
-        return {
-            "nms_relax": tk.DoubleVar(value=0.95),
-            "low_ratio": tk.DoubleVar(value=0.04),
-            "high_ratio": tk.DoubleVar(value=0.12),
-            "use_blur": tk.BooleanVar(value=True),
-            "blur_sigma": tk.DoubleVar(value=1.2),
-            "blur_kernel_size": tk.IntVar(value=5),
-            "auto_threshold": tk.BooleanVar(value=True),
-            "contrast_ref": tk.DoubleVar(value=80.0),
-            "min_threshold_scale": tk.DoubleVar(value=0.5),
-            "use_thinning": tk.BooleanVar(value=True),
-            "thinning_max_iter": tk.IntVar(value=15),
-            "use_boundary_band_filter": tk.BooleanVar(value=True),
-            "boundary_band_radius": tk.IntVar(value=2),
-            "object_is_dark": tk.BooleanVar(value=True),
-            "use_mask_blur": tk.BooleanVar(value=True),
-            "mask_blur_sigma": tk.DoubleVar(value=1.0),
-            "mask_blur_kernel_size": tk.IntVar(value=5),
-            "mask_close_radius": tk.IntVar(value=1),
-            "use_polarity_filter": tk.BooleanVar(value=True),
-            "polarity_drop_margin": tk.DoubleVar(value=0.5),
-            "auto_nms_min": tk.DoubleVar(value=0.90),
-            "auto_nms_max": tk.DoubleVar(value=1.00),
-            "auto_nms_step": tk.DoubleVar(value=0.02),
-            "auto_high_min": tk.DoubleVar(value=0.08),
-            "auto_high_max": tk.DoubleVar(value=0.16),
-            "auto_high_step": tk.DoubleVar(value=0.02),
-            "auto_low_factor": tk.DoubleVar(value=0.33),
-            "auto_band_min": tk.IntVar(value=1),
-            "auto_band_max": tk.IntVar(value=3),
-            "auto_margin_min": tk.DoubleVar(value=0.0),
-            "auto_margin_max": tk.DoubleVar(value=0.8),
-            "auto_margin_step": tk.DoubleVar(value=0.2),
-            "weight_coverage": tk.DoubleVar(value=1.0),
-            "weight_intrusion": tk.DoubleVar(value=1.2),
-            "weight_outside": tk.DoubleVar(value=0.7),
-            "weight_gap": tk.DoubleVar(value=1.0),
-            "weight_thickness": tk.DoubleVar(value=0.5),
-            "weight_low_quality": tk.DoubleVar(value=0.5),
-        }
+        vars_map = {}
+        for key, value in {**PARAM_DEFAULTS, **AUTO_DEFAULTS}.items():
+            if isinstance(value, bool):
+                vars_map[key] = tk.BooleanVar(value=value)
+            elif isinstance(value, int):
+                vars_map[key] = tk.IntVar(value=value)
+            else:
+                vars_map[key] = tk.DoubleVar(value=value)
+        return vars_map
 
     def _build_ui(self):
-        main_frame = ttk.Frame(self.root, padding=12)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        container = ttk.Frame(self.root)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
+        v_scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=v_scroll.set)
+
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        main_frame = ttk.Frame(canvas, padding=12)
+        canvas_window = canvas.create_window((0, 0), window=main_frame, anchor="nw")
+        self._scroll_canvas = canvas
+        self._scroll_window = canvas_window
+
+        def _on_frame_configure(event):
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], bbox[3] + 40))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+
+        main_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            delta = -1 * (event.delta // 120) if event.delta else 0
+            if delta:
+                canvas.yview_scroll(delta, "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", lambda event: canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>", lambda event: canvas.yview_scroll(1, "units"))
 
         header = ttk.Label(
             main_frame,
-            text="최대 100개 이미지 파일을 선택하여 연속 처리합니다.",
+            text="Select up to 100 images and process sequentially.",
             font=("Arial", 12, "bold"),
         )
         header.pack(anchor="w")
@@ -791,10 +1049,10 @@ class EdgeBatchGUI:
         output_frame = ttk.Frame(main_frame)
         output_frame.pack(fill=tk.X, pady=(10, 6))
 
-        ttk.Label(output_frame, text="출력 폴더:").pack(side=tk.LEFT)
+        ttk.Label(output_frame, text="Output folder:").pack(side=tk.LEFT)
         self.output_label = ttk.Label(output_frame, text=self.output_root)
         self.output_label.pack(side=tk.LEFT, padx=(6, 12))
-        ttk.Button(output_frame, text="폴더 변경", command=self._choose_output_dir).pack(side=tk.RIGHT)
+        ttk.Button(output_frame, text="Change", command=self._choose_output_dir).pack(side=tk.RIGHT)
 
         list_frame = ttk.Frame(main_frame)
         list_frame.pack(fill=tk.BOTH, expand=True)
@@ -806,7 +1064,7 @@ class EdgeBatchGUI:
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.file_listbox.config(yscrollcommand=scrollbar.set)
 
-        param_frame = ttk.LabelFrame(main_frame, text="파라미터 설정")
+        param_frame = ttk.LabelFrame(main_frame, text="Parameter Settings")
         param_frame.pack(fill=tk.X, pady=(8, 6))
 
         ttk.Label(param_frame, text="NMS relax").grid(row=0, column=0, sticky="w")
@@ -871,6 +1129,22 @@ class EdgeBatchGUI:
             variable=self.param_vars["use_blur"],
         ).grid(row=1, column=5, sticky="w", padx=(6, 0))
 
+        ttk.Checkbutton(
+            param_frame,
+            text="Median filter",
+            variable=self.param_vars["use_median_filter"],
+        ).grid(row=1, column=6, sticky="w", padx=(6, 0))
+
+        ttk.Label(param_frame, text="Median kernel").grid(row=1, column=7, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=3,
+            to=7,
+            increment=2,
+            textvariable=self.param_vars["median_kernel_size"],
+            width=5,
+        ).grid(row=1, column=8, sticky="w")
+
         ttk.Label(param_frame, text="Contrast ref").grid(row=2, column=0, sticky="w")
         ttk.Spinbox(
             param_frame,
@@ -907,6 +1181,16 @@ class EdgeBatchGUI:
             width=5,
         ).grid(row=2, column=6, sticky="w")
 
+        ttk.Label(param_frame, text="Magnitude gamma").grid(row=3, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.6,
+            to=2.0,
+            increment=0.1,
+            textvariable=self.param_vars["magnitude_gamma"],
+            width=5,
+        ).grid(row=3, column=7, sticky="w")
+
         ttk.Checkbutton(
             param_frame,
             text="Boundary band",
@@ -928,6 +1212,12 @@ class EdgeBatchGUI:
             text="Object dark",
             variable=self.param_vars["object_is_dark"],
         ).grid(row=3, column=4, sticky="w", padx=(4, 0))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Contrast stretch",
+            variable=self.param_vars["use_contrast_stretch"],
+        ).grid(row=3, column=5, sticky="w", padx=(6, 0))
 
         ttk.Checkbutton(
             param_frame,
@@ -955,6 +1245,26 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=4, column=5, sticky="w", padx=(4, 0))
 
+        ttk.Label(param_frame, text="Low pct").grid(row=4, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.0,
+            to=10.0,
+            increment=0.5,
+            textvariable=self.param_vars["contrast_low_pct"],
+            width=5,
+        ).grid(row=4, column=7, sticky="w")
+
+        ttk.Label(param_frame, text="High pct").grid(row=5, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=90.0,
+            to=100.0,
+            increment=0.5,
+            textvariable=self.param_vars["contrast_high_pct"],
+            width=5,
+        ).grid(row=5, column=7, sticky="w")
+
         ttk.Checkbutton(
             param_frame,
             text="Polarity filter",
@@ -971,7 +1281,97 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=5, column=3, sticky="w", padx=(4, 12))
 
-        auto_frame = ttk.LabelFrame(main_frame, text="자동탐색 범위/평가")
+        ttk.Checkbutton(
+            param_frame,
+            text="Soft linking",
+            variable=self.param_vars["use_soft_linking"],
+        ).grid(row=6, column=0, sticky="w")
+        ttk.Label(param_frame, text="Soft low").grid(row=6, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.01,
+            to=0.2,
+            increment=0.01,
+            textvariable=self.param_vars["soft_low_ratio"],
+            width=6,
+        ).grid(row=6, column=3, sticky="w", padx=(4, 12))
+        ttk.Label(param_frame, text="Soft high").grid(row=6, column=4, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.05,
+            to=0.4,
+            increment=0.01,
+            textvariable=self.param_vars["soft_high_ratio"],
+            width=6,
+        ).grid(row=6, column=5, sticky="w", padx=(4, 12))
+        ttk.Label(param_frame, text="Link radius").grid(row=6, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["link_radius"],
+            width=5,
+        ).grid(row=6, column=7, sticky="w")
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Closing",
+            variable=self.param_vars["use_closing"],
+        ).grid(row=7, column=0, sticky="w")
+        ttk.Label(param_frame, text="Close radius").grid(row=7, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["closing_radius"],
+            width=6,
+        ).grid(row=7, column=3, sticky="w", padx=(4, 12))
+        ttk.Label(param_frame, text="Close iters").grid(row=7, column=4, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["closing_iterations"],
+            width=6,
+        ).grid(row=7, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Edge smooth",
+            variable=self.param_vars["use_edge_smooth"],
+        ).grid(row=8, column=0, sticky="w")
+        ttk.Label(param_frame, text="Smooth radius").grid(row=8, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["edge_smooth_radius"],
+            width=6,
+        ).grid(row=8, column=3, sticky="w", padx=(4, 12))
+        ttk.Label(param_frame, text="Smooth iters").grid(row=8, column=4, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["edge_smooth_iters"],
+            width=6,
+        ).grid(row=8, column=5, sticky="w", padx=(4, 12))
+        ttk.Label(param_frame, text="Spur prune").grid(row=8, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["spur_prune_iters"],
+            width=5,
+        ).grid(row=8, column=7, sticky="w")
+
+        auto_frame = ttk.LabelFrame(main_frame, text="Auto Search Range / Scoring")
         auto_frame.pack(fill=tk.X, pady=(6, 6))
 
         ttk.Label(auto_frame, text="NMS min").grid(row=0, column=0, sticky="w")
@@ -1034,17 +1434,37 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=1, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Low factor").grid(row=2, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Low factor min").grid(row=2, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.2,
             to=0.6,
             increment=0.05,
-            textvariable=self.param_vars["auto_low_factor"],
+            textvariable=self.param_vars["auto_low_factor_min"],
             width=6,
         ).grid(row=2, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Band min").grid(row=2, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Low factor max").grid(row=2, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.2,
+            to=0.8,
+            increment=0.05,
+            textvariable=self.param_vars["auto_low_factor_max"],
+            width=6,
+        ).grid(row=2, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Low factor step").grid(row=2, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.01,
+            to=0.2,
+            increment=0.01,
+            textvariable=self.param_vars["auto_low_factor_step"],
+            width=6,
+        ).grid(row=2, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Band min").grid(row=3, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0,
@@ -1052,9 +1472,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_band_min"],
             width=6,
-        ).grid(row=2, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=3, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Band max").grid(row=2, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Band max").grid(row=3, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0,
@@ -1062,49 +1482,233 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_band_max"],
             width=6,
-        ).grid(row=2, column=5, sticky="w", padx=(4, 12))
-
-        ttk.Label(auto_frame, text="Margin min").grid(row=3, column=0, sticky="w")
-        ttk.Spinbox(
-            auto_frame,
-            from_=0.0,
-            to=1.0,
-            increment=0.1,
-            textvariable=self.param_vars["auto_margin_min"],
-            width=6,
-        ).grid(row=3, column=1, sticky="w", padx=(4, 12))
-
-        ttk.Label(auto_frame, text="Margin max").grid(row=3, column=2, sticky="w")
-        ttk.Spinbox(
-            auto_frame,
-            from_=0.0,
-            to=1.0,
-            increment=0.1,
-            textvariable=self.param_vars["auto_margin_max"],
-            width=6,
         ).grid(row=3, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Margin step").grid(row=3, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Margin min").grid(row=3, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
-            from_=0.1,
+            from_=0.0,
             to=1.0,
-            increment=0.1,
-            textvariable=self.param_vars["auto_margin_step"],
+            increment=0.05,
+            textvariable=self.param_vars["auto_margin_min"],
             width=6,
         ).grid(row=3, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W coverage").grid(row=4, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Margin max").grid(row=4, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
-            from_=0.5,
-            to=2.0,
-            increment=0.1,
-            textvariable=self.param_vars["weight_coverage"],
+            from_=0.0,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_margin_max"],
             width=6,
         ).grid(row=4, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W gap").grid(row=4, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Margin step").grid(row=4, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.01,
+            to=0.5,
+            increment=0.01,
+            textvariable=self.param_vars["auto_margin_step"],
+            width=6,
+        ).grid(row=4, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur sigma min").grid(row=4, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.4,
+            to=2.5,
+            increment=0.1,
+            textvariable=self.param_vars["auto_blur_sigma_min"],
+            width=6,
+        ).grid(row=4, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur sigma max").grid(row=5, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.4,
+            to=3.0,
+            increment=0.1,
+            textvariable=self.param_vars["auto_blur_sigma_max"],
+            width=6,
+        ).grid(row=5, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur sigma step").grid(row=5, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.05,
+            to=0.5,
+            increment=0.05,
+            textvariable=self.param_vars["auto_blur_sigma_step"],
+            width=6,
+        ).grid(row=5, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur kernel min").grid(row=5, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=3,
+            to=9,
+            increment=2,
+            textvariable=self.param_vars["auto_blur_kernel_min"],
+            width=6,
+        ).grid(row=5, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur kernel max").grid(row=6, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=3,
+            to=11,
+            increment=2,
+            textvariable=self.param_vars["auto_blur_kernel_max"],
+            width=6,
+        ).grid(row=6, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Blur kernel step").grid(row=6, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=2,
+            to=4,
+            increment=2,
+            textvariable=self.param_vars["auto_blur_kernel_step"],
+            width=6,
+        ).grid(row=6, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Thinning min").grid(row=6, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=5,
+            to=30,
+            increment=1,
+            textvariable=self.param_vars["auto_thinning_min"],
+            width=6,
+        ).grid(row=6, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Thinning max").grid(row=7, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=5,
+            to=30,
+            increment=1,
+            textvariable=self.param_vars["auto_thinning_max"],
+            width=6,
+        ).grid(row=7, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Thinning step").grid(row=7, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_thinning_step"],
+            width=6,
+        ).grid(row=7, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Contrast ref min").grid(row=7, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=20,
+            to=160,
+            increment=5,
+            textvariable=self.param_vars["auto_contrast_ref_min"],
+            width=6,
+        ).grid(row=7, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Contrast ref max").grid(row=8, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=20,
+            to=180,
+            increment=5,
+            textvariable=self.param_vars["auto_contrast_ref_max"],
+            width=6,
+        ).grid(row=8, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Contrast ref step").grid(row=8, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=5,
+            to=20,
+            increment=5,
+            textvariable=self.param_vars["auto_contrast_ref_step"],
+            width=6,
+        ).grid(row=8, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Min scale min").grid(row=8, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.2,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_min_scale_min"],
+            width=6,
+        ).grid(row=8, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Min scale max").grid(row=9, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.2,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_min_scale_max"],
+            width=6,
+        ).grid(row=9, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Min scale step").grid(row=9, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.05,
+            to=0.3,
+            increment=0.05,
+            textvariable=self.param_vars["auto_min_scale_step"],
+            width=6,
+        ).grid(row=9, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Checkbutton(
+            auto_frame,
+            text="Parallel eval",
+            variable=self.param_vars["auto_parallel"],
+        ).grid(row=9, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=32,
+            increment=1,
+            textvariable=self.param_vars["auto_workers"],
+            width=6,
+        ).grid(row=9, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W continuity").grid(row=10, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1.0,
+            to=5.0,
+            increment=0.2,
+            textvariable=self.param_vars["weight_continuity"],
+            width=6,
+        ).grid(row=10, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W band fit").grid(row=10, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1.0,
+            to=4.0,
+            increment=0.2,
+            textvariable=self.param_vars["weight_band_fit"],
+            width=6,
+        ).grid(row=10, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W coverage").grid(row=10, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.5,
+            to=3.0,
+            increment=0.1,
+            textvariable=self.param_vars["weight_coverage"],
+            width=6,
+        ).grid(row=10, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W gap").grid(row=11, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1112,19 +1716,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_gap"],
             width=6,
-        ).grid(row=4, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W intrusion").grid(row=4, column=4, sticky="w")
-        ttk.Spinbox(
-            auto_frame,
-            from_=0.5,
-            to=3.0,
-            increment=0.1,
-            textvariable=self.param_vars["weight_intrusion"],
-            width=6,
-        ).grid(row=4, column=5, sticky="w", padx=(4, 12))
-
-        ttk.Label(auto_frame, text="W outside").grid(row=5, column=0, sticky="w")
+        ttk.Label(auto_frame, text="W outside").grid(row=11, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1132,19 +1726,29 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_outside"],
             width=6,
-        ).grid(row=5, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W thickness").grid(row=5, column=2, sticky="w")
+        ttk.Label(auto_frame, text="W thickness").grid(row=11, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
-            to=2.0,
+            to=2.5,
             increment=0.1,
             textvariable=self.param_vars["weight_thickness"],
             width=6,
-        ).grid(row=5, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W low quality").grid(row=5, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W intrusion").grid(row=12, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.5,
+            to=3.0,
+            increment=0.1,
+            textvariable=self.param_vars["weight_intrusion"],
+            width=6,
+        ).grid(row=12, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W low quality").grid(row=12, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
@@ -1152,54 +1756,410 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_low_quality"],
             width=6,
-        ).grid(row=5, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=12, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W endpoints").grid(row=12, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.5,
+            to=4.0,
+            increment=0.1,
+            textvariable=self.param_vars["weight_endpoints"],
+            width=6,
+        ).grid(row=12, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Checkbutton(
+            auto_frame,
+            text="Early stop on stagnation (min)",
+            variable=self.param_vars["early_stop_enabled"],
+        ).grid(row=13, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=60,
+            increment=1,
+            textvariable=self.param_vars["early_stop_minutes"],
+            width=6,
+        ).grid(row=13, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W wrinkle").grid(row=13, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.5,
+            to=4.0,
+            increment=0.1,
+            textvariable=self.param_vars["weight_wrinkle"],
+            width=6,
+        ).grid(row=13, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W branch").grid(row=13, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.5,
+            to=3.0,
+            increment=0.1,
+            textvariable=self.param_vars["weight_branch"],
+            width=6,
+        ).grid(row=13, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft link prob").grid(row=14, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_soft_link_prob"],
+            width=6,
+        ).grid(row=14, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft high min").grid(row=14, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.04,
+            to=0.3,
+            increment=0.01,
+            textvariable=self.param_vars["auto_soft_high_min"],
+            width=6,
+        ).grid(row=14, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft high max").grid(row=14, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.04,
+            to=0.3,
+            increment=0.01,
+            textvariable=self.param_vars["auto_soft_high_max"],
+            width=6,
+        ).grid(row=14, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft high step").grid(row=15, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.005,
+            to=0.05,
+            increment=0.005,
+            textvariable=self.param_vars["auto_soft_high_step"],
+            width=6,
+        ).grid(row=15, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft low factor min").grid(row=15, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.1,
+            to=0.8,
+            increment=0.05,
+            textvariable=self.param_vars["auto_soft_low_factor_min"],
+            width=6,
+        ).grid(row=15, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft low factor max").grid(row=15, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.1,
+            to=0.8,
+            increment=0.05,
+            textvariable=self.param_vars["auto_soft_low_factor_max"],
+            width=6,
+        ).grid(row=15, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft low factor step").grid(row=16, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.01,
+            to=0.2,
+            increment=0.01,
+            textvariable=self.param_vars["auto_soft_low_factor_step"],
+            width=6,
+        ).grid(row=16, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Link radius min").grid(row=16, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_link_radius_min"],
+            width=6,
+        ).grid(row=16, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Link radius max").grid(row=16, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_link_radius_max"],
+            width=6,
+        ).grid(row=16, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Edge smooth prob").grid(row=17, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_use_edge_smooth_prob"],
+            width=6,
+        ).grid(row=17, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Smooth radius min").grid(row=17, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["auto_edge_smooth_radius_min"],
+            width=6,
+        ).grid(row=17, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Smooth radius max").grid(row=17, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["auto_edge_smooth_radius_max"],
+            width=6,
+        ).grid(row=17, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Smooth iters min").grid(row=18, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_edge_smooth_iters_min"],
+            width=6,
+        ).grid(row=18, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Smooth iters max").grid(row=18, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_edge_smooth_iters_max"],
+            width=6,
+        ).grid(row=18, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Spur prune min").grid(row=18, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_spur_prune_min"],
+            width=6,
+        ).grid(row=18, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Spur prune max").grid(row=19, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["auto_spur_prune_max"],
+            width=6,
+        ).grid(row=19, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Closing prob").grid(row=19, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.05,
+            textvariable=self.param_vars["auto_use_closing_prob"],
+            width=6,
+        ).grid(row=19, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Closing radius min").grid(row=19, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["auto_closing_radius_min"],
+            width=6,
+        ).grid(row=19, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Closing radius max").grid(row=20, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["auto_closing_radius_max"],
+            width=6,
+        ).grid(row=20, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Closing iters min").grid(row=20, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=5,
+            increment=1,
+            textvariable=self.param_vars["auto_closing_iter_min"],
+            width=6,
+        ).grid(row=20, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Closing iters max").grid(row=20, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=5,
+            increment=1,
+            textvariable=self.param_vars["auto_closing_iter_max"],
+            width=6,
+        ).grid(row=20, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Gamma min").grid(row=21, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.6,
+            to=2.0,
+            increment=0.1,
+            textvariable=self.param_vars["auto_magnitude_gamma_min"],
+            width=6,
+        ).grid(row=21, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Gamma max").grid(row=21, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.6,
+            to=2.0,
+            increment=0.1,
+            textvariable=self.param_vars["auto_magnitude_gamma_max"],
+            width=6,
+        ).grid(row=21, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Gamma step").grid(row=21, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.05,
+            to=0.3,
+            increment=0.05,
+            textvariable=self.param_vars["auto_magnitude_gamma_step"],
+            width=6,
+        ).grid(row=21, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Median kernel min").grid(row=22, column=0, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=3,
+            to=7,
+            increment=2,
+            textvariable=self.param_vars["auto_median_kernel_min"],
+            width=6,
+        ).grid(row=22, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Median kernel max").grid(row=22, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=3,
+            to=9,
+            increment=2,
+            textvariable=self.param_vars["auto_median_kernel_max"],
+            width=6,
+        ).grid(row=22, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Median kernel step").grid(row=22, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=2,
+            to=4,
+            increment=2,
+            textvariable=self.param_vars["auto_median_kernel_step"],
+            width=6,
+        ).grid(row=22, column=5, sticky="w", padx=(4, 12))
 
         auto_btn_frame = ttk.Frame(auto_frame)
-        auto_btn_frame.grid(row=6, column=0, columnspan=6, sticky="w", pady=(4, 0))
-        ttk.Button(auto_btn_frame, text="평가 저장", command=self._save_eval_config).pack(side=tk.LEFT, padx=4)
-        ttk.Button(auto_btn_frame, text="평가 불러오기", command=self._load_eval_config).pack(side=tk.LEFT, padx=4)
+        auto_btn_frame.grid(row=23, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        ttk.Button(auto_btn_frame, text="Save Auto Config", command=self._save_auto_config).pack(side=tk.LEFT, padx=4)
+        ttk.Button(auto_btn_frame, text="Load Auto Config", command=self._load_auto_config).pack(side=tk.LEFT, padx=4)
 
-        guide_frame = ttk.LabelFrame(main_frame, text="튜닝 가이드")
+        param_btn_frame = ttk.Frame(param_frame)
+        param_btn_frame.grid(row=9, column=0, columnspan=8, sticky="w", pady=(4, 0))
+        ttk.Button(param_btn_frame, text="Save Params", command=self._save_param_config).pack(side=tk.LEFT, padx=4)
+        ttk.Button(param_btn_frame, text="Load Params", command=self._load_param_config).pack(side=tk.LEFT, padx=4)
+
+        guide_frame = ttk.LabelFrame(main_frame, text="Tuning Guide")
         guide_frame.pack(fill=tk.X, pady=(6, 6))
-        guide_text = tk.Text(guide_frame, height=6, wrap="word")
+        guide_text = tk.Text(guide_frame, height=9, wrap="word")
         guide_text.insert(
             "1.0",
-            "- ROI 설정: 자동 최적화에 사용할 영역을 사각형으로 지정\n"
-            "- NMS relax 낮추면 끊김 감소, 너무 낮으면 두꺼워짐\n"
-            "- Low/High ratio 낮추면 검출율 증가, 내부 침범/노이즈 증가\n"
-            "- Boundary band는 내부 침범 억제 (작을수록 바깥 테두리 엄격)\n"
-            "- Polarity filter는 내부 곡선 제거에 도움\n"
-            "- Thinning은 1픽셀 두께 유지, 끊김이 있으면 NMS relax 조정\n"
-            "- Auto threshold는 저대비 이미지에서 임계값 자동 보정\n",
+            "- ROI: Draw a rectangle to focus auto-optimization on the true boundary area.\n"
+            "- Auto Optimize uses the average score across multiple images (Precise mode uses all).\n"
+            "- NMS relax: Lower reduces gaps, too low can thicken edges or create inner curl.\n"
+            "- Low/High ratio: Lower increases recall but can add intrusion/noise.\n"
+            "- Boundary band radius: Smaller forces edges to stay on the outer boundary.\n"
+            "- Polarity filter: Removes inner curves by checking edge brightness direction.\n"
+            "- Thinning: Keeps a single-pixel contour; adjust NMS relax if gaps appear.\n"
+            "- Auto threshold: Adapts to low-contrast images automatically.\n"
+            "- Weights: Continuity and band fit are highest priority for stable outer edges.\n"
+            "- Early stop ends optimization when best score stalls for N minutes.\n"
+            "- Save Params stores detection settings; Save Auto Config stores search ranges/weights.\n",
         )
         guide_text.configure(state="disabled")
         guide_text.pack(fill=tk.X)
+        graph_frame = ttk.LabelFrame(main_frame, text="Auto Optimization Progress")
+        graph_frame.pack(fill=tk.X, pady=(6, 6))
+        self.score_graph_label = ttk.Label(graph_frame)
+        self.score_graph_label.pack(side=tk.LEFT, padx=6)
+        self.best_graph_label = ttk.Label(graph_frame)
+        self.best_graph_label.pack(side=tk.LEFT, padx=6)
+        self.metric_graph_label = ttk.Label(graph_frame)
+        self.metric_graph_label.pack(side=tk.LEFT, padx=6)
+        self.detail_graph_label = ttk.Label(graph_frame)
+        self.detail_graph_label.pack(side=tk.LEFT, padx=6)
+        self.score_graph_label.bind("<Button-1>", lambda _e: self._open_graph_window("score"))
+        self.best_graph_label.bind("<Button-1>", lambda _e: self._open_graph_window("best"))
+        self.metric_graph_label.bind("<Button-1>", lambda _e: self._open_graph_window("metric"))
+        self.detail_graph_label.bind("<Button-1>", lambda _e: self._open_graph_window("detail"))
+
         self.log_text = tk.Text(main_frame, height=6, wrap="word")
         self.log_text.pack(fill=tk.BOTH, pady=(6, 6))
 
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, pady=(10, 6))
 
-        ttk.Button(button_frame, text="파일 추가", command=self._add_files).pack(side=tk.LEFT)
-        ttk.Button(button_frame, text="목록 비우기", command=self._clear_files).pack(side=tk.LEFT, padx=6)
-        ttk.Button(button_frame, text="ROI 설정", command=self._open_roi_editor).pack(side=tk.LEFT, padx=6)
-        ttk.Button(button_frame, text="ROI 초기화", command=self._clear_roi).pack(side=tk.LEFT, padx=6)
-        ttk.Label(button_frame, text="자동탐색 모드").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Button(button_frame, text="Add Files", command=self._add_files).pack(side=tk.LEFT)
+        ttk.Button(button_frame, text="Clear List", command=self._clear_files).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_frame, text="Set ROI", command=self._open_roi_editor).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_frame, text="Clear ROI", command=self._clear_roi).pack(side=tk.LEFT, padx=6)
+        ttk.Label(button_frame, text="Auto mode").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Combobox(
             button_frame,
             textvariable=self.auto_mode,
-            values=["빠름", "정밀"],
+            values=["Fast", "Precise"],
             width=6,
             state="readonly",
         ).pack(side=tk.LEFT)
-        self.auto_button = ttk.Button(button_frame, text="자동 최적화", command=self._start_auto_optimize)
+        self.auto_button = ttk.Button(button_frame, text="Auto Optimize", command=self._start_auto_optimize)
         self.auto_button.pack(side=tk.LEFT, padx=6)
-        self.start_button = ttk.Button(button_frame, text="처리 시작", command=self._start_processing)
+        ttk.Label(button_frame, text="Score display").pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Combobox(
+            button_frame,
+            textvariable=self.score_display_mode,
+            values=["raw", "log10", "x1e9"],
+            width=7,
+            state="readonly",
+        ).pack(side=tk.LEFT)
+        self.pause_button = ttk.Button(
+            button_frame, text="Pause", command=self._toggle_auto_pause, state=tk.DISABLED
+        )
+        self.pause_button.pack(side=tk.LEFT, padx=4)
+        self.stop_button = ttk.Button(
+            button_frame, text="Stop", command=self._stop_auto_optimize, state=tk.DISABLED
+        )
+        self.stop_button.pack(side=tk.LEFT, padx=4)
+        self.start_button = ttk.Button(button_frame, text="Start Processing", command=self._start_processing)
         self.start_button.pack(side=tk.RIGHT)
 
-        self.status_var = tk.StringVar(value="대기 중...")
+        self.status_var = tk.StringVar(value="Idle...")
         status_label = ttk.Label(main_frame, textvariable=self.status_var)
         status_label.pack(anchor="w", pady=(6, 0))
+
+        self.root.after(200, self._refresh_scroll_region)
 
     def _log(self, message):
         if not self.log_text:
@@ -1207,66 +2167,141 @@ class EdgeBatchGUI:
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
 
+    def _refresh_scroll_region(self):
+        canvas = getattr(self, "_scroll_canvas", None)
+        if not canvas:
+            return
+        bbox = canvas.bbox("all")
+        if bbox:
+            canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], bbox[3] + 60))
+
+    def _load_roi_cache(self):
+        if not os.path.exists(ROI_CACHE_PATH):
+            return {}
+        try:
+            data = load_json_config(ROI_CACHE_PATH)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        cache = {}
+        for key, value in data.items():
+            if not isinstance(value, (list, tuple)) or len(value) != 4:
+                continue
+            try:
+                cache[str(key)] = (int(value[0]), int(value[1]), int(value[2]), int(value[3]))
+            except (ValueError, TypeError):
+                continue
+        return cache
+
+    def _save_roi_cache(self):
+        try:
+            save_json_config(ROI_CACHE_PATH, self.roi_cache)
+        except OSError:
+            self._log("[ROI] Failed to save ROI cache.")
+
+    def _format_file_label(self, path):
+        tag = "[ROI] " if path in self.roi_map else "      "
+        return f"{tag}{path}"
+
+    def _refresh_file_list(self):
+        self.file_listbox.delete(0, tk.END)
+        for path in self.selected_files:
+            self.file_listbox.insert(tk.END, self._format_file_label(path))
+
+    def _update_file_label(self, path):
+        if path not in self.selected_files:
+            return
+        idx = self.selected_files.index(path)
+        self.file_listbox.delete(idx)
+        self.file_listbox.insert(idx, self._format_file_label(path))
+
     def _get_selected_file(self):
         selection = self.file_listbox.curselection()
         if not selection:
             return None
-        return self.file_listbox.get(selection[0])
+        return self.selected_files[selection[0]]
 
     def _open_roi_editor(self):
-        path = self._get_selected_file()
-        if not path:
-            messagebox.showinfo("알림", "ROI를 지정할 파일을 선택해주세요.")
+        selection = self.file_listbox.curselection()
+        if not self.selected_files:
+            messagebox.showinfo("Info", "Select a file to set ROI.")
             return
-        if not os.path.exists(path):
-            messagebox.showerror("오류", "파일을 찾을 수 없습니다.")
-            return
-
-        img = Image.open(path).convert("L")
-        max_w, max_h = 800, 500
-        scale = min(max_w / img.width, max_h / img.height, 1.0)
-        disp_w = int(img.width * scale)
-        disp_h = int(img.height * scale)
-        display = img.resize((disp_w, disp_h), resample=Image.BILINEAR)
+        idx = selection[0] if selection else 0
+        idx = max(0, min(idx, len(self.selected_files) - 1))
 
         win = tk.Toplevel(self.root)
-        win.title("ROI 설정")
-        canvas = tk.Canvas(win, width=disp_w, height=disp_h)
+        win.title("Set ROI")
+        canvas = tk.Canvas(win)
         canvas.pack()
-        tk_img = ImageTk.PhotoImage(display)
-        canvas.image = tk_img
-        canvas.create_image(0, 0, anchor="nw", image=tk_img)
-
-        roi_rect = None
-        start = {"x": 0, "y": 0}
-        roi_label = ttk.Label(win, text="드래그하여 ROI를 지정하세요.")
+        file_label = ttk.Label(win, text="")
+        file_label.pack(pady=2)
+        roi_label = ttk.Label(win, text="Drag to draw a rectangular ROI.")
         roi_label.pack(pady=4)
 
-        if path in self.roi_map:
-            x1, y1, x2, y2 = self.roi_map[path]
-            x1d, y1d = x1 * scale, y1 * scale
-            x2d, y2d = x2 * scale, y2 * scale
-            roi_rect = canvas.create_rectangle(x1d, y1d, x2d, y2d, outline="red", width=2)
+        state = {"idx": idx, "img": None, "scale": 1.0, "roi_rect": None, "path": None}
+        max_w, max_h = 900, 520
+
+        def load_index(new_idx):
+            if new_idx < 0 or new_idx >= len(self.selected_files):
+                roi_label.config(text="All ROI tasks are complete.")
+                return
+            state["idx"] = new_idx
+            path = self.selected_files[new_idx]
+            if not os.path.exists(path):
+                roi_label.config(text="File not found.")
+                return
+            img = Image.open(path).convert("L")
+            scale = min(max_w / img.width, max_h / img.height, 1.0)
+            disp_w = int(img.width * scale)
+            disp_h = int(img.height * scale)
+            display = img.resize((disp_w, disp_h), resample=Image.BILINEAR)
+            tk_img = ImageTk.PhotoImage(display)
+            canvas.config(width=disp_w, height=disp_h)
+            canvas.image = tk_img
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor="nw", image=tk_img)
+
+            state["img"] = img
+            state["scale"] = scale
+            state["path"] = path
+            state["roi_rect"] = None
+
+            if path in self.roi_map:
+                x1, y1, x2, y2 = self.roi_map[path]
+                x1d, y1d = x1 * scale, y1 * scale
+                x2d, y2d = x2 * scale, y2 * scale
+                state["roi_rect"] = canvas.create_rectangle(x1d, y1d, x2d, y2d, outline="red", width=2)
+                roi_label.config(text=f"ROI loaded: ({x1},{y1})-({x2},{y2})")
+            else:
+                roi_label.config(text="Drag to draw a rectangular ROI.")
+
+            file_label.config(text=f"File {new_idx + 1}/{len(self.selected_files)}: {os.path.basename(path)}")
+            self.file_listbox.selection_clear(0, tk.END)
+            self.file_listbox.selection_set(new_idx)
+            self.file_listbox.see(new_idx)
+
+        start = {"x": 0, "y": 0}
 
         def on_press(event):
             start["x"], start["y"] = event.x, event.y
-            nonlocal roi_rect
-            if roi_rect:
-                canvas.delete(roi_rect)
-                roi_rect = None
+            if state["roi_rect"]:
+                canvas.delete(state["roi_rect"])
+                state["roi_rect"] = None
 
         def on_drag(event):
-            nonlocal roi_rect
-            if roi_rect:
-                canvas.delete(roi_rect)
-            roi_rect = canvas.create_rectangle(
+            if state["roi_rect"]:
+                canvas.delete(state["roi_rect"])
+            state["roi_rect"] = canvas.create_rectangle(
                 start["x"], start["y"], event.x, event.y, outline="red", width=2
             )
 
         def on_release(event):
-            nonlocal roi_rect
-            if not roi_rect:
+            if not state["roi_rect"] or state["img"] is None:
                 return
+            img = state["img"]
+            scale = state["scale"]
+            path = state["path"]
             x1 = min(start["x"], event.x) / scale
             y1 = min(start["y"], event.y) / scale
             x2 = max(start["x"], event.x) / scale
@@ -1276,37 +2311,245 @@ class EdgeBatchGUI:
             x2 = int(max(1, min(img.width, x2)))
             y2 = int(max(1, min(img.height, y2)))
             if x2 <= x1 + 1 or y2 <= y1 + 1:
-                roi_label.config(text="ROI가 너무 작습니다.")
+                roi_label.config(text="ROI is too small.")
                 return
             self.roi_map[path] = (x1, y1, x2, y2)
-            roi_label.config(text=f"ROI 저장됨: ({x1},{y1})-({x2},{y2})")
+            self.roi_cache[path] = (x1, y1, x2, y2)
+            self.roi_cache[os.path.basename(path)] = (x1, y1, x2, y2)
+            self._save_roi_cache()
+            self._update_file_label(path)
+            roi_label.config(text=f"ROI saved: ({x1},{y1})-({x2},{y2})")
+
+            next_idx = state["idx"] + 1
+            if next_idx < len(self.selected_files):
+                load_index(next_idx)
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
         canvas.bind("<ButtonRelease-1>", on_release)
 
         def clear_roi():
-            if path in self.roi_map:
+            path = state["path"]
+            if path and path in self.roi_map:
                 del self.roi_map[path]
-            if roi_rect:
-                canvas.delete(roi_rect)
-            roi_label.config(text="ROI 초기화됨.")
+            if path and path in self.roi_cache:
+                del self.roi_cache[path]
+            if path:
+                base = os.path.basename(path)
+                if base in self.roi_cache:
+                    del self.roi_cache[base]
+            self._save_roi_cache()
+            if state["roi_rect"]:
+                canvas.delete(state["roi_rect"])
+                state["roi_rect"] = None
+            if path:
+                self._update_file_label(path)
+            roi_label.config(text="ROI cleared.")
+
+        def prev_image():
+            load_index(state["idx"] - 1)
+
+        def next_image():
+            load_index(state["idx"] + 1)
 
         btn_frame = ttk.Frame(win)
         btn_frame.pack(pady=6)
-        ttk.Button(btn_frame, text="ROI 초기화", command=clear_roi).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_frame, text="닫기", command=win.destroy).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Prev", command=prev_image).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Next", command=next_image).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Clear ROI", command=clear_roi).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side=tk.LEFT, padx=4)
+
+        load_index(idx)
 
     def _clear_roi(self):
         path = self._get_selected_file()
         if not path:
-            messagebox.showinfo("알림", "ROI를 초기화할 파일을 선택해주세요.")
+            messagebox.showinfo("Info", "Select a file to clear ROI.")
             return
         if path in self.roi_map:
             del self.roi_map[path]
-            self._log(f"[ROI] {os.path.basename(path)} 초기화 완료")
+            if path in self.roi_cache:
+                del self.roi_cache[path]
+            base = os.path.basename(path)
+            if base in self.roi_cache:
+                del self.roi_cache[base]
+            self._save_roi_cache()
+            self._update_file_label(path)
+            self._log(f"[ROI] Cleared: {os.path.basename(path)}")
         else:
-            messagebox.showinfo("알림", "설정된 ROI가 없습니다.")
+            messagebox.showinfo("Info", "No ROI is set.")
+
+    def _toggle_auto_pause(self):
+        if not self.pause_button:
+            return
+        if self._auto_pause_event.is_set():
+            self._auto_pause_event.clear()
+            self.pause_button.config(text="Pause")
+            self._log("[AUTO] Resumed")
+        else:
+            self._auto_pause_event.set()
+            self.pause_button.config(text="Resume")
+            self._log("[AUTO] Paused")
+
+    def _stop_auto_optimize(self):
+        if not self.stop_button:
+            return
+        self._auto_stop_event.set()
+        self._auto_pause_event.clear()
+        if self.pause_button:
+            self.pause_button.config(text="Pause")
+        self._log("[AUTO] Stop requested")
+
+    def _format_eta(self, seconds):
+        seconds = max(0, int(seconds))
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _score_to_display(self, value, mode=None):
+        mode = mode or (self.score_display_mode.get() if self.score_display_mode else "raw")
+        if mode == "log10":
+            return math.log10(max(float(value), 1e-30))
+        if mode == "x1e9":
+            return float(value) * 1e9
+        return float(value)
+
+    def _select_auto_subset(self, files, max_files):
+        if max_files >= len(files):
+            return list(files)
+        step = max(1, len(files) // max_files)
+        return list(files)[::step][:max_files]
+
+    def _compute_signature(self, image):
+        arr = np.clip(image, 0, 255).astype(np.uint8)
+        thumb = Image.fromarray(arr).resize((24, 24), resample=Image.BILINEAR)
+        small = np.asarray(thumb, dtype=np.float32) / 255.0
+        gx, gy = np.gradient(small)
+        mag = np.sqrt(gx**2 + gy**2)
+        sig = np.concatenate([small.flatten(), mag.flatten()])
+        sig = (sig - sig.mean()) / (sig.std() + 1e-6)
+        return sig
+
+    def _cluster_signatures(self, signatures, k, rng):
+        n = len(signatures)
+        if n <= k:
+            labels = np.arange(n, dtype=int)
+            centers = signatures.copy()
+            return labels, centers
+        indices = rng.choice(n, k, replace=False)
+        centers = signatures[indices].copy()
+        for _ in range(8):
+            distances = np.sum((signatures[:, None, :] - centers[None, :, :]) ** 2, axis=2)
+            labels = np.argmin(distances, axis=1)
+            for j in range(k):
+                mask = labels == j
+                if not np.any(mask):
+                    centers[j] = signatures[rng.randint(0, n)]
+                else:
+                    centers[j] = signatures[mask].mean(axis=0)
+        return labels, centers
+
+    def _prepare_auto_data(self, files, settings, auto_config, roi_map, max_files):
+        subset = self._select_auto_subset(files, max_files)
+        band_min = min(auto_config["auto_band_min"], auto_config["auto_band_max"])
+        band_max = max(auto_config["auto_band_min"], auto_config["auto_band_max"])
+        band_radii = list(range(band_min, band_max + 1))
+        if not band_radii:
+            band_radii = [settings["boundary_band_radius"]]
+        data = []
+        for path in subset:
+            image = self.detector.load_image(path)
+            roi = roi_map.get(path)
+            if roi:
+                x1, y1, x2, y2 = roi
+                image = image[y1:y2, x1:x2]
+
+            mask_source = image
+            if settings["use_mask_blur"]:
+                mask_source = self.detector.apply_gaussian_blur(
+                    image, settings["mask_blur_kernel_size"], settings["mask_blur_sigma"]
+                )
+            mask = self.detector.estimate_object_mask(mask_source, settings["object_is_dark"])
+            if settings["mask_close_radius"] > 0:
+                mask = self.detector.erode_binary(
+                    self.detector.dilate_binary(mask, settings["mask_close_radius"]),
+                    settings["mask_close_radius"],
+                )
+            boundary = self._compute_boundary(mask)
+            bands = {}
+            band_pixels = {}
+            for radius in band_radii:
+                if radius <= 0:
+                    band = boundary.copy()
+                else:
+                    band = self.detector.dilate_binary(boundary, radius)
+                bands[radius] = band
+                band_pixels[radius] = int(band.sum())
+
+            data.append(
+                {
+                    "path": path,
+                    "image": image,
+                    "mask": mask,
+                    "boundary": boundary,
+                    "bands": bands,
+                    "band_pixels": band_pixels,
+                    "weight": 1.0,
+                }
+            )
+        if len(data) < 4:
+            return {"coarse": data, "mid": data, "full": data}
+
+        rng = np.random.RandomState(42)
+        signatures = np.stack([self._compute_signature(item["image"]) for item in data], axis=0)
+        k = min(max(2, int(np.sqrt(len(data)))), 12)
+        labels, centers = self._cluster_signatures(signatures, k, rng)
+        clusters = {i: [] for i in range(k)}
+        for idx, label in enumerate(labels):
+            clusters[int(label)].append(idx)
+
+        coarse = []
+        mid = []
+        full = []
+        for cluster_id, indices in clusters.items():
+            if not indices:
+                continue
+            center = centers[cluster_id]
+            dists = []
+            for idx in indices:
+                d = float(np.sum((signatures[idx] - center) ** 2))
+                dists.append((d, idx))
+            dists.sort(key=lambda x: x[0])
+            rep_idx = dists[0][1]
+            rep_item = dict(data[rep_idx])
+            rep_item["weight"] = float(len(indices))
+            coarse.append(rep_item)
+
+            take = min(3, len(dists))
+            for _, idx in dists[:take]:
+                item = dict(data[idx])
+                item["weight"] = float(len(indices)) / float(take)
+                mid.append(item)
+
+        for item in data:
+            full.append(dict(item))
+
+        return {"coarse": coarse, "mid": mid, "full": full}
+
+    def _collect_values(self, keys):
+        return {key: self.param_vars[key].get() for key in keys if key in self.param_vars}
+
+    def _apply_values(self, values, defaults):
+        merged = dict(defaults)
+        for key, value in values.items():
+            if key in defaults:
+                merged[key] = value
+        for key, value in merged.items():
+            if key in self.param_vars:
+                self.param_vars[key].set(value)
 
     def _get_param_settings(self):
         def get_float(key):
@@ -1319,7 +2562,7 @@ class EdgeBatchGUI:
         low_ratio = get_float("low_ratio")
         high_ratio = get_float("high_ratio")
         if high_ratio <= 0 or low_ratio <= 0:
-            raise ValueError("Low/High ratio는 0보다 커야 합니다.")
+            raise ValueError("Low/High ratio must be greater than 0.")
         if low_ratio >= high_ratio:
             low_ratio = high_ratio * 0.5
 
@@ -1327,14 +2570,31 @@ class EdgeBatchGUI:
             "nms_relax": nms_relax,
             "low_ratio": low_ratio,
             "high_ratio": high_ratio,
+            "use_median_filter": bool(self.param_vars["use_median_filter"].get()),
+            "median_kernel_size": max(3, get_int("median_kernel_size") | 1),
             "use_blur": bool(self.param_vars["use_blur"].get()),
             "blur_sigma": get_float("blur_sigma"),
             "blur_kernel_size": max(3, get_int("blur_kernel_size")),
+            "magnitude_gamma": get_float("magnitude_gamma"),
+            "use_contrast_stretch": bool(self.param_vars["use_contrast_stretch"].get()),
+            "contrast_low_pct": get_float("contrast_low_pct"),
+            "contrast_high_pct": get_float("contrast_high_pct"),
             "auto_threshold": bool(self.param_vars["auto_threshold"].get()),
             "contrast_ref": get_float("contrast_ref"),
             "min_threshold_scale": get_float("min_threshold_scale"),
+            "use_soft_linking": bool(self.param_vars["use_soft_linking"].get()),
+            "soft_low_ratio": get_float("soft_low_ratio"),
+            "soft_high_ratio": get_float("soft_high_ratio"),
+            "link_radius": max(0, get_int("link_radius")),
+            "use_closing": bool(self.param_vars["use_closing"].get()),
+            "closing_radius": max(0, get_int("closing_radius")),
+            "closing_iterations": max(1, get_int("closing_iterations")),
             "use_thinning": bool(self.param_vars["use_thinning"].get()),
             "thinning_max_iter": max(1, get_int("thinning_max_iter")),
+            "use_edge_smooth": bool(self.param_vars["use_edge_smooth"].get()),
+            "edge_smooth_radius": max(0, get_int("edge_smooth_radius")),
+            "edge_smooth_iters": max(1, get_int("edge_smooth_iters")),
+            "spur_prune_iters": max(0, get_int("spur_prune_iters")),
             "use_boundary_band_filter": bool(self.param_vars["use_boundary_band_filter"].get()),
             "boundary_band_radius": max(1, get_int("boundary_band_radius")),
             "object_is_dark": bool(self.param_vars["object_is_dark"].get()),
@@ -1354,56 +2614,60 @@ class EdgeBatchGUI:
         return settings
 
     def _get_auto_config(self):
-        return {
-            "auto_nms_min": float(self.param_vars["auto_nms_min"].get()),
-            "auto_nms_max": float(self.param_vars["auto_nms_max"].get()),
-            "auto_nms_step": float(self.param_vars["auto_nms_step"].get()),
-            "auto_high_min": float(self.param_vars["auto_high_min"].get()),
-            "auto_high_max": float(self.param_vars["auto_high_max"].get()),
-            "auto_high_step": float(self.param_vars["auto_high_step"].get()),
-            "auto_low_factor": float(self.param_vars["auto_low_factor"].get()),
-            "auto_band_min": int(self.param_vars["auto_band_min"].get()),
-            "auto_band_max": int(self.param_vars["auto_band_max"].get()),
-            "auto_margin_min": float(self.param_vars["auto_margin_min"].get()),
-            "auto_margin_max": float(self.param_vars["auto_margin_max"].get()),
-            "auto_margin_step": float(self.param_vars["auto_margin_step"].get()),
-            "weight_coverage": float(self.param_vars["weight_coverage"].get()),
-            "weight_intrusion": float(self.param_vars["weight_intrusion"].get()),
-            "weight_outside": float(self.param_vars["weight_outside"].get()),
-            "weight_gap": float(self.param_vars.get("weight_gap", tk.DoubleVar(value=1.0)).get()),
-            "weight_thickness": float(self.param_vars.get("weight_thickness", tk.DoubleVar(value=0.5)).get()),
-            "weight_low_quality": float(self.param_vars.get("weight_low_quality", tk.DoubleVar(value=0.5)).get()),
-        }
+        return self._collect_values(AUTO_KEYS)
 
-    def _save_eval_config(self):
-        config = {
-            "params": {key: var.get() for key, var in self.param_vars.items()},
-        }
+    def _save_param_config(self):
+        config = {"params": self._collect_values(PARAM_KEYS)}
         path = filedialog.asksaveasfilename(
-            title="평가 함수 저장",
+            title="Save Parameters",
             defaultextension=".json",
             filetypes=[("JSON", "*.json")],
         )
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(config, handle, ensure_ascii=True, indent=2)
-        self._log(f"[CONFIG] 저장됨: {path}")
+        save_json_config(path, config)
+        self._log(f"[PARAMS] Saved: {path}")
 
-    def _load_eval_config(self):
+    def _load_param_config(self):
         path = filedialog.askopenfilename(
-            title="평가 함수 불러오기",
+            title="Load Parameters",
             filetypes=[("JSON", "*.json")],
         )
         if not path:
             return
-        with open(path, "r", encoding="utf-8") as handle:
-            config = json.load(handle)
+        config = load_json_config(path)
         params = config.get("params", {})
-        for key, value in params.items():
-            if key in self.param_vars:
-                self.param_vars[key].set(value)
-        self._log(f"[CONFIG] 불러옴: {path}")
+        self._apply_values(params, PARAM_DEFAULTS)
+        self._log(f"[PARAMS] Loaded: {path}")
+
+    def _save_auto_config(self):
+        config = {"auto": self._collect_values(AUTO_KEYS)}
+        path = filedialog.asksaveasfilename(
+            title="Save Auto Config",
+            defaultextension=".json",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        save_json_config(path, config)
+        self._log(f"[AUTO] Config saved: {path}")
+
+    def _load_auto_config(self):
+        path = filedialog.askopenfilename(
+            title="Load Auto Config",
+            filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        config = load_json_config(path)
+        auto_values = config.get("auto", {})
+        if "auto_low_factor" in auto_values and "auto_low_factor_min" not in auto_values:
+            base = float(auto_values.get("auto_low_factor", AUTO_DEFAULTS["auto_low_factor_min"]))
+            auto_values["auto_low_factor_min"] = max(0.1, base - 0.1)
+            auto_values["auto_low_factor_max"] = min(0.9, base + 0.1)
+            auto_values["auto_low_factor_step"] = 0.05
+        self._apply_values(auto_values, AUTO_DEFAULTS)
+        self._log(f"[AUTO] Config loaded: {path}")
 
     def _apply_settings(self, settings):
         for key, var in self.param_vars.items():
@@ -1422,147 +2686,523 @@ class EdgeBatchGUI:
                 boundary |= neighbor != center
         return boundary
 
-    def _evaluate_settings(self, files, settings, max_files, auto_config, roi_map):
-        subset = files[:max_files]
+    def _count_components(self, mask):
+        if mask is None or not mask.any():
+            return 0
+        visited = np.zeros(mask.shape, dtype=bool)
+        coords = np.argwhere(mask)
+        components = 0
+        for y, x in coords:
+            if visited[y, x]:
+                continue
+            components += 1
+            stack = [(y, x)]
+            visited[y, x] = True
+            while stack:
+                cy, cx = stack.pop()
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dy == 0 and dx == 0:
+                            continue
+                        ny = cy + dy
+                        nx = cx + dx
+                        if ny < 0 or nx < 0 or ny >= mask.shape[0] or nx >= mask.shape[1]:
+                            continue
+                        if mask[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+        return components
+
+    def _evaluate_settings(self, data, settings, auto_config):
         total_score = 0.0
         total_coverage = 0.0
         total_intrusion = 0.0
         total_outside = 0.0
         total_gap = 0.0
         total_thickness = 0.0
-        total_edges = 0
+        total_continuity = 0.0
+        total_band_ratio = 0.0
+        total_endpoints = 0.0
+        total_wrinkle = 0.0
+        total_branch = 0.0
+        total_weight = 0.0
+        total_q_cont = 0.0
+        total_q_band = 0.0
+        total_q_thick = 0.0
+        total_q_intr = 0.0
+        total_q_end = 0.0
+        total_q_wrinkle = 0.0
+        total_q_branch = 0.0
 
-        for path in subset:
-            image = self.detector.load_image(path)
-            roi = roi_map.get(path)
-            if roi:
-                x1, y1, x2, y2 = roi
-                image = image[y1:y2, x1:x2]
-            mask_source = image
-            if settings["use_mask_blur"]:
-                mask_source = self.detector.apply_gaussian_blur(
-                    image, settings["mask_blur_kernel_size"], settings["mask_blur_sigma"]
-                )
-            mask = self.detector.estimate_object_mask(mask_source, settings["object_is_dark"])
-            if settings["mask_close_radius"] > 0:
-                mask = self.detector.erode_binary(
-                    self.detector.dilate_binary(mask, settings["mask_close_radius"]),
-                    settings["mask_close_radius"],
-                )
+        settings_eval = dict(settings)
+        settings_eval["use_boundary_band_filter"] = False
 
-            boundary = self._compute_boundary(mask)
-            band = self.detector.dilate_binary(boundary, settings["boundary_band_radius"])
+        def evaluate_item(item):
+            image = item["image"]
+            mask = item["mask"]
+            band_radius = settings["boundary_band_radius"]
+            band = item["bands"].get(band_radius)
+            if band is None:
+                if band_radius <= 0:
+                    band = item["boundary"]
+                else:
+                    band = self.detector.dilate_binary(item["boundary"], band_radius)
 
             results = self.detector.detect_edges_array(
                 image,
                 use_nms=True,
                 use_hysteresis=True,
-                **settings,
+                **settings_eval,
             )
-            edges = results["edges"] > 0
-            edge_pixels = int(edges.sum())
+            edges_raw = results["edges"] > 0
+            edge_pixels = int(edges_raw.sum())
+            band_pixels = item["band_pixels"].get(band_radius, int(band.sum()))
+            edges_in_band = int((edges_raw & band).sum()) if band_pixels else 0
+            intrusion = int((edges_raw & mask & ~band).sum())
+            outside = int((edges_raw & ~mask & ~band).sum())
+
             if edge_pixels == 0:
-                continue
+                coverage = 0.0
+                intrusion_ratio = 1.0
+                outside_ratio = 1.0
+                gap_ratio = 1.0
+                continuity_penalty = 1.0
+                thickness_penalty = 1.0
+                band_ratio = 0.0
+                endpoint_ratio = 1.0
+                wrinkle_ratio = 1.0
+                branch_ratio = 1.0
+            else:
+                coverage = edges_in_band / band_pixels if band_pixels else 0.0
+                intrusion_ratio = intrusion / edge_pixels
+                outside_ratio = outside / edge_pixels
+                gap_ratio = max(0.0, 1.0 - coverage)
+                band_ratio = edges_in_band / edge_pixels if edge_pixels else 0.0
+                neighbor_counts = self.detector._neighbor_count(edges_raw)
+                endpoint_count = int((edges_raw & (neighbor_counts <= 1)).sum())
+                branch_count = int((edges_raw & (neighbor_counts >= 3)).sum())
+                endpoint_ratio = endpoint_count / edge_pixels
+                branch_ratio = branch_count / edge_pixels
+                smooth_mask = self.detector.erode_binary(self.detector.dilate_binary(edges_raw, 1), 1)
+                wrinkle_ratio = int((edges_raw ^ smooth_mask).sum()) / edge_pixels
+                components = self._count_components(edges_raw & band)
+                components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
+                continuity_penalty = min(1.0, components_penalty * 5.0)
+                edge_density = edge_pixels / max(band_pixels, 1)
+                thickness_penalty = max(0.0, edge_density - 1.2)
 
-            band_pixels = int(band.sum())
-            edges_in_band = int((edges & band).sum())
-            intrusion = int((edges & mask & ~band).sum())
-            outside = int((edges & ~mask & ~band).sum())
-
-            coverage = edges_in_band / band_pixels if band_pixels else 0.0
-            intrusion_ratio = intrusion / edge_pixels
-            outside_ratio = outside / edge_pixels
-            gap_ratio = max(0.0, 1.0 - coverage)
-            edge_density = edge_pixels / max(band_pixels, 1)
-            thickness_penalty = max(0.0, edge_density - 1.2)
-            w_cov = auto_config["weight_coverage"]
-            w_gap = auto_config["weight_gap"]
-            w_intr = auto_config["weight_intrusion"]
-            w_out = auto_config["weight_outside"]
-            w_thick = auto_config["weight_thickness"]
-            score = (
-                w_cov * coverage
-                - w_gap * gap_ratio
-                - w_intr * intrusion_ratio
-                - w_out * outside_ratio
-                - w_thick * thickness_penalty
-            )
-
+            metrics = {
+                "coverage": coverage,
+                "gap": gap_ratio,
+                "continuity": continuity_penalty,
+                "intrusion": intrusion_ratio,
+                "outside": outside_ratio,
+                "thickness": thickness_penalty,
+                "band_ratio": band_ratio,
+                "endpoints": endpoint_ratio,
+                "wrinkle": wrinkle_ratio,
+                "branch": branch_ratio,
+            }
+            score, details = compute_auto_score(metrics, auto_config, return_details=True)
             p10, p90 = np.percentile(image, [10, 90])
             contrast = max(float(p90 - p10), 1.0)
             if contrast < settings["contrast_ref"] * 0.6:
                 score *= (1.0 + auto_config["weight_low_quality"])
 
-            total_score += score
-            total_coverage += coverage
-            total_intrusion += intrusion_ratio
-            total_outside += outside_ratio
-            total_gap += gap_ratio
-            total_thickness += thickness_penalty
-            total_edges += 1
+            weight = float(item.get("weight", 1.0))
+            return (
+                weight,
+                score,
+                coverage,
+                intrusion_ratio,
+                outside_ratio,
+                gap_ratio,
+                thickness_penalty,
+                continuity_penalty,
+                band_ratio,
+                endpoint_ratio,
+                wrinkle_ratio,
+                branch_ratio,
+                details,
+            )
 
-        if total_edges == 0:
-            return -1.0, {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0}
+        use_parallel = bool(auto_config.get("auto_parallel", False))
+        max_workers = max(1, int(auto_config.get("auto_workers", 1)))
+        results = []
+        if use_parallel and len(data) > 1 and max_workers > 1:
+            workers = min(max_workers, len(data))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                results = list(executor.map(evaluate_item, data))
+        else:
+            results = [evaluate_item(item) for item in data]
 
-        avg_score = total_score / total_edges
+        for (
+            weight,
+            score,
+            coverage,
+            intrusion_ratio,
+            outside_ratio,
+            gap_ratio,
+            thickness_penalty,
+            continuity_penalty,
+            band_ratio,
+            endpoint_ratio,
+            wrinkle_ratio,
+            branch_ratio,
+            details,
+        ) in results:
+            total_weight += weight
+            total_score += score * weight
+            total_coverage += coverage * weight
+            total_intrusion += intrusion_ratio * weight
+            total_outside += outside_ratio * weight
+            total_gap += gap_ratio * weight
+            total_thickness += thickness_penalty * weight
+            total_continuity += continuity_penalty * weight
+            total_band_ratio += band_ratio * weight
+            total_endpoints += endpoint_ratio * weight
+            total_wrinkle += wrinkle_ratio * weight
+            total_branch += branch_ratio * weight
+            total_q_cont += details["q_cont"] * weight
+            total_q_band += details["q_band"] * weight
+            total_q_thick += details["q_thick"] * weight
+            total_q_intr += details["q_intr"] * weight
+            total_q_end += details["q_end"] * weight
+            total_q_wrinkle += details["q_wrinkle"] * weight
+            total_q_branch += details["q_branch"] * weight
+
+        if total_weight <= 0:
+            return (
+                0.0,
+                {
+                    "coverage": 0.0,
+                    "intrusion": 1.0,
+                    "outside": 1.0,
+                    "gap": 1.0,
+                    "thickness": 1.0,
+                    "continuity": 1.0,
+                    "band_ratio": 0.0,
+                    "endpoints": 1.0,
+                    "wrinkle": 1.0,
+                    "branch": 1.0,
+                },
+                {
+                    "q_cont": 0.0,
+                    "q_band": 0.0,
+                    "q_thick": 0.0,
+                    "q_intr": 0.0,
+                    "q_end": 0.0,
+                    "q_wrinkle": 0.0,
+                    "q_branch": 0.0,
+                },
+            )
+
+        avg_score = max(0.0, total_score / total_weight)
         summary = {
-            "coverage": total_coverage / total_edges,
-            "intrusion": total_intrusion / total_edges,
-            "outside": total_outside / total_edges,
-            "gap": total_gap / total_edges,
-            "thickness": total_thickness / total_edges,
+            "coverage": total_coverage / total_weight,
+            "intrusion": total_intrusion / total_weight,
+            "outside": total_outside / total_weight,
+            "gap": total_gap / total_weight,
+            "thickness": total_thickness / total_weight,
+            "continuity": total_continuity / total_weight,
+            "band_ratio": total_band_ratio / total_weight,
+            "endpoints": total_endpoints / total_weight,
+            "wrinkle": total_wrinkle / total_weight,
+            "branch": total_branch / total_weight,
         }
-        return avg_score, summary
+        qualities = {
+            "q_cont": total_q_cont / total_weight,
+            "q_band": total_q_band / total_weight,
+            "q_thick": total_q_thick / total_weight,
+            "q_intr": total_q_intr / total_weight,
+            "q_end": total_q_end / total_weight,
+            "q_wrinkle": total_q_wrinkle / total_weight,
+            "q_branch": total_q_branch / total_weight,
+        }
+        return avg_score, summary, qualities
 
-    def _build_candidates(self, base_settings, mode):
-        auto_config = self._get_auto_config()
+    def _sample_candidates(self, items, budget):
+        if budget <= 0 or len(items) <= budget:
+            return items
+        stride = max(1, len(items) // budget)
+        sampled = items[::stride]
+        return sampled[:budget]
 
-        def frange(start, stop, step):
-            values = []
-            if step <= 0:
-                return values
-            v = start
-            while v <= stop + 1e-6:
-                values.append(round(v, 4))
-                v += step
-            return values
+    def _sample_float(self, rng, min_val, max_val, step, center=None, scale=1.0):
+        min_val = float(min_val)
+        max_val = float(max_val)
+        step = float(step) if step else 0.0
+        if center is None:
+            value = rng.uniform(min_val, max_val)
+        else:
+            sigma = max(step * scale, (max_val - min_val) * 0.05 * scale)
+            value = rng.normal(center, sigma)
+        value = min(max_val, max(min_val, value))
+        if step > 0:
+            value = round(round((value - min_val) / step) * step + min_val, 4)
+        return float(value)
 
-        nms_list = frange(auto_config["auto_nms_min"], auto_config["auto_nms_max"], auto_config["auto_nms_step"])
-        high_list = frange(auto_config["auto_high_min"], auto_config["auto_high_max"], auto_config["auto_high_step"])
-        margin_list = frange(auto_config["auto_margin_min"], auto_config["auto_margin_max"], auto_config["auto_margin_step"])
-        band_min = auto_config["auto_band_min"]
-        band_max = auto_config["auto_band_max"]
+    def _sample_int(self, rng, min_val, max_val, step, center=None, scale=1.0, odd=False):
+        min_val = int(min_val)
+        max_val = int(max_val)
+        step = max(1, int(step))
+        if center is None:
+            value = rng.randint(min_val, max_val + 1)
+        else:
+            sigma = max(step * scale, max(1, int((max_val - min_val) * 0.05 * scale)))
+            value = int(round(rng.normal(center, sigma)))
+        value = max(min_val, min(max_val, value))
+        if odd and value % 2 == 0:
+            value = value + 1 if value + 1 <= max_val else value - 1
+        if step > 1:
+            value = min_val + (int(round((value - min_val) / step)) * step)
+            value = max(min_val, min(max_val, value))
+            if odd and value % 2 == 0:
+                value = value + 1 if value + 1 <= max_val else value - 1
+        return int(value)
 
-        if mode == "빠름":
-            nms_list = nms_list[::2] if len(nms_list) > 2 else nms_list
-            high_list = high_list[::2] if len(high_list) > 2 else high_list
-            margin_list = margin_list[::2] if len(margin_list) > 2 else margin_list
-
+    def _build_candidates(self, base_settings, mode, auto_config, count, rng, step_scale=1.0, centers=None):
         candidates = []
-        for nms_relax in nms_list:
-            if nms_relax < 0.85 or nms_relax > 1.0:
+        seen = set()
+        centers = centers or []
+
+        nms_min = min(auto_config["auto_nms_min"], auto_config["auto_nms_max"])
+        nms_max = max(auto_config["auto_nms_min"], auto_config["auto_nms_max"])
+        high_min = min(auto_config["auto_high_min"], auto_config["auto_high_max"])
+        high_max = max(auto_config["auto_high_min"], auto_config["auto_high_max"])
+        low_min = min(auto_config["auto_low_factor_min"], auto_config["auto_low_factor_max"])
+        low_max = max(auto_config["auto_low_factor_min"], auto_config["auto_low_factor_max"])
+        margin_min = min(auto_config["auto_margin_min"], auto_config["auto_margin_max"])
+        margin_max = max(auto_config["auto_margin_min"], auto_config["auto_margin_max"])
+        band_min = min(auto_config["auto_band_min"], auto_config["auto_band_max"])
+        band_max = max(auto_config["auto_band_min"], auto_config["auto_band_max"])
+        blur_sigma_min = min(auto_config["auto_blur_sigma_min"], auto_config["auto_blur_sigma_max"])
+        blur_sigma_max = max(auto_config["auto_blur_sigma_min"], auto_config["auto_blur_sigma_max"])
+        blur_kernel_min = min(auto_config["auto_blur_kernel_min"], auto_config["auto_blur_kernel_max"])
+        blur_kernel_max = max(auto_config["auto_blur_kernel_min"], auto_config["auto_blur_kernel_max"])
+        thinning_min = min(auto_config["auto_thinning_min"], auto_config["auto_thinning_max"])
+        thinning_max = max(auto_config["auto_thinning_min"], auto_config["auto_thinning_max"])
+        contrast_min = min(auto_config["auto_contrast_ref_min"], auto_config["auto_contrast_ref_max"])
+        contrast_max = max(auto_config["auto_contrast_ref_min"], auto_config["auto_contrast_ref_max"])
+        min_scale_min = min(auto_config["auto_min_scale_min"], auto_config["auto_min_scale_max"])
+        min_scale_max = max(auto_config["auto_min_scale_min"], auto_config["auto_min_scale_max"])
+        soft_high_min = min(auto_config["auto_soft_high_min"], auto_config["auto_soft_high_max"])
+        soft_high_max = max(auto_config["auto_soft_high_min"], auto_config["auto_soft_high_max"])
+        soft_low_min = min(auto_config["auto_soft_low_factor_min"], auto_config["auto_soft_low_factor_max"])
+        soft_low_max = max(auto_config["auto_soft_low_factor_min"], auto_config["auto_soft_low_factor_max"])
+        link_radius_min = min(auto_config["auto_link_radius_min"], auto_config["auto_link_radius_max"])
+        link_radius_max = max(auto_config["auto_link_radius_min"], auto_config["auto_link_radius_max"])
+        smooth_radius_min = min(auto_config["auto_edge_smooth_radius_min"], auto_config["auto_edge_smooth_radius_max"])
+        smooth_radius_max = max(auto_config["auto_edge_smooth_radius_min"], auto_config["auto_edge_smooth_radius_max"])
+        smooth_iters_min = min(auto_config["auto_edge_smooth_iters_min"], auto_config["auto_edge_smooth_iters_max"])
+        smooth_iters_max = max(auto_config["auto_edge_smooth_iters_min"], auto_config["auto_edge_smooth_iters_max"])
+        spur_min = min(auto_config["auto_spur_prune_min"], auto_config["auto_spur_prune_max"])
+        spur_max = max(auto_config["auto_spur_prune_min"], auto_config["auto_spur_prune_max"])
+        closing_radius_min = min(auto_config["auto_closing_radius_min"], auto_config["auto_closing_radius_max"])
+        closing_radius_max = max(auto_config["auto_closing_radius_min"], auto_config["auto_closing_radius_max"])
+        closing_iter_min = min(auto_config["auto_closing_iter_min"], auto_config["auto_closing_iter_max"])
+        closing_iter_max = max(auto_config["auto_closing_iter_min"], auto_config["auto_closing_iter_max"])
+        gamma_min = min(auto_config["auto_magnitude_gamma_min"], auto_config["auto_magnitude_gamma_max"])
+        gamma_max = max(auto_config["auto_magnitude_gamma_min"], auto_config["auto_magnitude_gamma_max"])
+        median_min = min(auto_config["auto_median_kernel_min"], auto_config["auto_median_kernel_max"])
+        median_max = max(auto_config["auto_median_kernel_min"], auto_config["auto_median_kernel_max"])
+
+        def candidate_key(settings):
+            return (
+                round(settings["nms_relax"], 3),
+                round(settings["high_ratio"], 3),
+                round(settings["low_ratio"], 3),
+                int(settings["boundary_band_radius"]),
+                round(settings["polarity_drop_margin"], 3),
+                round(settings["blur_sigma"], 2),
+                int(settings["blur_kernel_size"]),
+                int(settings["thinning_max_iter"]),
+                round(settings["contrast_ref"], 1),
+                round(settings["min_threshold_scale"], 2),
+                round(settings["magnitude_gamma"], 2),
+                int(settings["median_kernel_size"]),
+                int(settings["link_radius"]),
+                round(settings["soft_high_ratio"], 2),
+                round(settings["soft_low_ratio"], 2),
+                int(settings["edge_smooth_radius"]),
+                int(settings["edge_smooth_iters"]),
+                int(settings["spur_prune_iters"]),
+                int(settings["closing_radius"]),
+                int(settings["closing_iterations"]),
+            )
+
+        max_tries = max(count * 8, 200)
+        tries = 0
+        while len(candidates) < count and tries < max_tries:
+            tries += 1
+            center = centers[rng.randint(0, len(centers))] if centers else None
+            nms_center = center["nms_relax"] if center else None
+            high_center = center["high_ratio"] if center else None
+            low_center = None
+            if center:
+                low_center = center["low_ratio"] / max(center["high_ratio"], 1e-6)
+            margin_center = center["polarity_drop_margin"] if center else None
+            band_center = center["boundary_band_radius"] if center else None
+            blur_sigma_center = center["blur_sigma"] if center else None
+            blur_kernel_center = center["blur_kernel_size"] if center else None
+            thinning_center = center["thinning_max_iter"] if center else None
+            contrast_center = center["contrast_ref"] if center else None
+            min_scale_center = center["min_threshold_scale"] if center else None
+
+            nms_relax = self._sample_float(rng, nms_min, nms_max, auto_config["auto_nms_step"], nms_center, step_scale)
+            high_ratio = self._sample_float(rng, high_min, high_max, auto_config["auto_high_step"], high_center, step_scale)
+            low_factor = self._sample_float(
+                rng,
+                low_min,
+                low_max,
+                auto_config["auto_low_factor_step"],
+                low_center,
+                step_scale,
+            )
+            band_radius = self._sample_int(
+                rng, band_min, band_max, 1, band_center, step_scale, odd=False
+            )
+            margin = self._sample_float(
+                rng, margin_min, margin_max, auto_config["auto_margin_step"], margin_center, step_scale
+            )
+            blur_sigma = self._sample_float(
+                rng,
+                blur_sigma_min,
+                blur_sigma_max,
+                auto_config["auto_blur_sigma_step"],
+                blur_sigma_center,
+                step_scale,
+            )
+            blur_kernel = self._sample_int(
+                rng,
+                blur_kernel_min,
+                blur_kernel_max,
+                auto_config["auto_blur_kernel_step"],
+                blur_kernel_center,
+                step_scale,
+                odd=True,
+            )
+            thinning_iter = self._sample_int(
+                rng,
+                thinning_min,
+                thinning_max,
+                auto_config["auto_thinning_step"],
+                thinning_center,
+                step_scale,
+            )
+            contrast_ref = self._sample_float(
+                rng,
+                contrast_min,
+                contrast_max,
+                auto_config["auto_contrast_ref_step"],
+                contrast_center,
+                step_scale,
+            )
+            min_scale = self._sample_float(
+                rng,
+                min_scale_min,
+                min_scale_max,
+                auto_config["auto_min_scale_step"],
+                min_scale_center,
+                step_scale,
+            )
+            magnitude_gamma = self._sample_float(
+                rng,
+                gamma_min,
+                gamma_max,
+                auto_config["auto_magnitude_gamma_step"],
+                None,
+                step_scale,
+            )
+            median_kernel = self._sample_int(
+                rng,
+                median_min,
+                median_max,
+                auto_config["auto_median_kernel_step"],
+                None,
+                step_scale,
+                odd=True,
+            )
+            use_soft_linking = rng.rand() < float(auto_config["auto_soft_link_prob"])
+            soft_high = self._sample_float(
+                rng,
+                soft_high_min,
+                soft_high_max,
+                auto_config["auto_soft_high_step"],
+                None,
+                step_scale,
+            )
+            soft_factor = self._sample_float(
+                rng,
+                soft_low_min,
+                soft_low_max,
+                auto_config["auto_soft_low_factor_step"],
+                None,
+                step_scale,
+            )
+            soft_low = max(0.01, soft_high * soft_factor)
+            link_radius = self._sample_int(
+                rng,
+                link_radius_min,
+                link_radius_max,
+                auto_config["auto_link_radius_step"],
+                None,
+                step_scale,
+            )
+            use_edge_smooth = rng.rand() < float(auto_config["auto_use_edge_smooth_prob"])
+            edge_smooth_radius = self._sample_int(rng, smooth_radius_min, smooth_radius_max, 1, None, step_scale)
+            edge_smooth_iters = self._sample_int(rng, smooth_iters_min, smooth_iters_max, 1, None, step_scale)
+            spur_prune_iters = self._sample_int(rng, spur_min, spur_max, 1, None, step_scale)
+            use_closing = rng.rand() < float(auto_config["auto_use_closing_prob"])
+            closing_radius = self._sample_int(
+                rng, closing_radius_min, closing_radius_max, 1, None, step_scale
+            )
+            closing_iters = self._sample_int(
+                rng, closing_iter_min, closing_iter_max, 1, None, step_scale
+            )
+
+            low_ratio = max(0.02, high_ratio * low_factor)
+
+            settings = dict(base_settings)
+            settings.update(
+                {
+                    "nms_relax": round(nms_relax, 3),
+                    "high_ratio": float(high_ratio),
+                    "low_ratio": float(low_ratio),
+                    "boundary_band_radius": int(band_radius),
+                    "polarity_drop_margin": float(margin),
+                    "use_boundary_band_filter": int(band_radius) > 0,
+                    "blur_sigma": float(blur_sigma),
+                    "blur_kernel_size": int(max(3, blur_kernel)),
+                    "thinning_max_iter": int(max(1, thinning_iter)),
+                    "contrast_ref": float(contrast_ref),
+                    "min_threshold_scale": float(min_scale),
+                    "magnitude_gamma": float(magnitude_gamma),
+                    "median_kernel_size": int(max(3, median_kernel)),
+                    "use_soft_linking": bool(use_soft_linking),
+                    "soft_high_ratio": float(soft_high),
+                    "soft_low_ratio": float(soft_low),
+                    "link_radius": int(max(0, link_radius)),
+                    "use_edge_smooth": bool(use_edge_smooth),
+                    "edge_smooth_radius": int(edge_smooth_radius if use_edge_smooth else 0),
+                    "edge_smooth_iters": int(edge_smooth_iters),
+                    "spur_prune_iters": int(spur_prune_iters),
+                    "use_closing": bool(use_closing),
+                    "closing_radius": int(closing_radius if use_closing else 0),
+                    "closing_iterations": int(closing_iters),
+                }
+            )
+            key = candidate_key(settings)
+            if key in seen:
                 continue
-            for high_ratio in high_list:
-                low_ratio = max(0.02, high_ratio * auto_config["auto_low_factor"])
-                for band_radius in range(band_min, band_max + 1):
-                    for margin in margin_list:
-                        settings = dict(base_settings)
-                        settings.update(
-                            {
-                                "nms_relax": round(nms_relax, 3),
-                                "high_ratio": float(high_ratio),
-                                "low_ratio": float(low_ratio),
-                                "boundary_band_radius": int(band_radius),
-                                "polarity_drop_margin": float(margin),
-                                "use_boundary_band_filter": band_radius > 0,
-                            }
-                        )
-                        candidates.append(settings)
+            seen.add(key)
+            candidates.append(settings)
+
         return candidates
 
     def _start_auto_optimize(self):
         if self._worker_thread and self._worker_thread.is_alive():
-            messagebox.showwarning("진행 중", "현재 처리 중입니다.")
+            messagebox.showwarning("In Progress", "Processing is already running.")
             return
         if not self.selected_files:
             self._add_files()
@@ -1572,47 +3212,172 @@ class EdgeBatchGUI:
         try:
             base_settings = self._get_param_settings()
         except ValueError as exc:
-            messagebox.showerror("파라미터 오류", str(exc))
+            messagebox.showerror("Parameter Error", str(exc))
             return
         auto_config = self._get_auto_config()
 
         mode = self.auto_mode.get()
-        self.status_var.set("자동 최적화 시작...")
+        self.status_var.set("Auto optimization started...")
         self.start_button.config(state=tk.DISABLED)
         self.auto_button.config(state=tk.DISABLED)
+        if self.pause_button:
+            self.pause_button.config(state=tk.NORMAL, text="Pause")
+        if self.stop_button:
+            self.stop_button.config(state=tk.NORMAL)
+        self._auto_pause_event.clear()
+        self._auto_stop_event.clear()
+        self._auto_start_time = time.time()
+        self._auto_last_best_time = self._auto_start_time
+        self._auto_scores = []
+        self._auto_best_scores = []
+        self._auto_best_time_series = []
+        self._auto_cont_scores = []
+        self._auto_band_scores = []
+        self._auto_penalty_scores = []
+        self._auto_wrinkle_scores = []
+        self._auto_endpoint_scores = []
+        self._auto_branch_scores = []
+        self._refresh_auto_graphs()
+        display_mode = self.score_display_mode.get()
         self._worker_thread = threading.Thread(
             target=self._auto_optimize_worker,
-            args=(list(self.selected_files), base_settings, auto_config, mode, dict(self.roi_map)),
+            args=(list(self.selected_files), base_settings, auto_config, mode, dict(self.roi_map), display_mode),
             daemon=True,
         )
         self._worker_thread.start()
         self.root.after(100, self._poll_messages)
 
-    def _auto_optimize_worker(self, files, base_settings, auto_config, mode, roi_map):
-        candidates = self._build_candidates(base_settings, mode)
-        max_files = 8 if mode == "빠름" else 15
+    def _auto_optimize_worker(self, files, base_settings, auto_config, mode, roi_map, display_mode):
+        max_files = min(8, len(files)) if mode == "Fast" else len(files)
+        data = self._prepare_auto_data(files, base_settings, auto_config, roi_map, max_files)
+        data_coarse = data.get("coarse", [])
+        data_mid = data.get("mid", [])
+        data_full = data.get("full", [])
+        if not data_coarse:
+            data_coarse = data_full
+        if not data_mid:
+            data_mid = data_full
         best = None
-        best_score = -1e9
-        report_lines = []
+        best_score = 0.0
+        report_lines = [f"[INFO] score_display={display_mode}"]
         scores = []
         best_progress = []
+        evaluated = []
+        seen_keys = set()
+        stop_reason = None
+        start_time = time.time()
+        last_best_time = start_time
+        early_stop_enabled = bool(auto_config.get("early_stop_enabled", True))
+        early_stop_minutes = float(auto_config.get("early_stop_minutes", 10.0))
+        processed = 0
+
+        if not data_full:
+            report_dir = self._create_batch_output_dir()
+            report_path = os.path.join(report_dir, "auto_optimize_report.txt")
+            with open(report_path, "w", encoding="utf-8") as handle:
+                handle.write("No data available for auto optimization.\n")
+            self._message_queue.put(("auto_done", None, report_path, "no_data"))
+            return
+        rng = np.random.RandomState(42)
+        target_eval = 3000 if mode == "Fast" else 9000
+        budget = int(target_eval / max(1, len(data_coarse)))
+        budget = max(80, min(budget, 600))
+        candidates = self._build_candidates(base_settings, mode, auto_config, budget, rng, step_scale=1.0)
+        report_lines.append(f"[INFO] Coarse candidates: {len(candidates)}")
+
+        def wait_if_paused():
+            while self._auto_pause_event.is_set() and not self._auto_stop_event.is_set():
+                time.sleep(0.2)
+            return not self._auto_stop_event.is_set()
+
+        def key_from(settings):
+            return (
+                round(settings["nms_relax"], 3),
+                round(settings["high_ratio"], 3),
+                round(settings["low_ratio"], 3),
+                int(settings["boundary_band_radius"]),
+                round(settings["polarity_drop_margin"], 3),
+                round(settings["blur_sigma"], 2),
+                int(settings["blur_kernel_size"]),
+                int(settings["thinning_max_iter"]),
+                round(settings["contrast_ref"], 1),
+                round(settings["min_threshold_scale"], 2),
+                round(settings.get("magnitude_gamma", 1.0), 2),
+                int(settings.get("median_kernel_size", 3)),
+                int(settings.get("link_radius", 0)),
+                round(settings.get("soft_high_ratio", 0.0), 2),
+                round(settings.get("soft_low_ratio", 0.0), 2),
+                int(settings.get("edge_smooth_radius", 0)),
+                int(settings.get("edge_smooth_iters", 0)),
+                int(settings.get("spur_prune_iters", 0)),
+                int(settings.get("closing_radius", 0)),
+                int(settings.get("closing_iterations", 0)),
+            )
+
+        def check_stagnation():
+            if not early_stop_enabled:
+                return False
+            stagnant = (time.time() - last_best_time) > (early_stop_minutes * 60.0)
+            if stagnant:
+                return True
+            return False
 
         for idx, settings in enumerate(candidates, start=1):
-            score, summary = self._evaluate_settings(files, settings, max_files, auto_config, roi_map)
+            if not wait_if_paused():
+                stop_reason = "stopped"
+                break
+            if check_stagnation():
+                stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
+                break
+            key = key_from(settings)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            score, summary, qualities = self._evaluate_settings(data_coarse, settings, auto_config)
+            processed += 1
+            elapsed = time.time() - start_time
+            avg_time = elapsed / max(1, processed)
+            eta_seconds = avg_time * max(0, len(candidates) - processed)
+            score_base = qualities["q_cont"] * qualities["q_band"]
+            penalty = max(0.0, 1.0 - score)
+            evaluated.append((score, settings, summary))
+            score_disp = self._score_to_display(score, display_mode)
             report_lines.append(
-                f"{idx:03d} score={score:.4f} coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                f"intrusion={summary['intrusion']:.4f} outside={summary['outside']:.4f} thickness={summary['thickness']:.4f} "
-                f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
-                f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
+                f"{idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
+                f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
+                f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
+                f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
+                f"thick={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} "
+                f"high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} "
+                f"margin={settings['polarity_drop_margin']:.2f}"
             )
             scores.append(score)
-            if score > best_score:
+            if best is None or score > best_score:
                 best_score = score
                 best = settings
+                last_best_time = time.time()
+                self._message_queue.put(("auto_best", best_score, elapsed))
             best_progress.append(best_score)
-            self._message_queue.put(("auto_progress", idx, len(candidates), best_score))
+            self._auto_best_time_series.append((elapsed, best_score))
+            self._message_queue.put(
+                (
+                    "auto_progress",
+                    idx,
+                    len(candidates),
+                    score,
+                    best_score,
+                    eta_seconds,
+                    "coarse",
+                    elapsed,
+                    summary,
+                    qualities,
+                    score_base,
+                    penalty,
+                )
+            )
 
-        if best and mode != "빠름":
+        if best and mode != "Fast" and not stop_reason:
             refine_step = max(auto_config["auto_nms_step"] * 0.5, 0.005)
             high_step = max(auto_config["auto_high_step"] * 0.5, 0.005)
             margin_step = max(auto_config["auto_margin_step"] * 0.5, 0.05)
@@ -1624,36 +3389,169 @@ class EdgeBatchGUI:
                             settings = dict(best)
                             settings["nms_relax"] = round(min(1.0, max(0.85, best["nms_relax"] + dnms)), 3)
                             settings["high_ratio"] = max(0.05, best["high_ratio"] + dhigh)
-                            settings["low_ratio"] = max(0.02, settings["high_ratio"] * auto_config["auto_low_factor"])
+                            low_factor = 0.5 * (
+                                auto_config["auto_low_factor_min"] + auto_config["auto_low_factor_max"]
+                            )
+                            settings["low_ratio"] = max(0.02, settings["high_ratio"] * low_factor)
                             settings["boundary_band_radius"] = max(0, best["boundary_band_radius"] + dband)
                             settings["polarity_drop_margin"] = max(0.0, best["polarity_drop_margin"] + dmargin)
                             settings["use_boundary_band_filter"] = settings["boundary_band_radius"] > 0
                             refine_candidates.append(settings)
 
             for idx, settings in enumerate(refine_candidates, start=1):
-                score, summary = self._evaluate_settings(files, settings, max_files, auto_config, roi_map)
+                if not wait_if_paused():
+                    stop_reason = "stopped"
+                    break
+                if check_stagnation():
+                    stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
+                    break
+                key = key_from(settings)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                score, summary, qualities = self._evaluate_settings(data_mid, settings, auto_config)
+                processed += 1
+                elapsed = time.time() - start_time
+                avg_time = elapsed / max(1, processed)
+                eta_seconds = avg_time * max(0, len(refine_candidates) - idx)
+                score_base = qualities["q_cont"] * qualities["q_band"]
+                penalty = max(0.0, 1.0 - score)
+                evaluated.append((score, settings, summary))
+                score_disp = self._score_to_display(score, display_mode)
                 report_lines.append(
-                    f"refine {idx:03d} score={score:.4f} coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                    f"intrusion={summary['intrusion']:.4f} outside={summary['outside']:.4f} thickness={summary['thickness']:.4f} "
+                    f"refine {idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
+                    f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
+                    f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                    f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
+                    f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
+                    f"thick={summary['thickness']:.4f} "
                     f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
                     f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
                 )
                 scores.append(score)
-                if score > best_score:
+                if best is None or score > best_score:
                     best_score = score
                     best = settings
+                    last_best_time = time.time()
+                    self._message_queue.put(("auto_best", best_score, elapsed))
                 best_progress.append(best_score)
-                self._message_queue.put(("auto_progress", idx, len(refine_candidates), best_score))
+                self._auto_best_time_series.append((elapsed, best_score))
+                self._message_queue.put(
+                    (
+                        "auto_progress",
+                        idx,
+                        len(refine_candidates),
+                        score,
+                        best_score,
+                        eta_seconds,
+                        "refine",
+                        elapsed,
+                        summary,
+                        qualities,
+                        score_base,
+                        penalty,
+                    )
+                )
+        if not stop_reason:
+            adaptive_scales = [0.6, 0.35, 0.2] if mode != "Fast" else [0.6, 0.35]
+            for round_idx, scale in enumerate(adaptive_scales, start=1):
+                evaluated_sorted = sorted(evaluated, key=lambda item: item[0], reverse=True)
+                top_settings = [item[1] for item in evaluated_sorted[:8]]
+                adaptive_count = max(40, min(220, int(budget * (0.6 / round_idx))))
+                ai_candidates = self._build_candidates(
+                    base_settings,
+                    mode,
+                    auto_config,
+                    adaptive_count,
+                    rng,
+                    step_scale=scale,
+                    centers=top_settings,
+                )
+                if not ai_candidates:
+                    continue
+                report_lines.append(
+                    f"[INFO] Adaptive round {round_idx} scale={scale:.2f} count={len(ai_candidates)}"
+                )
+                for idx, settings in enumerate(ai_candidates, start=1):
+                    if not wait_if_paused():
+                        stop_reason = "stopped"
+                        break
+                    if check_stagnation():
+                        stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
+                        break
+                    key = key_from(settings)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    score, summary, qualities = self._evaluate_settings(data_full, settings, auto_config)
+                    processed += 1
+                    elapsed = time.time() - start_time
+                    avg_time = elapsed / max(1, processed)
+                    eta_seconds = avg_time * max(0, len(ai_candidates) - idx)
+                    score_base = qualities["q_cont"] * qualities["q_band"]
+                    penalty = max(0.0, 1.0 - score)
+                    evaluated.append((score, settings, summary))
+                    score_disp = self._score_to_display(score, display_mode)
+                    report_lines.append(
+                        f"adaptive{round_idx} {idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
+                        f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
+                        f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                        f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
+                        f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
+                        f"thick={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} "
+                        f"low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
+                        f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
+                    )
+                    scores.append(score)
+                    if best is None or score > best_score:
+                        best_score = score
+                        best = settings
+                        last_best_time = time.time()
+                        self._message_queue.put(("auto_best", best_score, elapsed))
+                    best_progress.append(best_score)
+                    self._auto_best_time_series.append((elapsed, best_score))
+                    self._message_queue.put(
+                        (
+                            "auto_progress",
+                            idx,
+                            len(ai_candidates),
+                            score,
+                            best_score,
+                            eta_seconds,
+                            f"adaptive{round_idx}",
+                            elapsed,
+                            summary,
+                            qualities,
+                            score_base,
+                            penalty,
+                        )
+                    )
+                if stop_reason:
+                    break
+
+        if stop_reason:
+            report_lines.append(f"[STOP] Optimization ended: {stop_reason}")
 
         report_dir = self._create_batch_output_dir()
         report_path = os.path.join(report_dir, "auto_optimize_report.txt")
         with open(report_path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(report_lines))
 
+        time_csv = os.path.join(report_dir, "auto_optimize_best_time.csv")
+        with open(time_csv, "w", encoding="utf-8") as handle:
+            handle.write("elapsed_sec,best_score\n")
+            for elapsed, score in self._auto_best_time_series:
+                handle.write(f"{elapsed:.2f},{score:.6f}\n")
+
         graph_path = os.path.join(report_dir, "auto_optimize_scores.png")
         best_path = os.path.join(report_dir, "auto_optimize_best.png")
-        self._draw_score_graph(scores, graph_path, "Score by Candidate")
-        self._draw_score_graph(best_progress, best_path, "Best Score Progress")
+        time_path = os.path.join(report_dir, "auto_optimize_best_time.png")
+        display_scores = [self._score_to_display(v, display_mode) for v in scores]
+        display_best = [self._score_to_display(v, display_mode) for v in best_progress]
+        display_time = [(t, self._score_to_display(v, display_mode)) for t, v in self._auto_best_time_series]
+        self._draw_score_graph(display_scores, graph_path, "Score by Candidate")
+        self._draw_score_graph(display_best, best_path, "Best Score Progress")
+        self._draw_time_graph(display_time, time_path, "Best Score vs Time (min)")
 
         config_path = os.path.join(report_dir, "auto_optimize_config.json")
         with open(config_path, "w", encoding="utf-8") as handle:
@@ -1664,42 +3562,347 @@ class EdgeBatchGUI:
                 indent=2,
             )
 
-        self._message_queue.put(("auto_done", best, report_path))
+        self._message_queue.put(("auto_done", best, report_path, stop_reason))
 
-    def _draw_score_graph(self, values, path, title):
+    def _downsample_values(self, values, max_points=600):
         if not values:
-            return
-        width, height = 800, 300
-        margin = 40
+            return [], []
+        n = len(values)
+        if n <= max_points:
+            xs = list(range(1, n + 1))
+            return xs, list(values)
+        block = n / float(max_points)
+        xs = []
+        ys = []
+        for i in range(max_points):
+            start = int(i * block)
+            end = int((i + 1) * block)
+            if start >= n:
+                break
+            segment = values[start:end] if end > start else [values[start]]
+            avg = float(sum(segment)) / max(1, len(segment))
+            xs.append((start + end) * 0.5 + 1)
+            ys.append(avg)
+        return xs, ys
+
+    def _render_graph(self, values, title, width=400, height=220):
+        margin = 36
         img = Image.new("RGB", (width, height), "white")
         draw = ImageDraw.Draw(img)
-        draw.rectangle([margin, margin, width - margin, height - margin], outline="black")
-        draw.text((margin, 10), title, fill="black")
 
-        min_val = min(values)
-        max_val = max(values)
-        if max_val == min_val:
-            max_val += 1.0
+        left = margin
+        top = margin
+        right = width - margin
+        bottom = height - margin
+        draw.rectangle([left, top, right, bottom], outline="black")
+        draw.text((left, 8), title, fill="black")
 
-        def scale_x(idx):
-            return margin + idx * (width - 2 * margin) / max(1, len(values) - 1)
+        if not values:
+            return img
+
+        xs, ys = self._downsample_values(values, max_points=700)
+        min_val = min(0.0, float(min(ys)))
+        max_val = float(max(ys))
+        if max_val <= min_val:
+            max_val = min_val + 1.0
+
+        min_x = min(xs)
+        max_x = max(xs)
+        if max_x <= min_x:
+            max_x = min_x + 1.0
+
+        def scale_x(xval):
+            return left + (xval - min_x) * (right - left) / (max_x - min_x)
 
         def scale_y(val):
-            return height - margin - (val - min_val) * (height - 2 * margin) / (max_val - min_val)
+            return bottom - (val - min_val) * (bottom - top) / (max_val - min_val)
 
-        points = [(scale_x(i), scale_y(v)) for i, v in enumerate(values)]
-        draw.line(points, fill="blue", width=2)
+        ticks = 4
+        for i in range(ticks + 1):
+            tx = left + i * (right - left) / ticks
+            tick_val = int(round(min_x + i * (max_x - min_x) / ticks))
+            draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
+            draw.text((tx - 6, bottom + 6), str(tick_val), fill="black")
+
+            ty = bottom - i * (bottom - top) / ticks
+            y_val = min_val + i * (max_val - min_val) / ticks
+            draw.line([(left - 4, ty), (left, ty)], fill="black")
+            draw.text((4, ty - 6), f"{y_val:.2f}", fill="black")
+
+        points = [(scale_x(xval), scale_y(v)) for xval, v in zip(xs, ys)]
+        if len(points) >= 2:
+            draw.line(points, fill="blue", width=2)
+        else:
+            draw.ellipse([points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2], fill="blue")
+        return img
+
+    def _render_time_graph(self, series, title, width=400, height=220):
+        margin = 36
+        img = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(img)
+
+        left = margin
+        top = margin
+        right = width - margin
+        bottom = height - margin
+        draw.rectangle([left, top, right, bottom], outline="black")
+        draw.text((left, 8), title, fill="black")
+
+        if not series:
+            return img
+
+        if len(series) > 700:
+            stride = max(1, len(series) // 700)
+            series = series[::stride]
+        times = [float(t) for t, _ in series]
+        values = [float(v) for _, v in series]
+        min_x = min(0.0, min(times))
+        max_x = max(times)
+        if max_x <= min_x:
+            max_x = min_x + 1.0
+
+        min_y = min(0.0, min(values))
+        max_y = max(values)
+        if max_y <= min_y:
+            max_y = min_y + 1.0
+
+        def scale_x(t):
+            return left + (t - min_x) * (right - left) / (max_x - min_x)
+
+        def scale_y(val):
+            return bottom - (val - min_y) * (bottom - top) / (max_y - min_y)
+
+        ticks = 4
+        for i in range(ticks + 1):
+            tx = left + i * (right - left) / ticks
+            t_val = min_x + i * (max_x - min_x) / ticks
+            draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
+            draw.text((tx - 6, bottom + 6), f"{t_val/60.0:.1f}", fill="black")
+
+            ty = bottom - i * (bottom - top) / ticks
+            y_val = min_y + i * (max_y - min_y) / ticks
+            draw.line([(left - 4, ty), (left, ty)], fill="black")
+            draw.text((4, ty - 6), f"{y_val:.2f}", fill="black")
+
+        points = [(scale_x(t), scale_y(v)) for t, v in series]
+        if len(points) >= 2:
+            draw.line(points, fill="blue", width=2)
+        else:
+            draw.ellipse([points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2], fill="blue")
+        return img
+
+    def _render_multi_graph(self, series_list, title, labels, colors, width=400, height=220):
+        margin = 36
+        img = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(img)
+
+        left = margin
+        top = margin
+        right = width - margin
+        bottom = height - margin
+        draw.rectangle([left, top, right, bottom], outline="black")
+        draw.text((left, 8), title, fill="black")
+
+        values = [v for series in series_list for v in series]
+        if not values:
+            return img
+
+        min_y = min(0.0, min(values))
+        max_y = max(values)
+        if max_y <= min_y:
+            max_y = min_y + 1.0
+
+        max_len = max(1, max(len(series) for series in series_list))
+        def scale_x(idx, total):
+            return left + idx * (right - left) / max(1, total - 1)
+
+        def scale_y(val):
+            return bottom - (val - min_y) * (bottom - top) / (max_y - min_y)
+
+        ticks = 4
+        for i in range(ticks + 1):
+            tx = left + i * (right - left) / ticks
+            tick_val = int(round(1 + i * (max_len - 1) / ticks))
+            draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
+            draw.text((tx - 6, bottom + 6), str(tick_val), fill="black")
+
+            ty = bottom - i * (bottom - top) / ticks
+            y_val = min_y + i * (max_y - min_y) / ticks
+            draw.line([(left - 4, ty), (left, ty)], fill="black")
+            draw.text((4, ty - 6), f"{y_val:.2f}", fill="black")
+
+        for series, label, color in zip(series_list, labels, colors):
+            if not series:
+                continue
+            xs, ys = self._downsample_values(series, max_points=700)
+            points = [(scale_x(xval, max_len), scale_y(v)) for xval, v in zip(xs, ys)]
+            if len(points) >= 2:
+                draw.line(points, fill=color, width=2)
+            else:
+                draw.ellipse(
+                    [points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2],
+                    fill=color,
+                )
+
+        legend_y = top - 22
+        legend_x = left
+        for label, color in zip(labels, colors):
+            draw.rectangle([legend_x, legend_y, legend_x + 12, legend_y + 12], fill=color)
+            draw.text((legend_x + 16, legend_y - 2), label, fill="black")
+            legend_x += 90
+
+        return img
+
+    def _draw_score_graph(self, values, path, title):
+        img = self._render_graph(values, title, width=800, height=300)
         img.save(path)
 
+    def _draw_time_graph(self, series, path, title):
+        img = self._render_time_graph(series, title, width=800, height=300)
+        img.save(path)
+
+    def _refresh_auto_graphs(self):
+        if not self.score_graph_label or not self.best_graph_label:
+            return
+        mode_label = self.score_display_mode.get() if self.score_display_mode else "raw"
+        display_scores = [self._score_to_display(v) for v in self._auto_scores]
+        display_best_series = [
+            (t, self._score_to_display(v)) for t, v in self._auto_best_time_series
+        ] or [(i, self._score_to_display(v)) for i, v in enumerate(self._auto_best_scores)]
+        score_img = self._render_graph(display_scores, f"Score ({mode_label})", width=460, height=260)
+        best_img = self._render_time_graph(display_best_series, f"Best score ({mode_label})", width=460, height=260)
+        metric_img = self._render_multi_graph(
+            [self._auto_cont_scores, self._auto_band_scores],
+            "Continuity & Band Fit",
+            ["Continuity", "Band fit"],
+            ["green", "blue"],
+            width=460,
+            height=260,
+        )
+        detail_img = self._render_multi_graph(
+            [self._auto_endpoint_scores, self._auto_wrinkle_scores, self._auto_branch_scores],
+            "Endpoints & Wrinkle",
+            ["Endpoints", "Wrinkle", "Branch"],
+            ["purple", "orange", "red"],
+            width=460,
+            height=260,
+        )
+        self._score_graph_photo = ImageTk.PhotoImage(score_img)
+        self._best_graph_photo = ImageTk.PhotoImage(best_img)
+        self._metric_graph_photo = ImageTk.PhotoImage(metric_img)
+        self._detail_graph_photo = ImageTk.PhotoImage(detail_img)
+        self.score_graph_label.config(image=self._score_graph_photo)
+        self.best_graph_label.config(image=self._best_graph_photo)
+        if self.metric_graph_label:
+            self.metric_graph_label.config(image=self._metric_graph_photo)
+        if self.detail_graph_label:
+            self.detail_graph_label.config(image=self._detail_graph_photo)
+
+    def _open_graph_window(self, kind):
+        win = tk.Toplevel(self.root)
+        win.title(f"Graph: {kind}")
+        win.geometry("980x640")
+
+        frame = ttk.Frame(win)
+        frame.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(frame, background="white")
+        h_scroll = ttk.Scrollbar(frame, orient="horizontal", command=canvas.xview)
+        v_scroll = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        mode_label = self.score_display_mode.get() if self.score_display_mode else "raw"
+        display_scores = [self._score_to_display(v) for v in self._auto_scores]
+        display_best_series = [
+            (t, self._score_to_display(v)) for t, v in self._auto_best_time_series
+        ] or [(i, self._score_to_display(v)) for i, v in enumerate(self._auto_best_scores)]
+
+        if kind == "score":
+            base_img = self._render_graph(display_scores, f"Score ({mode_label})", width=900, height=520)
+        elif kind == "best":
+            base_img = self._render_time_graph(
+                display_best_series, f"Best score ({mode_label})", width=900, height=520
+            )
+        elif kind == "metric":
+            base_img = self._render_multi_graph(
+                [self._auto_cont_scores, self._auto_band_scores],
+                "Continuity & Band Fit",
+                ["Continuity", "Band fit"],
+                ["green", "blue"],
+                width=900,
+                height=520,
+            )
+        else:
+            base_img = self._render_multi_graph(
+                [self._auto_endpoint_scores, self._auto_wrinkle_scores, self._auto_branch_scores],
+                "Endpoints & Wrinkle",
+                ["Endpoints", "Wrinkle", "Branch"],
+                ["purple", "orange", "red"],
+                width=900,
+                height=520,
+            )
+
+        state = {"scale": 1.0, "image": base_img, "photo": None}
+
+        def redraw():
+            scale = state["scale"]
+            w, h = state["image"].size
+            scaled = state["image"].resize((int(w * scale), int(h * scale)), resample=Image.BILINEAR)
+            state["photo"] = ImageTk.PhotoImage(scaled)
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor="nw", image=state["photo"])
+            canvas.configure(scrollregion=(0, 0, scaled.size[0], scaled.size[1]))
+
+        def zoom(factor):
+            state["scale"] = max(0.3, min(6.0, state["scale"] * factor))
+            redraw()
+
+        def on_wheel(event):
+            if event.delta > 0:
+                zoom(1.1)
+            elif event.delta < 0:
+                zoom(0.9)
+
+        def on_button4(_event):
+            zoom(1.1)
+
+        def on_button5(_event):
+            zoom(0.9)
+
+        def start_pan(event):
+            canvas.scan_mark(event.x, event.y)
+
+        def drag_pan(event):
+            canvas.scan_dragto(event.x, event.y, gain=1)
+
+        canvas.bind("<MouseWheel>", on_wheel)
+        canvas.bind("<Button-4>", on_button4)
+        canvas.bind("<Button-5>", on_button5)
+        canvas.bind("<ButtonPress-1>", start_pan)
+        canvas.bind("<B1-Motion>", drag_pan)
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, pady=4)
+        ttk.Button(btn_frame, text="Zoom In", command=lambda: zoom(1.2)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Zoom Out", command=lambda: zoom(0.85)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Reset", command=lambda: (state.update({"scale": 1.0}), redraw())).pack(side=tk.LEFT, padx=4)
+
+        redraw()
+
     def _choose_output_dir(self):
-        selected = filedialog.askdirectory(title="출력 폴더 선택")
+        selected = filedialog.askdirectory(title="Select output folder")
         if selected:
             self.output_root = selected
             self.output_label.config(text=self.output_root)
 
     def _add_files(self):
         files = filedialog.askopenfilenames(
-            title="이미지 파일 선택 (최대 100개)",
+            title="Select image files (up to 100)",
             filetypes=[
                 ("Image Files", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff"),
                 ("All Files", "*.*"),
@@ -1710,39 +3913,46 @@ class EdgeBatchGUI:
 
         remaining = self.max_files - len(self.selected_files)
         if remaining <= 0:
-            messagebox.showwarning("제한 초과", "이미 최대 100개 파일이 선택되었습니다.")
+            messagebox.showwarning("Limit Reached", "You already selected 100 files.")
             return
 
         files = list(files)
         if len(files) > remaining:
-            messagebox.showwarning("파일 제한", f"{remaining}개까지만 추가됩니다.")
+            messagebox.showwarning("File Limit", f"Only {remaining} more files can be added.")
             files = files[:remaining]
 
         for path in files:
+            if path in self.selected_files:
+                continue
             self.selected_files.append(path)
-            self.file_listbox.insert(tk.END, path)
+            roi = self.roi_cache.get(path)
+            if roi is None:
+                roi = self.roi_cache.get(os.path.basename(path))
+            if roi:
+                self.roi_map[path] = tuple(roi)
+        self._refresh_file_list()
 
     def _clear_files(self):
         self.selected_files = []
         self.file_listbox.delete(0, tk.END)
-        self.status_var.set("대기 중...")
+        self.status_var.set("Idle...")
 
     def _start_processing(self):
         if not self.selected_files:
-            messagebox.showinfo("알림", "처리할 파일을 먼저 선택해주세요.")
+            messagebox.showinfo("Info", "Select files to process first.")
             return
         if self._worker_thread and self._worker_thread.is_alive():
-            messagebox.showwarning("진행 중", "현재 처리 중입니다.")
+            messagebox.showwarning("In Progress", "Processing is already running.")
             return
 
         try:
             settings = self._get_param_settings()
         except ValueError as exc:
-            messagebox.showerror("파라미터 오류", str(exc))
+            messagebox.showerror("Parameter Error", str(exc))
             return
 
         batch_dir = self._create_batch_output_dir()
-        self.status_var.set(f"처리 시작... (저장 위치: {batch_dir})")
+        self.status_var.set(f"Processing started... (Output: {batch_dir})")
         self.start_button.config(state=tk.DISABLED)
         self.auto_button.config(state=tk.DISABLED)
 
@@ -1789,32 +3999,72 @@ class EdgeBatchGUI:
             self.start_button.config(state=tk.NORMAL)
             if self.auto_button:
                 self.auto_button.config(state=tk.NORMAL)
+            if self.pause_button:
+                self.pause_button.config(state=tk.DISABLED, text="Pause")
+            if self.stop_button:
+                self.stop_button.config(state=tk.DISABLED)
 
     def _handle_message(self, msg):
         msg_type = msg[0]
         if msg_type == "progress":
             idx, total, name = msg[1], msg[2], msg[3]
-            self.status_var.set(f"처리 중... ({idx}/{total}) {name}")
+            self.status_var.set(f"Processing... ({idx}/{total}) {name}")
         elif msg_type == "error":
             path, detail = msg[1], msg[2]
-            messagebox.showerror("처리 실패", f"{path}\n{detail}")
+            messagebox.showerror("Processing Failed", f"{path}\n{detail}")
         elif msg_type == "done":
             batch_dir = msg[1]
-            self.status_var.set(f"완료! 결과 저장 위치: {batch_dir}")
+            self.status_var.set(f"Done! Output: {batch_dir}")
         elif msg_type == "auto_progress":
-            idx, total, best_score = msg[1], msg[2], msg[3]
-            self.status_var.set(f"자동 최적화 중... ({idx}/{total}) best={best_score:.4f}")
+            idx, total, score, best_score = msg[1], msg[2], msg[3], msg[4]
+            eta_seconds = msg[5] if len(msg) > 5 else None
+            phase = msg[6] if len(msg) > 6 else "coarse"
+            elapsed = msg[7] if len(msg) > 7 else None
+            summary = msg[8] if len(msg) > 8 else None
+            qualities = msg[9] if len(msg) > 9 else None
+            penalty = msg[11] if len(msg) > 11 else None
+            score_disp = self._score_to_display(score)
+            best_disp = self._score_to_display(best_score)
+            self._auto_scores.append(score)
+            self._auto_best_scores.append(best_score)
+            if summary:
+                if qualities:
+                    self._auto_cont_scores.append(float(qualities.get("q_cont", 0.0)))
+                    self._auto_band_scores.append(float(qualities.get("q_band", 0.0)))
+                if penalty is not None:
+                    self._auto_penalty_scores.append(float(penalty))
+                self._auto_wrinkle_scores.append(float(summary.get("wrinkle", 0.0)))
+                self._auto_endpoint_scores.append(float(summary.get("endpoints", 0.0)))
+                self._auto_branch_scores.append(float(summary.get("branch", 0.0)))
+            self._refresh_auto_graphs()
+            eta_text = f" ETA {self._format_eta(eta_seconds)}" if eta_seconds is not None else ""
+            phase_text = f"{phase} " if phase else ""
+            self.status_var.set(
+                f"Auto optimizing... ({phase_text}{idx}/{total}) score={score_disp:.12f} "
+                f"best={best_disp:.12f}{eta_text}"
+            )
+        elif msg_type == "auto_best":
+            best_score, elapsed = msg[1], msg[2]
+            best_disp = self._score_to_display(best_score)
+            minutes = elapsed / 60.0
+            self._log(f"[AUTO] Best improved to {best_disp:.12f} at {minutes:.1f} min")
         elif msg_type == "auto_done":
             settings, report_path = msg[1], msg[2]
+            stop_reason = msg[3] if len(msg) > 3 else None
             if settings:
                 self._apply_settings(settings)
-            self.status_var.set(f"자동 최적화 완료! 보고서: {report_path}")
-            self._log(f"[AUTO] 최적화 완료: {report_path}")
+            if stop_reason:
+                label = "stopped by user" if stop_reason == "stopped" else stop_reason
+                self.status_var.set(f"Auto optimization stopped ({label}). Report: {report_path}")
+                self._log(f"[AUTO] Stopped ({label}): {report_path}")
+            else:
+                self.status_var.set(f"Auto optimization complete! Report: {report_path}")
+                self._log(f"[AUTO] Completed: {report_path}")
 
 
 def main():
     if tk is None:
-        raise RuntimeError("tkinter가 설치되어 있지 않습니다. GUI 실행을 위해 설치하세요.")
+        raise RuntimeError("tkinter is not installed. Install it to run the GUI.")
     root = tk.Tk()
     EdgeBatchGUI(root)
     root.mainloop()

@@ -967,6 +967,7 @@ class EdgeBatchGUI:
         self._auto_thread = None
         self.param_vars = self._init_param_vars()
         self.auto_mode = tk.StringVar(value="Fast")
+        self.score_display_mode = tk.StringVar(value="x1e9")
         self.log_text = None
         self.score_graph_label = None
         self.best_graph_label = None
@@ -981,6 +982,7 @@ class EdgeBatchGUI:
         self._auto_wrinkle_scores = []
         self._auto_endpoint_scores = []
         self._auto_branch_scores = []
+        self.score_display_mode.trace_add("write", lambda *_: self._refresh_auto_graphs())
         self._auto_start_time = None
         self._auto_last_best_time = None
         self._auto_pause_event = threading.Event()
@@ -1123,6 +1125,22 @@ class EdgeBatchGUI:
             variable=self.param_vars["use_blur"],
         ).grid(row=1, column=5, sticky="w", padx=(6, 0))
 
+        ttk.Checkbutton(
+            param_frame,
+            text="Median filter",
+            variable=self.param_vars["use_median_filter"],
+        ).grid(row=1, column=6, sticky="w", padx=(6, 0))
+
+        ttk.Label(param_frame, text="Median kernel").grid(row=2, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=3,
+            to=7,
+            increment=2,
+            textvariable=self.param_vars["median_kernel_size"],
+            width=5,
+        ).grid(row=2, column=7, sticky="w")
+
         ttk.Label(param_frame, text="Contrast ref").grid(row=2, column=0, sticky="w")
         ttk.Spinbox(
             param_frame,
@@ -1159,6 +1177,16 @@ class EdgeBatchGUI:
             width=5,
         ).grid(row=2, column=6, sticky="w")
 
+        ttk.Label(param_frame, text="Magnitude gamma").grid(row=3, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.6,
+            to=2.0,
+            increment=0.1,
+            textvariable=self.param_vars["magnitude_gamma"],
+            width=5,
+        ).grid(row=3, column=7, sticky="w")
+
         ttk.Checkbutton(
             param_frame,
             text="Boundary band",
@@ -1180,6 +1208,12 @@ class EdgeBatchGUI:
             text="Object dark",
             variable=self.param_vars["object_is_dark"],
         ).grid(row=3, column=4, sticky="w", padx=(4, 0))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Contrast stretch",
+            variable=self.param_vars["use_contrast_stretch"],
+        ).grid(row=3, column=5, sticky="w", padx=(6, 0))
 
         ttk.Checkbutton(
             param_frame,
@@ -1207,6 +1241,26 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=4, column=5, sticky="w", padx=(4, 0))
 
+        ttk.Label(param_frame, text="Low pct").grid(row=4, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.0,
+            to=10.0,
+            increment=0.5,
+            textvariable=self.param_vars["contrast_low_pct"],
+            width=5,
+        ).grid(row=4, column=7, sticky="w")
+
+        ttk.Label(param_frame, text="High pct").grid(row=5, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=90.0,
+            to=100.0,
+            increment=0.5,
+            textvariable=self.param_vars["contrast_high_pct"],
+            width=5,
+        ).grid(row=5, column=7, sticky="w")
+
         ttk.Checkbutton(
             param_frame,
             text="Polarity filter",
@@ -1222,6 +1276,96 @@ class EdgeBatchGUI:
             textvariable=self.param_vars["polarity_drop_margin"],
             width=6,
         ).grid(row=5, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Soft linking",
+            variable=self.param_vars["use_soft_linking"],
+        ).grid(row=6, column=0, sticky="w")
+        ttk.Label(param_frame, text="Soft low").grid(row=6, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.01,
+            to=0.2,
+            increment=0.01,
+            textvariable=self.param_vars["soft_low_ratio"],
+            width=6,
+        ).grid(row=6, column=3, sticky="w", padx=(4, 12))
+        ttk.Label(param_frame, text="Soft high").grid(row=6, column=4, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0.05,
+            to=0.4,
+            increment=0.01,
+            textvariable=self.param_vars["soft_high_ratio"],
+            width=6,
+        ).grid(row=6, column=5, sticky="w", padx=(4, 12))
+        ttk.Label(param_frame, text="Link radius").grid(row=6, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["link_radius"],
+            width=5,
+        ).grid(row=6, column=7, sticky="w")
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Closing",
+            variable=self.param_vars["use_closing"],
+        ).grid(row=7, column=0, sticky="w")
+        ttk.Label(param_frame, text="Close radius").grid(row=7, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["closing_radius"],
+            width=6,
+        ).grid(row=7, column=3, sticky="w", padx=(4, 12))
+        ttk.Label(param_frame, text="Close iters").grid(row=7, column=4, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["closing_iterations"],
+            width=6,
+        ).grid(row=7, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Edge smooth",
+            variable=self.param_vars["use_edge_smooth"],
+        ).grid(row=8, column=0, sticky="w")
+        ttk.Label(param_frame, text="Smooth radius").grid(row=8, column=2, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0,
+            to=4,
+            increment=1,
+            textvariable=self.param_vars["edge_smooth_radius"],
+            width=6,
+        ).grid(row=8, column=3, sticky="w", padx=(4, 12))
+        ttk.Label(param_frame, text="Smooth iters").grid(row=8, column=4, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=1,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["edge_smooth_iters"],
+            width=6,
+        ).grid(row=8, column=5, sticky="w", padx=(4, 12))
+        ttk.Label(param_frame, text="Spur prune").grid(row=8, column=6, sticky="w")
+        ttk.Spinbox(
+            param_frame,
+            from_=0,
+            to=6,
+            increment=1,
+            textvariable=self.param_vars["spur_prune_iters"],
+            width=5,
+        ).grid(row=8, column=7, sticky="w")
 
         auto_frame = ttk.LabelFrame(main_frame, text="Auto Search Range / Scoring")
         auto_frame.pack(fill=tk.X, pady=(6, 6))
@@ -1610,6 +1754,16 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=12, column=3, sticky="w", padx=(4, 12))
 
+        ttk.Label(auto_frame, text="W endpoints").grid(row=12, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.5,
+            to=4.0,
+            increment=0.1,
+            textvariable=self.param_vars["weight_endpoints"],
+            width=6,
+        ).grid(row=12, column=5, sticky="w", padx=(4, 12))
+
         ttk.Checkbutton(
             auto_frame,
             text="Early stop on stagnation (min)",
@@ -1623,6 +1777,26 @@ class EdgeBatchGUI:
             textvariable=self.param_vars["early_stop_minutes"],
             width=6,
         ).grid(row=13, column=1, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W wrinkle").grid(row=13, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.5,
+            to=4.0,
+            increment=0.1,
+            textvariable=self.param_vars["weight_wrinkle"],
+            width=6,
+        ).grid(row=13, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="W branch").grid(row=13, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.5,
+            to=3.0,
+            increment=0.1,
+            textvariable=self.param_vars["weight_branch"],
+            width=6,
+        ).grid(row=13, column=5, sticky="w", padx=(4, 12))
 
         ttk.Label(auto_frame, text="Soft link prob").grid(row=14, column=0, sticky="w")
         ttk.Spinbox(
@@ -1900,7 +2074,7 @@ class EdgeBatchGUI:
         ttk.Button(auto_btn_frame, text="Load Auto Config", command=self._load_auto_config).pack(side=tk.LEFT, padx=4)
 
         param_btn_frame = ttk.Frame(param_frame)
-        param_btn_frame.grid(row=6, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        param_btn_frame.grid(row=9, column=0, columnspan=8, sticky="w", pady=(4, 0))
         ttk.Button(param_btn_frame, text="Save Params", command=self._save_param_config).pack(side=tk.LEFT, padx=4)
         ttk.Button(param_btn_frame, text="Load Params", command=self._load_param_config).pack(side=tk.LEFT, padx=4)
 
@@ -1958,6 +2132,14 @@ class EdgeBatchGUI:
         ).pack(side=tk.LEFT)
         self.auto_button = ttk.Button(button_frame, text="Auto Optimize", command=self._start_auto_optimize)
         self.auto_button.pack(side=tk.LEFT, padx=6)
+        ttk.Label(button_frame, text="Score display").pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Combobox(
+            button_frame,
+            textvariable=self.score_display_mode,
+            values=["raw", "log10", "x1e9"],
+            width=7,
+            state="readonly",
+        ).pack(side=tk.LEFT)
         self.pause_button = ttk.Button(
             button_frame, text="Pause", command=self._toggle_auto_pause, state=tk.DISABLED
         )
@@ -2212,6 +2394,14 @@ class EdgeBatchGUI:
         if hours > 0:
             return f"{hours:02d}:{minutes:02d}:{secs:02d}"
         return f"{minutes:02d}:{secs:02d}"
+
+    def _score_to_display(self, value, mode=None):
+        mode = mode or (self.score_display_mode.get() if self.score_display_mode else "raw")
+        if mode == "log10":
+            return math.log10(max(float(value), 1e-12))
+        if mode == "x1e9":
+            return float(value) * 1e9
+        return float(value)
 
     def _select_auto_subset(self, files, max_files):
         if max_files >= len(files):
@@ -3034,15 +3224,16 @@ class EdgeBatchGUI:
         self._auto_endpoint_scores = []
         self._auto_branch_scores = []
         self._refresh_auto_graphs()
+        display_mode = self.score_display_mode.get()
         self._worker_thread = threading.Thread(
             target=self._auto_optimize_worker,
-            args=(list(self.selected_files), base_settings, auto_config, mode, dict(self.roi_map)),
+            args=(list(self.selected_files), base_settings, auto_config, mode, dict(self.roi_map), display_mode),
             daemon=True,
         )
         self._worker_thread.start()
         self.root.after(100, self._poll_messages)
 
-    def _auto_optimize_worker(self, files, base_settings, auto_config, mode, roi_map):
+    def _auto_optimize_worker(self, files, base_settings, auto_config, mode, roi_map, display_mode):
         max_files = min(8, len(files)) if mode == "Fast" else len(files)
         data = self._prepare_auto_data(files, base_settings, auto_config, roi_map, max_files)
         data_coarse = data.get("coarse", [])
@@ -3054,7 +3245,7 @@ class EdgeBatchGUI:
             data_mid = data_full
         best = None
         best_score = 0.0
-        report_lines = []
+        report_lines = [f"[INFO] score_display={display_mode}"]
         scores = []
         best_progress = []
         evaluated = []
@@ -3136,8 +3327,9 @@ class EdgeBatchGUI:
             score_base = qualities["q_cont"] * qualities["q_band"]
             penalty = max(0.0, 1.0 - score)
             evaluated.append((score, settings, summary))
+            score_disp = self._score_to_display(score, display_mode)
             report_lines.append(
-                f"{idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
+                f"{idx:03d} score={score_disp:.4f} raw={score:.6e} base={score_base:.4f} pen={penalty:.4f} "
                 f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                 f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
                 f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
@@ -3211,8 +3403,9 @@ class EdgeBatchGUI:
                 score_base = qualities["q_cont"] * qualities["q_band"]
                 penalty = max(0.0, 1.0 - score)
                 evaluated.append((score, settings, summary))
+                score_disp = self._score_to_display(score, display_mode)
                 report_lines.append(
-                    f"refine {idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
+                    f"refine {idx:03d} score={score_disp:.4f} raw={score:.6e} base={score_base:.4f} pen={penalty:.4f} "
                     f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                     f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
                     f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
@@ -3284,8 +3477,9 @@ class EdgeBatchGUI:
                     score_base = qualities["q_cont"] * qualities["q_band"]
                     penalty = max(0.0, 1.0 - score)
                     evaluated.append((score, settings, summary))
+                    score_disp = self._score_to_display(score, display_mode)
                     report_lines.append(
-                        f"adaptive{round_idx} {idx:03d} score={score:.4f} base={score_base:.4f} pen={penalty:.4f} "
+                        f"adaptive{round_idx} {idx:03d} score={score_disp:.4f} raw={score:.6e} base={score_base:.4f} pen={penalty:.4f} "
                         f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                         f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
                         f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
@@ -3338,9 +3532,12 @@ class EdgeBatchGUI:
         graph_path = os.path.join(report_dir, "auto_optimize_scores.png")
         best_path = os.path.join(report_dir, "auto_optimize_best.png")
         time_path = os.path.join(report_dir, "auto_optimize_best_time.png")
-        self._draw_score_graph(scores, graph_path, "Score by Candidate")
-        self._draw_score_graph(best_progress, best_path, "Best Score Progress")
-        self._draw_time_graph(self._auto_best_time_series, time_path, "Best Score vs Time (min)")
+        display_scores = [self._score_to_display(v, display_mode) for v in scores]
+        display_best = [self._score_to_display(v, display_mode) for v in best_progress]
+        display_time = [(t, self._score_to_display(v, display_mode)) for t, v in self._auto_best_time_series]
+        self._draw_score_graph(display_scores, graph_path, "Score by Candidate")
+        self._draw_score_graph(display_best, best_path, "Best Score Progress")
+        self._draw_time_graph(display_time, time_path, "Best Score vs Time (min)")
 
         config_path = os.path.join(report_dir, "auto_optimize_config.json")
         with open(config_path, "w", encoding="utf-8") as handle:
@@ -3352,6 +3549,27 @@ class EdgeBatchGUI:
             )
 
         self._message_queue.put(("auto_done", best, report_path, stop_reason))
+
+    def _downsample_values(self, values, max_points=600):
+        if not values:
+            return [], []
+        n = len(values)
+        if n <= max_points:
+            xs = list(range(1, n + 1))
+            return xs, list(values)
+        block = n / float(max_points)
+        xs = []
+        ys = []
+        for i in range(max_points):
+            start = int(i * block)
+            end = int((i + 1) * block)
+            if start >= n:
+                break
+            segment = values[start:end] if end > start else [values[start]]
+            avg = float(sum(segment)) / max(1, len(segment))
+            xs.append((start + end) * 0.5 + 1)
+            ys.append(avg)
+        return xs, ys
 
     def _render_graph(self, values, title, width=400, height=220):
         margin = 36
@@ -3368,13 +3586,19 @@ class EdgeBatchGUI:
         if not values:
             return img
 
-        min_val = min(0.0, float(min(values)))
-        max_val = float(max(values))
+        xs, ys = self._downsample_values(values, max_points=700)
+        min_val = min(0.0, float(min(ys)))
+        max_val = float(max(ys))
         if max_val <= min_val:
             max_val = min_val + 1.0
 
-        def scale_x(idx):
-            return left + idx * (right - left) / max(1, len(values) - 1)
+        min_x = min(xs)
+        max_x = max(xs)
+        if max_x <= min_x:
+            max_x = min_x + 1.0
+
+        def scale_x(xval):
+            return left + (xval - min_x) * (right - left) / (max_x - min_x)
 
         def scale_y(val):
             return bottom - (val - min_val) * (bottom - top) / (max_val - min_val)
@@ -3382,7 +3606,7 @@ class EdgeBatchGUI:
         ticks = 4
         for i in range(ticks + 1):
             tx = left + i * (right - left) / ticks
-            tick_val = int(round(1 + i * (len(values) - 1) / ticks))
+            tick_val = int(round(min_x + i * (max_x - min_x) / ticks))
             draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
             draw.text((tx - 6, bottom + 6), str(tick_val), fill="black")
 
@@ -3391,7 +3615,7 @@ class EdgeBatchGUI:
             draw.line([(left - 4, ty), (left, ty)], fill="black")
             draw.text((4, ty - 6), f"{y_val:.2f}", fill="black")
 
-        points = [(scale_x(i), scale_y(v)) for i, v in enumerate(values)]
+        points = [(scale_x(xval), scale_y(v)) for xval, v in zip(xs, ys)]
         if len(points) >= 2:
             draw.line(points, fill="blue", width=2)
         else:
@@ -3413,6 +3637,9 @@ class EdgeBatchGUI:
         if not series:
             return img
 
+        if len(series) > 700:
+            stride = max(1, len(series) // 700)
+            series = series[::stride]
         times = [float(t) for t, _ in series]
         values = [float(v) for _, v in series]
         min_x = min(0.0, min(times))
@@ -3471,6 +3698,7 @@ class EdgeBatchGUI:
         if max_y <= min_y:
             max_y = min_y + 1.0
 
+        max_len = max(1, max(len(series) for series in series_list))
         def scale_x(idx, total):
             return left + idx * (right - left) / max(1, total - 1)
 
@@ -3480,7 +3708,7 @@ class EdgeBatchGUI:
         ticks = 4
         for i in range(ticks + 1):
             tx = left + i * (right - left) / ticks
-            tick_val = int(round(1 + i * (max(len(series) for series in series_list) - 1) / ticks))
+            tick_val = int(round(1 + i * (max_len - 1) / ticks))
             draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
             draw.text((tx - 6, bottom + 6), str(tick_val), fill="black")
 
@@ -3492,7 +3720,8 @@ class EdgeBatchGUI:
         for series, label, color in zip(series_list, labels, colors):
             if not series:
                 continue
-            points = [(scale_x(i, len(series)), scale_y(v)) for i, v in enumerate(series)]
+            xs, ys = self._downsample_values(series, max_points=700)
+            points = [(scale_x(xval, max_len), scale_y(v)) for xval, v in zip(xs, ys)]
             if len(points) >= 2:
                 draw.line(points, fill=color, width=2)
             else:
@@ -3521,9 +3750,13 @@ class EdgeBatchGUI:
     def _refresh_auto_graphs(self):
         if not self.score_graph_label or not self.best_graph_label:
             return
-        score_img = self._render_graph(self._auto_scores, "Score (current)", width=460, height=260)
-        best_series = self._auto_best_time_series or [(i, v) for i, v in enumerate(self._auto_best_scores)]
-        best_img = self._render_time_graph(best_series, "Best score (min)", width=460, height=260)
+        mode_label = self.score_display_mode.get() if self.score_display_mode else "raw"
+        display_scores = [self._score_to_display(v) for v in self._auto_scores]
+        display_best_series = [
+            (t, self._score_to_display(v)) for t, v in self._auto_best_time_series
+        ] or [(i, self._score_to_display(v)) for i, v in enumerate(self._auto_best_scores)]
+        score_img = self._render_graph(display_scores, f"Score ({mode_label})", width=460, height=260)
+        best_img = self._render_time_graph(display_best_series, f"Best score ({mode_label})", width=460, height=260)
         metric_img = self._render_multi_graph(
             [self._auto_cont_scores, self._auto_band_scores],
             "Continuity & Band Fit",
@@ -3554,13 +3787,35 @@ class EdgeBatchGUI:
     def _open_graph_window(self, kind):
         win = tk.Toplevel(self.root)
         win.title(f"Graph: {kind}")
+        win.geometry("980x640")
+
+        frame = ttk.Frame(win)
+        frame.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(frame, background="white")
+        h_scroll = ttk.Scrollbar(frame, orient="horizontal", command=canvas.xview)
+        v_scroll = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        canvas.configure(xscrollcommand=h_scroll.set, yscrollcommand=v_scroll.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        mode_label = self.score_display_mode.get() if self.score_display_mode else "raw"
+        display_scores = [self._score_to_display(v) for v in self._auto_scores]
+        display_best_series = [
+            (t, self._score_to_display(v)) for t, v in self._auto_best_time_series
+        ] or [(i, self._score_to_display(v)) for i, v in enumerate(self._auto_best_scores)]
+
         if kind == "score":
-            img = self._render_graph(self._auto_scores, "Score (current)", width=900, height=520)
+            base_img = self._render_graph(display_scores, f"Score ({mode_label})", width=900, height=520)
         elif kind == "best":
-            series = self._auto_best_time_series or [(i, v) for i, v in enumerate(self._auto_best_scores)]
-            img = self._render_time_graph(series, "Best score (min)", width=900, height=520)
+            base_img = self._render_time_graph(
+                display_best_series, f"Best score ({mode_label})", width=900, height=520
+            )
         elif kind == "metric":
-            img = self._render_multi_graph(
+            base_img = self._render_multi_graph(
                 [self._auto_cont_scores, self._auto_band_scores],
                 "Continuity & Band Fit",
                 ["Continuity", "Band fit"],
@@ -3569,7 +3824,7 @@ class EdgeBatchGUI:
                 height=520,
             )
         else:
-            img = self._render_multi_graph(
+            base_img = self._render_multi_graph(
                 [self._auto_endpoint_scores, self._auto_wrinkle_scores, self._auto_branch_scores],
                 "Endpoints & Wrinkle",
                 ["Endpoints", "Wrinkle", "Branch"],
@@ -3577,10 +3832,53 @@ class EdgeBatchGUI:
                 width=900,
                 height=520,
             )
-        photo = ImageTk.PhotoImage(img)
-        label = ttk.Label(win, image=photo)
-        label.image = photo
-        label.pack()
+
+        state = {"scale": 1.0, "image": base_img, "photo": None}
+
+        def redraw():
+            scale = state["scale"]
+            w, h = state["image"].size
+            scaled = state["image"].resize((int(w * scale), int(h * scale)), resample=Image.BILINEAR)
+            state["photo"] = ImageTk.PhotoImage(scaled)
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor="nw", image=state["photo"])
+            canvas.configure(scrollregion=(0, 0, scaled.size[0], scaled.size[1]))
+
+        def zoom(factor):
+            state["scale"] = max(0.3, min(6.0, state["scale"] * factor))
+            redraw()
+
+        def on_wheel(event):
+            if event.delta > 0:
+                zoom(1.1)
+            elif event.delta < 0:
+                zoom(0.9)
+
+        def on_button4(_event):
+            zoom(1.1)
+
+        def on_button5(_event):
+            zoom(0.9)
+
+        def start_pan(event):
+            canvas.scan_mark(event.x, event.y)
+
+        def drag_pan(event):
+            canvas.scan_dragto(event.x, event.y, gain=1)
+
+        canvas.bind("<MouseWheel>", on_wheel)
+        canvas.bind("<Button-4>", on_button4)
+        canvas.bind("<Button-5>", on_button5)
+        canvas.bind("<ButtonPress-1>", start_pan)
+        canvas.bind("<B1-Motion>", drag_pan)
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, pady=4)
+        ttk.Button(btn_frame, text="Zoom In", command=lambda: zoom(1.2)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Zoom Out", command=lambda: zoom(0.85)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Reset", command=lambda: (state.update({"scale": 1.0}), redraw())).pack(side=tk.LEFT, padx=4)
+
+        redraw()
 
     def _choose_output_dir(self):
         selected = filedialog.askdirectory(title="Select output folder")
@@ -3711,6 +4009,8 @@ class EdgeBatchGUI:
             summary = msg[8] if len(msg) > 8 else None
             qualities = msg[9] if len(msg) > 9 else None
             penalty = msg[11] if len(msg) > 11 else None
+            score_disp = self._score_to_display(score)
+            best_disp = self._score_to_display(best_score)
             self._auto_scores.append(score)
             self._auto_best_scores.append(best_score)
             if summary:
@@ -3726,13 +4026,14 @@ class EdgeBatchGUI:
             eta_text = f" ETA {self._format_eta(eta_seconds)}" if eta_seconds is not None else ""
             phase_text = f"{phase} " if phase else ""
             self.status_var.set(
-                f"Auto optimizing... ({phase_text}{idx}/{total}) score={score:.4f} "
-                f"best={best_score:.4f}{eta_text}"
+                f"Auto optimizing... ({phase_text}{idx}/{total}) score={score_disp:.4f} "
+                f"best={best_disp:.4f}{eta_text}"
             )
         elif msg_type == "auto_best":
             best_score, elapsed = msg[1], msg[2]
+            best_disp = self._score_to_display(best_score)
             minutes = elapsed / 60.0
-            self._log(f"[AUTO] Best improved to {best_score:.4f} at {minutes:.1f} min")
+            self._log(f"[AUTO] Best improved to {best_disp:.4f} at {minutes:.1f} min")
         elif msg_type == "auto_done":
             settings, report_path = msg[1], msg[2]
             stop_reason = msg[3] if len(msg) > 3 else None

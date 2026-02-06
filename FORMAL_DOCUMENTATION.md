@@ -3,8 +3,8 @@
 ## 1. Document Control / 문서 관리
 - Document Title / 문서명: OLED FCB Edge Detection System
 - Version / 버전: 15
-- Date / 작성일: 2026-02-04
-- Owner / 담당: Edge Detection Team
+- Date / 작성일: 2026-02-06
+- Owner / 담당: Min joon kim /Edge Detection AI PIC(Assy/Ins)
 
 ## 2. Purpose / 목적
 **KR:** OLED FCB 사이드 뷰 이미지에서 외곽선 에지를 안정적으로 검출하여
@@ -44,6 +44,12 @@ re-search.
 4. Auto optimization 진행률/그래프 표시
 5. 저장/불러오기 지원
 
+1. Up to 100 images in batch processing
+2. Save the resulting image (green edge) and coordinate text
+3. Support ROI-based automatic optimization
+4. Auto optimization progress/graph display
+5. Save/Import Support
+
 ## 7. Architecture / 아키텍처
 **KR:**  
 GUI → 파라미터 설정 → 에지 검출 파이프라인 → 결과 저장  
@@ -54,6 +60,11 @@ GUI → parameter settings → edge detection pipeline → output
 Auto Optimization → candidate generation → ROI/cluster evaluation → apply best
 
 ## 8. Evaluation & Validation / 검증
+
+- 합성 굽힘 루프 및 복잡한 루프 테스트
+- 저품질/노이즈/블러 시나리오
+- 메트릭 : 연속성, 밴드핏, 두께, 침입, 주름, 종점
+  
 - Synthetic bending-loop and complex-loop tests
 - Low-quality/noise/blur scenarios
 - Metrics: continuity, band-fit, thickness, intrusion, wrinkle, endpoints
@@ -61,14 +72,27 @@ Auto Optimization → candidate generation → ROI/cluster evaluation → apply 
 ## 9. Risks / 리스크
 1. 데이터별 특성 차이로 인한 최적 파라미터 변동
 2. 과도한 스무딩으로 인한 경계 약화
-3. Wide search ranges causing long optimization time
+3. 긴 최적화 시간을 일으키는 원인이 되는 넓은 탐색 범위
+      
+1. Variation of optimal parameters due to differences in characteristics by data;
+2. Weakening of boundaries due to excessive smoothing
+3. Wide navigation range, causing long optimization time
 
 ## 10. Maintenance / 유지보수
 - Auto config 범위를 프로젝트별로 축소 권장
 - ROI 캐시를 운영 환경과 분리 관리
 - 주요 파라미터 변경 시 평가 재수행
 
+- Reduce Auto config range by project
+- Separate ROI cache from production
+- Re-perform evaluation when major parameters are changed
+- 
 ## 11. Change Log / 변경 이력
+
+- v13: 자동 최적화 점수 확장 (연속성/밴드 적합)
+- v14: ROI 캐시 + 멀티 그래프 GUI + ETA
+- v15: 적응 단계 검색, 주름 / 끝점 패널티, 확대 / 축소 그래프
+  
 - v13: Auto optimization scoring expanded (continuity/band fit)
 - v14: ROI cache + multi-graph GUI + ETA
 - v15: Adaptive step search, wrinkle/endpoints penalties, zoomable graphs
@@ -79,3 +103,7 @@ Auto Optimization → candidate generation → ROI/cluster evaluation → apply 
 1. 이미지 선택 → ROI 설정 → Auto Optimize 실행
 2. 그래프 클릭 → 확대/드래그로 확인
 3. 최적 결과 적용 후 Batch 처리 수행
+
+1. Select Image → Set ROI → Run Auto Optimize
+2. Click on the graph → Confirm by zooming/dragging
+3. Batch processing after applying optimal results

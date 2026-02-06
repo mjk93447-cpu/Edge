@@ -1,109 +1,76 @@
-# Formal Development Document (Korean / English)
+# Formal Development Document (English Only)
 
-## 1. Document Control / 문서 관리
-- Document Title / 문서명: OLED FCB Edge Detection System
-- Version / 버전: 15
-- Date / 작성일: 2026-02-06
-- Owner / 담당: Min joon kim /Edge Detection AI PIC(Assy/Ins)
+## 1. Document Control
+- Document Title: OLED FCB Edge Detection System
+- Version: 17
+- Date: 2026-02-04
+- Owner: Edge Detection Team
 
-## 2. Purpose / 목적
-**KR:** OLED FCB 사이드 뷰 이미지에서 외곽선 에지를 안정적으로 검출하여
-라인 추적 및 품질 판단에 활용하기 위한 시스템을 정의한다.  
-**EN:** Define the system for robust outer-boundary edge detection on OLED FCB
-side-view images for line tracing and quality validation.
+## 2. Purpose
+Define a robust, offline edge detection system that traces the outer boundary
+of OLED FCB side-view images for line tracking and quality validation.
 
-## 3. Scope / 범위
-**KR:** 본 문서는 알고리즘, GUI, 자동 최적화, 평가 도구, 배포 방식까지 포함한다.  
-**EN:** This document covers the algorithm, GUI, auto-optimization, evaluation
-tools, and deployment method.
+## 3. Scope
+This document covers the algorithm, GUI workflow, auto-optimization, evaluation
+tools, and deployment guidelines.
 
-## 4. Definitions / 용어 정의
-- **Boundary Band**: 객체 외곽선 근방의 허용 대역
-- **Continuity**: 외곽선 연결성 지표
-- **Intrusion**: 외곽선이 내부로 침범하는 정도
-- **Wrinkle**: 곡선이 주름처럼 불규칙하게 꺾이는 현상
+## 4. Definitions
+- **Boundary Band**: Allowed region around the estimated object boundary.
+- **Continuity**: Metric for connected, unbroken outer edges.
+- **Intrusion**: Percentage of edges inside the object interior.
+- **Wrinkle**: Jagged or wavy contour artifacts.
+- **Endpoints**: Unwanted edge breaks that indicate discontinuity.
 
-## 5. System Overview / 시스템 개요
-**KR:**  
-입력 이미지를 전처리(블러/중앙값/대비 보정) 후 Sobel 기반 에지 검출을 수행한다.
-이후 Non-Maximum Suppression, 이중 임계값, 히스테리시스 추적을 적용하며,
-Polarity Filter 및 Boundary Band Filter로 내부 침범을 억제한다.  
-자동 최적화는 다중 후보 생성 → 평가 → 적응형 재탐색으로 진행된다.
+## 5. System Overview
+Input images are pre-processed (median/blur/contrast). A Sobel pipeline with NMS,
+double-thresholding, and hysteresis extracts edges. Post-filters (polarity and
+boundary band) reduce inward curling. Optional smoothing and spur pruning reduce
+wrinkle artifacts.
 
-**EN:**  
-Input images are pre-processed (blur/median/contrast) and processed with a
-Sobel-based edge detector. NMS, double-thresholding, and hysteresis tracking
-follow. Polarity and boundary-band filters suppress internal intrusion.  
-Auto-optimization executes candidate generation, evaluation, and adaptive
-re-search.
+Auto-optimization performs candidate generation, evaluation, and adaptive
+re-search with priority-based scoring.
 
-## 6. Functional Requirements / 기능 요구사항
-1. 최대 100장 이미지 배치 처리
-2. 결과 이미지(녹색 에지) 및 좌표 텍스트 저장
-3. ROI 기반 자동 최적화 지원
-4. Auto optimization 진행률/그래프 표시
-5. 저장/불러오기 지원
+## 6. Functional Requirements
+1. Batch processing up to 100 images.
+2. Export edge overlay images and coordinate text files.
+3. ROI-based optimization with cache support.
+4. Auto-optimization progress and graphs.
+5. Save/load parameters and auto configuration.
 
-1. Up to 100 images in batch processing
-2. Save the resulting image (green edge) and coordinate text
-3. Support ROI-based automatic optimization
-4. Auto optimization progress/graph display
-5. Save/Import Support
+## 7. Architecture
+GUI -> Parameter settings -> Edge pipeline -> Output  
+Auto optimization -> Candidate generation -> ROI/cluster evaluation -> Apply best
 
-## 7. Architecture / 아키텍처
-**KR:**  
-GUI → 파라미터 설정 → 에지 검출 파이프라인 → 결과 저장  
-Auto Optimization → 후보 생성 → ROI/클러스터 기반 평가 → 결과 적용
+## 8. Evaluation and Validation
+- Synthetic bending-loop and complex-loop test images.
+- Low-quality, blur, noise, and gradient stress tests.
+- Metrics: continuity, band-fit, thickness, intrusion, wrinkle, endpoints.
 
-**EN:**  
-GUI → parameter settings → edge detection pipeline → output  
-Auto Optimization → candidate generation → ROI/cluster evaluation → apply best
+## 9. Development Process Summary
+1. Baseline Sobel implementation and vectorization for performance.
+2. NMS relax and thinning to improve recall (with thickness tradeoffs).
+3. Polarity and boundary band filters to reduce inner intrusion.
+4. Auto thresholding and contrast controls for low-quality images.
+5. Multi-stage auto-optimization with adaptive sampling.
+6. ROI clustering to reduce evaluation time on large datasets.
 
-## 8. Evaluation & Validation / 검증
+## 10. Risks
+1. Parameter sensitivity across datasets.
+2. Over-smoothing of faint or thin boundaries.
+3. Large search ranges can increase optimization time.
 
-- 합성 굽힘 루프 및 복잡한 루프 테스트
-- 저품질/노이즈/블러 시나리오
-- 메트릭 : 연속성, 밴드핏, 두께, 침입, 주름, 종점
-  
-- Synthetic bending-loop and complex-loop tests
-- Low-quality/noise/blur scenarios
-- Metrics: continuity, band-fit, thickness, intrusion, wrinkle, endpoints
+## 11. Maintenance Guidance
+- Narrow auto config ranges for each production dataset.
+- Separate ROI cache per machine or dataset.
+- Re-run evaluation after major parameter changes.
 
-## 9. Risks / 리스크
-1. 데이터별 특성 차이로 인한 최적 파라미터 변동
-2. 과도한 스무딩으로 인한 경계 약화
-3. 긴 최적화 시간을 일으키는 원인이 되는 넓은 탐색 범위
-      
-1. Variation of optimal parameters due to differences in characteristics by data;
-2. Weakening of boundaries due to excessive smoothing
-3. Wide navigation range, causing long optimization time
-
-## 10. Maintenance / 유지보수
-- Auto config 범위를 프로젝트별로 축소 권장
-- ROI 캐시를 운영 환경과 분리 관리
-- 주요 파라미터 변경 시 평가 재수행
-
-- Reduce Auto config range by project
-- Separate ROI cache from production
-- Re-perform evaluation when major parameters are changed
-- 
-## 11. Change Log / 변경 이력
-
-- v13: 자동 최적화 점수 확장 (연속성/밴드 적합)
-- v14: ROI 캐시 + 멀티 그래프 GUI + ETA
-- v15: 적응 단계 검색, 주름 / 끝점 패널티, 확대 / 축소 그래프
-  
-- v13: Auto optimization scoring expanded (continuity/band fit)
+## 12. Change Log
+- v13: Expanded scoring (continuity/band fit)
 - v14: ROI cache + multi-graph GUI + ETA
 - v15: Adaptive step search, wrinkle/endpoints penalties, zoomable graphs
+- v17: Expanded parameter space and score display scaling
 
----
-
-### Appendix A. Operator Quick Guide / 운영자 요약 가이드
-1. 이미지 선택 → ROI 설정 → Auto Optimize 실행
-2. 그래프 클릭 → 확대/드래그로 확인
-3. 최적 결과 적용 후 Batch 처리 수행
-
-1. Select Image → Set ROI → Run Auto Optimize
-2. Click on the graph → Confirm by zooming/dragging
-3. Batch processing after applying optimal results
+## Appendix A: Operator Quick Guide
+1. Select images -> set ROI -> run Auto Optimize.
+2. Click graphs to zoom/drag and inspect trends.
+3. Apply best settings and run batch processing.

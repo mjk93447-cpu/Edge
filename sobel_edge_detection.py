@@ -1016,9 +1016,13 @@ class EdgeBatchGUI:
 
         main_frame = ttk.Frame(canvas, padding=12)
         canvas_window = canvas.create_window((0, 0), window=main_frame, anchor="nw")
+        self._scroll_canvas = canvas
+        self._scroll_window = canvas_window
 
         def _on_frame_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
+            bbox = canvas.bbox("all")
+            if bbox:
+                canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], bbox[3] + 40))
 
         def _on_canvas_configure(event):
             canvas.itemconfig(canvas_window, width=event.width)
@@ -1131,7 +1135,7 @@ class EdgeBatchGUI:
             variable=self.param_vars["use_median_filter"],
         ).grid(row=1, column=6, sticky="w", padx=(6, 0))
 
-        ttk.Label(param_frame, text="Median kernel").grid(row=2, column=6, sticky="w")
+        ttk.Label(param_frame, text="Median kernel").grid(row=1, column=7, sticky="w")
         ttk.Spinbox(
             param_frame,
             from_=3,
@@ -1139,7 +1143,7 @@ class EdgeBatchGUI:
             increment=2,
             textvariable=self.param_vars["median_kernel_size"],
             width=5,
-        ).grid(row=2, column=7, sticky="w")
+        ).grid(row=1, column=8, sticky="w")
 
         ttk.Label(param_frame, text="Contrast ref").grid(row=2, column=0, sticky="w")
         ttk.Spinbox(
@@ -2155,11 +2159,21 @@ class EdgeBatchGUI:
         status_label = ttk.Label(main_frame, textvariable=self.status_var)
         status_label.pack(anchor="w", pady=(6, 0))
 
+        self.root.after(200, self._refresh_scroll_region)
+
     def _log(self, message):
         if not self.log_text:
             return
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
+
+    def _refresh_scroll_region(self):
+        canvas = getattr(self, "_scroll_canvas", None)
+        if not canvas:
+            return
+        bbox = canvas.bbox("all")
+        if bbox:
+            canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], bbox[3] + 60))
 
     def _load_roi_cache(self):
         if not os.path.exists(ROI_CACHE_PATH):
@@ -2398,7 +2412,7 @@ class EdgeBatchGUI:
     def _score_to_display(self, value, mode=None):
         mode = mode or (self.score_display_mode.get() if self.score_display_mode else "raw")
         if mode == "log10":
-            return math.log10(max(float(value), 1e-12))
+            return math.log10(max(float(value), 1e-30))
         if mode == "x1e9":
             return float(value) * 1e9
         return float(value)
@@ -3329,7 +3343,7 @@ class EdgeBatchGUI:
             evaluated.append((score, settings, summary))
             score_disp = self._score_to_display(score, display_mode)
             report_lines.append(
-                f"{idx:03d} score={score_disp:.4f} raw={score:.6e} base={score_base:.4f} pen={penalty:.4f} "
+                f"{idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
                 f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                 f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
                 f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
@@ -3405,7 +3419,7 @@ class EdgeBatchGUI:
                 evaluated.append((score, settings, summary))
                 score_disp = self._score_to_display(score, display_mode)
                 report_lines.append(
-                    f"refine {idx:03d} score={score_disp:.4f} raw={score:.6e} base={score_base:.4f} pen={penalty:.4f} "
+                    f"refine {idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
                     f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                     f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
                     f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
@@ -3479,7 +3493,7 @@ class EdgeBatchGUI:
                     evaluated.append((score, settings, summary))
                     score_disp = self._score_to_display(score, display_mode)
                     report_lines.append(
-                        f"adaptive{round_idx} {idx:03d} score={score_disp:.4f} raw={score:.6e} base={score_base:.4f} pen={penalty:.4f} "
+                        f"adaptive{round_idx} {idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
                         f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
                         f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
                         f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
@@ -4026,14 +4040,14 @@ class EdgeBatchGUI:
             eta_text = f" ETA {self._format_eta(eta_seconds)}" if eta_seconds is not None else ""
             phase_text = f"{phase} " if phase else ""
             self.status_var.set(
-                f"Auto optimizing... ({phase_text}{idx}/{total}) score={score_disp:.4f} "
-                f"best={best_disp:.4f}{eta_text}"
+                f"Auto optimizing... ({phase_text}{idx}/{total}) score={score_disp:.12f} "
+                f"best={best_disp:.12f}{eta_text}"
             )
         elif msg_type == "auto_best":
             best_score, elapsed = msg[1], msg[2]
             best_disp = self._score_to_display(best_score)
             minutes = elapsed / 60.0
-            self._log(f"[AUTO] Best improved to {best_disp:.4f} at {minutes:.1f} min")
+            self._log(f"[AUTO] Best improved to {best_disp:.12f} at {minutes:.1f} min")
         elif msg_type == "auto_done":
             settings, report_path = msg[1], msg[2]
             stop_reason = msg[3] if len(msg) > 3 else None

@@ -16,7 +16,7 @@ Scores are relative and should be updated after each major release.
 | ROI Editor + Cache | 80 | Stable | High usability; needs multi-ROI workflow. |
 | Auto Optimization Search | 74 | Improving | Adaptive search works, still heavy on wide ranges. |
 | Auto Optimization Scoring | 76 | Improving | Expanded metrics, still dataset-sensitive. |
-| Graphing/Visualization | 72 | Improving | Zoom/pan added; more KPI graphs planned. |
+| Graphing/Visualization | 76 | Improving | v19: spacing, thin lines, professional theme; scaled score display. |
 | Synthetic Evaluation Script | 78 | Stable | Includes complex/low-quality cases. |
 | EXE Packaging | 78 | Stable | Automated by CI; manual validation required. |
 

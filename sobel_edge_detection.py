@@ -20,6 +20,9 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image, ImageTk, ImageDraw
 
+# Display scale for small scores so UI shows readable numbers (learning uses raw score only)
+SCORE_DISPLAY_SCALE = 1e15
+
 PARAM_DEFAULTS = {
     "nms_relax": 0.95,
     "low_ratio": 0.04,
@@ -952,7 +955,7 @@ class EdgeBatchGUI:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Sobel Edge Batch Processor")
+        self.root.title("Sobel Edge Batch Processor (ver19)")
         self.root.geometry("1920x1080")
 
         self.detector = SobelEdgeDetector()
@@ -967,7 +970,7 @@ class EdgeBatchGUI:
         self._auto_thread = None
         self.param_vars = self._init_param_vars()
         self.auto_mode = tk.StringVar(value="Fast")
-        self.score_display_mode = tk.StringVar(value="x1e9")
+        self.score_display_mode = tk.StringVar(value="scaled")
         self.log_text = None
         self.score_graph_label = None
         self.best_graph_label = None
@@ -1022,7 +1025,8 @@ class EdgeBatchGUI:
         def _on_frame_configure(event):
             bbox = canvas.bbox("all")
             if bbox:
-                canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], bbox[3] + 40))
+                # Extra bottom margin (~graph height) so full scroll reaches the end
+                canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], bbox[3] + 300))
 
         def _on_canvas_configure(event):
             canvas.itemconfig(canvas_window, width=event.width)
@@ -2140,7 +2144,7 @@ class EdgeBatchGUI:
         ttk.Combobox(
             button_frame,
             textvariable=self.score_display_mode,
-            values=["raw", "log10", "x1e9"],
+            values=["raw", "log10", "scaled"],
             width=7,
             state="readonly",
         ).pack(side=tk.LEFT)
@@ -2173,7 +2177,7 @@ class EdgeBatchGUI:
             return
         bbox = canvas.bbox("all")
         if bbox:
-            canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], bbox[3] + 60))
+            canvas.configure(scrollregion=(bbox[0], bbox[1], bbox[2], bbox[3] + 300))
 
     def _load_roi_cache(self):
         if not os.path.exists(ROI_CACHE_PATH):
@@ -2410,12 +2414,14 @@ class EdgeBatchGUI:
         return f"{minutes:02d}:{secs:02d}"
 
     def _score_to_display(self, value, mode=None):
-        mode = mode or (self.score_display_mode.get() if self.score_display_mode else "raw")
+        """Convert raw score to display value only; learning/optimization always uses raw score."""
+        mode = mode or (self.score_display_mode.get() if self.score_display_mode else "scaled")
+        v = float(value)
         if mode == "log10":
-            return math.log10(max(float(value), 1e-30))
-        if mode == "x1e9":
-            return float(value) * 1e9
-        return float(value)
+            return math.log10(max(v, 1e-30))
+        if mode == "scaled":
+            return v * SCORE_DISPLAY_SCALE
+        return v
 
     def _select_auto_subset(self, files, max_files):
         if max_files >= len(files):
@@ -3586,16 +3592,21 @@ class EdgeBatchGUI:
         return xs, ys
 
     def _render_graph(self, values, title, width=400, height=220):
-        margin = 36
-        img = Image.new("RGB", (width, height), "white")
+        # Professional math/physics style: generous spacing, thin lines, clear axes
+        margin_left = 52
+        margin_right = 24
+        margin_top = 56
+        margin_bottom = 44
+        title_gap = 14
+        img = Image.new("RGB", (width, height), (252, 252, 252))
         draw = ImageDraw.Draw(img)
 
-        left = margin
-        top = margin
-        right = width - margin
-        bottom = height - margin
-        draw.rectangle([left, top, right, bottom], outline="black")
-        draw.text((left, 8), title, fill="black")
+        left = margin_left
+        top = margin_top
+        right = width - margin_right
+        bottom = height - margin_bottom
+        draw.rectangle([left, top, right, bottom], outline=(40, 40, 40), width=1)
+        draw.text((left, title_gap), title, fill=(20, 20, 20))
 
         if not values:
             return img
@@ -3617,36 +3628,46 @@ class EdgeBatchGUI:
         def scale_y(val):
             return bottom - (val - min_val) * (bottom - top) / (max_val - min_val)
 
-        ticks = 4
+        # Light grid
+        ticks = 5
+        for i in range(1, ticks):
+            tx = left + i * (right - left) / ticks
+            draw.line([(tx, top), (tx, bottom)], fill=(230, 230, 230), width=1)
+            ty = bottom - i * (bottom - top) / ticks
+            draw.line([(left, ty), (right, ty)], fill=(230, 230, 230), width=1)
         for i in range(ticks + 1):
             tx = left + i * (right - left) / ticks
             tick_val = int(round(min_x + i * (max_x - min_x) / ticks))
-            draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
-            draw.text((tx - 6, bottom + 6), str(tick_val), fill="black")
+            draw.line([(tx, bottom), (tx, bottom + 5)], fill=(40, 40, 40), width=1)
+            draw.text((tx - 10, bottom + 8), str(tick_val), fill=(30, 30, 30))
 
             ty = bottom - i * (bottom - top) / ticks
             y_val = min_val + i * (max_val - min_val) / ticks
-            draw.line([(left - 4, ty), (left, ty)], fill="black")
-            draw.text((4, ty - 6), f"{y_val:.2f}", fill="black")
+            draw.line([(left - 5, ty), (left, ty)], fill=(40, 40, 40), width=1)
+            draw.text((2, ty - 7), f"{y_val:.2f}", fill=(30, 30, 30))
 
         points = [(scale_x(xval), scale_y(v)) for xval, v in zip(xs, ys)]
         if len(points) >= 2:
-            draw.line(points, fill="blue", width=2)
+            draw.line(points, fill=(0, 80, 160), width=1)
         else:
-            draw.ellipse([points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2], fill="blue")
+            draw.ellipse([points[0][0] - 1, points[0][1] - 1, points[0][0] + 1, points[0][1] + 1], fill=(0, 80, 160))
         return img
 
     def _render_time_graph(self, series, title, width=400, height=220):
-        margin = 36
-        img = Image.new("RGB", (width, height), "white")
+        margin_left = 52
+        margin_right = 24
+        margin_top = 56
+        margin_bottom = 44
+        title_gap = 14
+        img = Image.new("RGB", (width, height), (252, 252, 252))
         draw = ImageDraw.Draw(img)
 
-        left = margin
-        top = margin
-        right = width - margin
-        bottom = height - margin
-        draw.rectangle([left, top, right, bottom], outline="black")
-        draw.text((left, 8), title, fill="black")
+        left = margin_left
+        top = margin_top
+        right = width - margin_right
+        bottom = height - margin_bottom
+        draw.rectangle([left, top, right, bottom], outline=(40, 40, 40), width=1)
+        draw.text((left, title_gap), title, fill=(20, 20, 20))
 
         if not series:
             return img
@@ -3672,36 +3693,46 @@ class EdgeBatchGUI:
         def scale_y(val):
             return bottom - (val - min_y) * (bottom - top) / (max_y - min_y)
 
-        ticks = 4
+        ticks = 5
+        for i in range(1, ticks):
+            tx = left + i * (right - left) / ticks
+            draw.line([(tx, top), (tx, bottom)], fill=(230, 230, 230), width=1)
+            ty = bottom - i * (bottom - top) / ticks
+            draw.line([(left, ty), (right, ty)], fill=(230, 230, 230), width=1)
         for i in range(ticks + 1):
             tx = left + i * (right - left) / ticks
             t_val = min_x + i * (max_x - min_x) / ticks
-            draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
-            draw.text((tx - 6, bottom + 6), f"{t_val/60.0:.1f}", fill="black")
+            draw.line([(tx, bottom), (tx, bottom + 5)], fill=(40, 40, 40), width=1)
+            draw.text((tx - 12, bottom + 8), f"{t_val/60.0:.1f}", fill=(30, 30, 30))
 
             ty = bottom - i * (bottom - top) / ticks
             y_val = min_y + i * (max_y - min_y) / ticks
-            draw.line([(left - 4, ty), (left, ty)], fill="black")
-            draw.text((4, ty - 6), f"{y_val:.2f}", fill="black")
+            draw.line([(left - 5, ty), (left, ty)], fill=(40, 40, 40), width=1)
+            draw.text((2, ty - 7), f"{y_val:.2f}", fill=(30, 30, 30))
 
         points = [(scale_x(t), scale_y(v)) for t, v in series]
         if len(points) >= 2:
-            draw.line(points, fill="blue", width=2)
+            draw.line(points, fill=(0, 80, 160), width=1)
         else:
-            draw.ellipse([points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2], fill="blue")
+            draw.ellipse([points[0][0] - 1, points[0][1] - 1, points[0][0] + 1, points[0][1] + 1], fill=(0, 80, 160))
         return img
 
     def _render_multi_graph(self, series_list, title, labels, colors, width=400, height=220):
-        margin = 36
-        img = Image.new("RGB", (width, height), "white")
+        margin_left = 52
+        margin_right = 24
+        margin_top = 56
+        margin_bottom = 44
+        title_gap = 14
+        legend_gap = 28
+        img = Image.new("RGB", (width, height), (252, 252, 252))
         draw = ImageDraw.Draw(img)
 
-        left = margin
-        top = margin
-        right = width - margin
-        bottom = height - margin
-        draw.rectangle([left, top, right, bottom], outline="black")
-        draw.text((left, 8), title, fill="black")
+        left = margin_left
+        top = margin_top
+        right = width - margin_right
+        bottom = height - margin_bottom
+        draw.rectangle([left, top, right, bottom], outline=(40, 40, 40), width=1)
+        draw.text((left, title_gap), title, fill=(20, 20, 20))
 
         values = [v for series in series_list for v in series]
         if not values:
@@ -3719,17 +3750,22 @@ class EdgeBatchGUI:
         def scale_y(val):
             return bottom - (val - min_y) * (bottom - top) / (max_y - min_y)
 
-        ticks = 4
+        ticks = 5
+        for i in range(1, ticks):
+            tx = left + i * (right - left) / ticks
+            draw.line([(tx, top), (tx, bottom)], fill=(230, 230, 230), width=1)
+            ty = bottom - i * (bottom - top) / ticks
+            draw.line([(left, ty), (right, ty)], fill=(230, 230, 230), width=1)
         for i in range(ticks + 1):
             tx = left + i * (right - left) / ticks
             tick_val = int(round(1 + i * (max_len - 1) / ticks))
-            draw.line([(tx, bottom), (tx, bottom + 4)], fill="black")
-            draw.text((tx - 6, bottom + 6), str(tick_val), fill="black")
+            draw.line([(tx, bottom), (tx, bottom + 5)], fill=(40, 40, 40), width=1)
+            draw.text((tx - 10, bottom + 8), str(tick_val), fill=(30, 30, 30))
 
             ty = bottom - i * (bottom - top) / ticks
             y_val = min_y + i * (max_y - min_y) / ticks
-            draw.line([(left - 4, ty), (left, ty)], fill="black")
-            draw.text((4, ty - 6), f"{y_val:.2f}", fill="black")
+            draw.line([(left - 5, ty), (left, ty)], fill=(40, 40, 40), width=1)
+            draw.text((2, ty - 7), f"{y_val:.2f}", fill=(30, 30, 30))
 
         for series, label, color in zip(series_list, labels, colors):
             if not series:
@@ -3737,19 +3773,19 @@ class EdgeBatchGUI:
             xs, ys = self._downsample_values(series, max_points=700)
             points = [(scale_x(xval, max_len), scale_y(v)) for xval, v in zip(xs, ys)]
             if len(points) >= 2:
-                draw.line(points, fill=color, width=2)
+                draw.line(points, fill=color, width=1)
             else:
                 draw.ellipse(
-                    [points[0][0] - 2, points[0][1] - 2, points[0][0] + 2, points[0][1] + 2],
+                    [points[0][0] - 1, points[0][1] - 1, points[0][0] + 1, points[0][1] + 1],
                     fill=color,
                 )
 
-        legend_y = top - 22
+        legend_y = top - legend_gap
         legend_x = left
         for label, color in zip(labels, colors):
-            draw.rectangle([legend_x, legend_y, legend_x + 12, legend_y + 12], fill=color)
-            draw.text((legend_x + 16, legend_y - 2), label, fill="black")
-            legend_x += 90
+            draw.rectangle([legend_x, legend_y, legend_x + 10, legend_y + 10], fill=color, outline=(60, 60, 60))
+            draw.text((legend_x + 14, legend_y - 2), label, fill=(30, 30, 30))
+            legend_x += 92
 
         return img
 

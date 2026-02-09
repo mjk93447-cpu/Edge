@@ -83,8 +83,13 @@ balanced speed, controllability, and low dependency footprint.
 
 ## 7. Known Limitations
 - GPU acceleration not enabled by default (CPU parallel used).
-- Score values can be extremely small; GUI supports log or scaled display.
+- Score values can be extremely small; GUI shows scaled (×10¹⁵) or log10 by default; optimization always uses raw score.
 - Large auto-config ranges can still cause long optimization runtime.
+
+## 7.1. Version 19 (2026-02-08)
+- Score display: default "scaled" (×10¹⁵) for readable numbers; "log10" and "raw" still available; x1e9 removed. Learning/optimization unchanged.
+- Graphs: increased title/axis spacing, thin lines, light grid, neutral theme for clarity.
+- Full-window scroll: bottom margin added so content scrolls to the end.
 
 ## 8. Suggested Next Steps
 - Optional GPU backend (CuPy/PyTorch) for scoring and evaluation.

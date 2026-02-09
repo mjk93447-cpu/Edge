@@ -2,8 +2,8 @@
 
 ## 1. Document Control
 - Document Title: OLED FCB Edge Detection System
-- Version: 19
-- Date: 2026-02-08
+- Version: 20
+- Date: 2026-02-09
 - Owner: Edge Detection Team
 
 ## 2. Purpose
@@ -71,6 +71,7 @@ Auto optimization -> Candidate generation -> ROI/cluster evaluation -> Apply bes
 - v17: Expanded parameter space and score display scaling
 - v18: Tested in production; score display and graph UX improvements
 - v19: Score display ×10¹⁵ (display only; learning unchanged), log/scaled modes; x1e9 removed; graph styling (spacing, thin lines, professional theme); full-window scroll margin; documentation update
+- v20: **Perfect** auto mode (importance-weighted 2–10× denser grid, ~5× time, coordinate descent; score function unchanged); **raw** score display in exponential notation; same score function and evaluation pipeline
 
 ## Appendix A: Operator Quick Guide
 1. Select images -> set ROI -> run Auto Optimize.

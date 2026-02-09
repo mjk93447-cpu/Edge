@@ -142,6 +142,31 @@ PARAM_KEYS = tuple(PARAM_DEFAULTS.keys())
 AUTO_KEYS = tuple(AUTO_DEFAULTS.keys())
 ROI_CACHE_PATH = os.path.abspath("roi_cache.json")
 
+# Perfect mode: importance-weighted step multipliers (1/N = N× denser grid). Score function unchanged.
+# Based on sensitivity: threshold/NMS/high/low/margin have highest impact on edge quality.
+PERFECT_STEP_MULTIPLIERS = {
+    "nms_relax": 0.2,
+    "high_ratio": 0.2,
+    "low_ratio": 0.25,
+    "polarity_drop_margin": 0.2,
+    "boundary_band_radius": 0.4,
+    "blur_sigma": 0.4,
+    "blur_kernel_size": 0.5,
+    "thinning_max_iter": 0.5,
+    "contrast_ref": 0.5,
+    "min_threshold_scale": 0.5,
+    "magnitude_gamma": 0.5,
+    "median_kernel_size": 0.5,
+    "soft_high_ratio": 0.5,
+    "soft_low_ratio": 0.5,
+    "link_radius": 0.5,
+    "edge_smooth_radius": 0.7,
+    "edge_smooth_iters": 0.7,
+    "spur_prune_iters": 0.7,
+    "closing_radius": 0.7,
+    "closing_iterations": 0.7,
+}
+
 
 def save_json_config(path, payload):
     with open(path, "w", encoding="utf-8") as handle:
@@ -955,7 +980,7 @@ class EdgeBatchGUI:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Sobel Edge Batch Processor (ver19)")
+        self.root.title("Sobel Edge Batch Processor (ver20)")
         self.root.geometry("1920x1080")
 
         self.detector = SobelEdgeDetector()
@@ -2092,7 +2117,7 @@ class EdgeBatchGUI:
         guide_text.insert(
             "1.0",
             "- ROI: Draw a rectangle to focus auto-optimization on the true boundary area.\n"
-            "- Auto Optimize uses the average score across multiple images (Precise mode uses all).\n"
+            "- Auto Optimize: Fast (subset), Precise (all images, refine), Perfect (denser grid, ~5× time, coordinate descent).\n"
             "- NMS relax: Lower reduces gaps, too low can thicken edges or create inner curl.\n"
             "- Low/High ratio: Lower increases recall but can add intrusion/noise.\n"
             "- Boundary band radius: Smaller forces edges to stay on the outer boundary.\n"
@@ -2134,8 +2159,8 @@ class EdgeBatchGUI:
         ttk.Combobox(
             button_frame,
             textvariable=self.auto_mode,
-            values=["Fast", "Precise"],
-            width=6,
+            values=["Fast", "Precise", "Perfect"],
+            width=8,
             state="readonly",
         ).pack(side=tk.LEFT)
         self.auto_button = ttk.Button(button_frame, text="Auto Optimize", command=self._start_auto_optimize)
@@ -2422,6 +2447,18 @@ class EdgeBatchGUI:
         if mode == "scaled":
             return v * SCORE_DISPLAY_SCALE
         return v
+
+    def _format_score_for_display(self, value, mode=None):
+        """Format score for UI/graph labels. Raw mode uses exponential notation for readability."""
+        mode = mode or (self.score_display_mode.get() if self.score_display_mode else "scaled")
+        v = float(value)
+        if mode == "raw":
+            return f"{v:.4e}"
+        if mode == "log10":
+            return f"{math.log10(max(v, 1e-30)):.4f}"
+        if mode == "scaled":
+            return f"{v * SCORE_DISPLAY_SCALE:.4f}"
+        return f"{v:.4e}"
 
     def _select_auto_subset(self, files, max_files):
         if max_files >= len(files):
@@ -2967,10 +3004,14 @@ class EdgeBatchGUI:
                 value = value + 1 if value + 1 <= max_val else value - 1
         return int(value)
 
-    def _build_candidates(self, base_settings, mode, auto_config, count, rng, step_scale=1.0, centers=None):
+    def _build_candidates(self, base_settings, mode, auto_config, count, rng, step_scale=1.0, centers=None, step_multipliers=None):
         candidates = []
         seen = set()
         centers = centers or []
+        mult = step_multipliers or {}
+
+        def step_for(key, default_step):
+            return float(default_step) * mult.get(key, 1.0)
 
         nms_min = min(auto_config["auto_nms_min"], auto_config["auto_nms_max"])
         nms_max = max(auto_config["auto_nms_min"], auto_config["auto_nms_max"])
@@ -3055,13 +3096,13 @@ class EdgeBatchGUI:
             contrast_center = center["contrast_ref"] if center else None
             min_scale_center = center["min_threshold_scale"] if center else None
 
-            nms_relax = self._sample_float(rng, nms_min, nms_max, auto_config["auto_nms_step"], nms_center, step_scale)
-            high_ratio = self._sample_float(rng, high_min, high_max, auto_config["auto_high_step"], high_center, step_scale)
+            nms_relax = self._sample_float(rng, nms_min, nms_max, step_for("nms_relax", auto_config["auto_nms_step"]), nms_center, step_scale)
+            high_ratio = self._sample_float(rng, high_min, high_max, step_for("high_ratio", auto_config["auto_high_step"]), high_center, step_scale)
             low_factor = self._sample_float(
                 rng,
                 low_min,
                 low_max,
-                auto_config["auto_low_factor_step"],
+                step_for("low_ratio", auto_config["auto_low_factor_step"]),
                 low_center,
                 step_scale,
             )
@@ -3069,13 +3110,13 @@ class EdgeBatchGUI:
                 rng, band_min, band_max, 1, band_center, step_scale, odd=False
             )
             margin = self._sample_float(
-                rng, margin_min, margin_max, auto_config["auto_margin_step"], margin_center, step_scale
+                rng, margin_min, margin_max, step_for("polarity_drop_margin", auto_config["auto_margin_step"]), margin_center, step_scale
             )
             blur_sigma = self._sample_float(
                 rng,
                 blur_sigma_min,
                 blur_sigma_max,
-                auto_config["auto_blur_sigma_step"],
+                step_for("blur_sigma", auto_config["auto_blur_sigma_step"]),
                 blur_sigma_center,
                 step_scale,
             )
@@ -3083,7 +3124,7 @@ class EdgeBatchGUI:
                 rng,
                 blur_kernel_min,
                 blur_kernel_max,
-                auto_config["auto_blur_kernel_step"],
+                max(1, int(step_for("blur_kernel_size", auto_config["auto_blur_kernel_step"]))),
                 blur_kernel_center,
                 step_scale,
                 odd=True,
@@ -3092,7 +3133,7 @@ class EdgeBatchGUI:
                 rng,
                 thinning_min,
                 thinning_max,
-                auto_config["auto_thinning_step"],
+                max(1, int(step_for("thinning_max_iter", auto_config["auto_thinning_step"]))),
                 thinning_center,
                 step_scale,
             )
@@ -3100,7 +3141,7 @@ class EdgeBatchGUI:
                 rng,
                 contrast_min,
                 contrast_max,
-                auto_config["auto_contrast_ref_step"],
+                step_for("contrast_ref", auto_config["auto_contrast_ref_step"]),
                 contrast_center,
                 step_scale,
             )
@@ -3108,7 +3149,7 @@ class EdgeBatchGUI:
                 rng,
                 min_scale_min,
                 min_scale_max,
-                auto_config["auto_min_scale_step"],
+                step_for("min_threshold_scale", auto_config["auto_min_scale_step"]),
                 min_scale_center,
                 step_scale,
             )
@@ -3116,7 +3157,7 @@ class EdgeBatchGUI:
                 rng,
                 gamma_min,
                 gamma_max,
-                auto_config["auto_magnitude_gamma_step"],
+                step_for("magnitude_gamma", auto_config["auto_magnitude_gamma_step"]),
                 None,
                 step_scale,
             )
@@ -3124,7 +3165,7 @@ class EdgeBatchGUI:
                 rng,
                 median_min,
                 median_max,
-                auto_config["auto_median_kernel_step"],
+                max(1, int(step_for("median_kernel_size", auto_config["auto_median_kernel_step"]))),
                 None,
                 step_scale,
                 odd=True,
@@ -3134,7 +3175,7 @@ class EdgeBatchGUI:
                 rng,
                 soft_high_min,
                 soft_high_max,
-                auto_config["auto_soft_high_step"],
+                step_for("soft_high_ratio", auto_config["auto_soft_high_step"]),
                 None,
                 step_scale,
             )
@@ -3142,7 +3183,7 @@ class EdgeBatchGUI:
                 rng,
                 soft_low_min,
                 soft_low_max,
-                auto_config["auto_soft_low_factor_step"],
+                step_for("soft_low_ratio", auto_config["auto_soft_low_factor_step"]),
                 None,
                 step_scale,
             )
@@ -3151,7 +3192,7 @@ class EdgeBatchGUI:
                 rng,
                 link_radius_min,
                 link_radius_max,
-                auto_config["auto_link_radius_step"],
+                max(1, int(step_for("link_radius", auto_config["auto_link_radius_step"]))),
                 None,
                 step_scale,
             )
@@ -3255,6 +3296,7 @@ class EdgeBatchGUI:
 
     def _auto_optimize_worker(self, files, base_settings, auto_config, mode, roi_map, display_mode):
         max_files = min(8, len(files)) if mode == "Fast" else len(files)
+        is_perfect = mode == "Perfect"
         data = self._prepare_auto_data(files, base_settings, auto_config, roi_map, max_files)
         data_coarse = data.get("coarse", [])
         data_mid = data.get("mid", [])
@@ -3285,10 +3327,16 @@ class EdgeBatchGUI:
             self._message_queue.put(("auto_done", None, report_path, "no_data"))
             return
         rng = np.random.RandomState(42)
-        target_eval = 3000 if mode == "Fast" else 9000
+        if mode == "Fast":
+            target_eval = 3000
+        elif is_perfect:
+            target_eval = 45000
+        else:
+            target_eval = 9000
         budget = int(target_eval / max(1, len(data_coarse)))
-        budget = max(80, min(budget, 600))
-        candidates = self._build_candidates(base_settings, mode, auto_config, budget, rng, step_scale=1.0)
+        budget = max(80, min(budget, 600)) if not is_perfect else max(400, min(2500, budget))
+        step_mults = PERFECT_STEP_MULTIPLIERS if is_perfect else None
+        candidates = self._build_candidates(base_settings, mode, auto_config, budget, rng, step_scale=1.0, step_multipliers=step_mults)
         report_lines.append(f"[INFO] Coarse candidates: {len(candidates)}")
 
         def wait_if_paused():
@@ -3384,14 +3432,19 @@ class EdgeBatchGUI:
             )
 
         if best and mode != "Fast" and not stop_reason:
-            refine_step = max(auto_config["auto_nms_step"] * 0.5, 0.005)
-            high_step = max(auto_config["auto_high_step"] * 0.5, 0.005)
-            margin_step = max(auto_config["auto_margin_step"] * 0.5, 0.05)
+            refine_factor = 0.2 if is_perfect else 0.5
+            refine_step = max(auto_config["auto_nms_step"] * refine_factor, 0.002 if is_perfect else 0.005)
+            high_step = max(auto_config["auto_high_step"] * refine_factor, 0.002 if is_perfect else 0.005)
+            margin_step = max(auto_config["auto_margin_step"] * refine_factor, 0.02 if is_perfect else 0.05)
+            refine_nms = (-refine_step, 0.0, refine_step) if not is_perfect else (-2*refine_step, -refine_step, 0.0, refine_step, 2*refine_step)
+            refine_high = (-high_step, 0.0, high_step) if not is_perfect else (-2*high_step, -high_step, 0.0, high_step, 2*high_step)
             refine_candidates = []
-            for dnms in (-refine_step, 0.0, refine_step):
-                for dhigh in (-high_step, 0.0, high_step):
-                    for dband in (-1, 0, 1):
-                        for dmargin in (-margin_step, 0.0, margin_step):
+            dband_list = (-1, 0, 1) if not is_perfect else (-2, -1, 0, 1, 2)
+            margin_list = (-margin_step, 0.0, margin_step) if not is_perfect else (-2*margin_step, -margin_step, 0.0, margin_step, 2*margin_step)
+            for dnms in refine_nms:
+                for dhigh in refine_high:
+                    for dband in dband_list:
+                        for dmargin in margin_list:
                             settings = dict(best)
                             settings["nms_relax"] = round(min(1.0, max(0.85, best["nms_relax"] + dnms)), 3)
                             settings["high_ratio"] = max(0.05, best["high_ratio"] + dhigh)
@@ -3399,7 +3452,7 @@ class EdgeBatchGUI:
                                 auto_config["auto_low_factor_min"] + auto_config["auto_low_factor_max"]
                             )
                             settings["low_ratio"] = max(0.02, settings["high_ratio"] * low_factor)
-                            settings["boundary_band_radius"] = max(0, best["boundary_band_radius"] + dband)
+                            settings["boundary_band_radius"] = max(0, min(4, best["boundary_band_radius"] + dband))
                             settings["polarity_drop_margin"] = max(0.0, best["polarity_drop_margin"] + dmargin)
                             settings["use_boundary_band_filter"] = settings["boundary_band_radius"] > 0
                             refine_candidates.append(settings)
@@ -3459,11 +3512,17 @@ class EdgeBatchGUI:
                     )
                 )
         if not stop_reason:
-            adaptive_scales = [0.6, 0.35, 0.2] if mode != "Fast" else [0.6, 0.35]
+            if mode == "Fast":
+                adaptive_scales = [0.6, 0.35]
+            elif is_perfect:
+                adaptive_scales = [0.5, 0.35, 0.2, 0.1, 0.05]
+            else:
+                adaptive_scales = [0.6, 0.35, 0.2]
             for round_idx, scale in enumerate(adaptive_scales, start=1):
                 evaluated_sorted = sorted(evaluated, key=lambda item: item[0], reverse=True)
-                top_settings = [item[1] for item in evaluated_sorted[:8]]
-                adaptive_count = max(40, min(220, int(budget * (0.6 / round_idx))))
+                top_k = 12 if is_perfect else 8
+                top_settings = [item[1] for item in evaluated_sorted[:top_k]]
+                adaptive_count = max(40, min(220, int(budget * (0.6 / round_idx)))) if not is_perfect else max(80, min(400, int(budget * (0.7 / round_idx))))
                 ai_candidates = self._build_candidates(
                     base_settings,
                     mode,
@@ -3472,6 +3531,7 @@ class EdgeBatchGUI:
                     rng,
                     step_scale=scale,
                     centers=top_settings,
+                    step_multipliers=step_mults,
                 )
                 if not ai_candidates:
                     continue
@@ -3535,6 +3595,57 @@ class EdgeBatchGUI:
                 if stop_reason:
                     break
 
+        if best and is_perfect and not stop_reason:
+            report_lines.append("[INFO] Perfect mode: coordinate descent (one-at-a-time local search)")
+            cd_params = [
+                ("nms_relax", 0.002, 0.85, 1.0),
+                ("high_ratio", 0.002, 0.05, 0.25),
+                ("low_ratio", 0.005, 0.02, 0.5),
+                ("boundary_band_radius", 1, 0, 4),
+                ("polarity_drop_margin", 0.02, 0.0, 0.8),
+            ]
+            for param_name, delta, lo, hi in cd_params:
+                if not wait_if_paused() or check_stagnation():
+                    break
+                current = best.get(param_name)
+                if current is None:
+                    continue
+                is_int = isinstance(current, (int, np.integer))
+                deltas = [-2*delta, -delta, 0, delta, 2*delta] if not is_int else [-2*max(1,int(delta)), -max(1,int(delta)), 0, max(1,int(delta)), 2*max(1,int(delta))]
+                for d in deltas:
+                    s = dict(best)
+                    if is_int:
+                        s[param_name] = int(max(lo, min(hi, current + d)))
+                    else:
+                        s[param_name] = round(max(lo, min(hi, current + d)), 4 if param_name == "polarity_drop_margin" else 3)
+                    if param_name == "high_ratio" and "high_ratio" in s:
+                        s["low_ratio"] = max(0.02, s["high_ratio"] * 0.35)
+                    if param_name == "boundary_band_radius":
+                        s["use_boundary_band_filter"] = s["boundary_band_radius"] > 0
+                    key = key_from(s)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    score, summary, qualities = self._evaluate_settings(data_full, s, auto_config)
+                    processed += 1
+                    elapsed = time.time() - start_time
+                    evaluated.append((score, s, summary))
+                    score_disp = self._score_to_display(score, display_mode)
+                    report_lines.append(
+                        f"cd_{param_name} score={self._format_score_for_display(score, display_mode)} raw={score:.12e} {param_name}={s[param_name]}"
+                    )
+                    scores.append(score)
+                    if score > best_score:
+                        best_score = score
+                        best = s
+                        last_best_time = time.time()
+                        self._message_queue.put(("auto_best", best_score, elapsed))
+                    best_progress.append(best_score)
+                    self._auto_best_time_series.append((elapsed, best_score))
+                    self._message_queue.put(
+                        ("auto_progress", processed, processed, score, best_score, 0.0, "coord_descent", elapsed, summary, qualities, qualities["q_cont"]*qualities["q_band"], max(0, 1.0-score))
+                    )
+
         if stop_reason:
             report_lines.append(f"[STOP] Optimization ended: {stop_reason}")
 
@@ -3591,7 +3702,8 @@ class EdgeBatchGUI:
             ys.append(avg)
         return xs, ys
 
-    def _render_graph(self, values, title, width=400, height=220):
+    def _render_graph(self, values, title, width=400, height=220, display_mode=None):
+        display_mode = display_mode or (self.score_display_mode.get() if self.score_display_mode else "scaled")
         # Professional math/physics style: generous spacing, thin lines, clear axes
         margin_left = 52
         margin_right = 24
@@ -3628,6 +3740,9 @@ class EdgeBatchGUI:
         def scale_y(val):
             return bottom - (val - min_val) * (bottom - top) / (max_val - min_val)
 
+        def fmt_y(val):
+            return self._format_score_for_display(val, display_mode) if display_mode == "raw" else f"{val:.2f}"
+
         # Light grid
         ticks = 5
         for i in range(1, ticks):
@@ -3644,7 +3759,7 @@ class EdgeBatchGUI:
             ty = bottom - i * (bottom - top) / ticks
             y_val = min_val + i * (max_val - min_val) / ticks
             draw.line([(left - 5, ty), (left, ty)], fill=(40, 40, 40), width=1)
-            draw.text((2, ty - 7), f"{y_val:.2f}", fill=(30, 30, 30))
+            draw.text((2, ty - 7), fmt_y(y_val), fill=(30, 30, 30))
 
         points = [(scale_x(xval), scale_y(v)) for xval, v in zip(xs, ys)]
         if len(points) >= 2:
@@ -3653,7 +3768,8 @@ class EdgeBatchGUI:
             draw.ellipse([points[0][0] - 1, points[0][1] - 1, points[0][0] + 1, points[0][1] + 1], fill=(0, 80, 160))
         return img
 
-    def _render_time_graph(self, series, title, width=400, height=220):
+    def _render_time_graph(self, series, title, width=400, height=220, display_mode=None):
+        display_mode = display_mode or (self.score_display_mode.get() if self.score_display_mode else "scaled")
         margin_left = 52
         margin_right = 24
         margin_top = 56
@@ -3708,7 +3824,8 @@ class EdgeBatchGUI:
             ty = bottom - i * (bottom - top) / ticks
             y_val = min_y + i * (max_y - min_y) / ticks
             draw.line([(left - 5, ty), (left, ty)], fill=(40, 40, 40), width=1)
-            draw.text((2, ty - 7), f"{y_val:.2f}", fill=(30, 30, 30))
+            y_str = self._format_score_for_display(y_val, display_mode) if display_mode == "raw" else f"{y_val:.2f}"
+            draw.text((2, ty - 7), y_str, fill=(30, 30, 30))
 
         points = [(scale_x(t), scale_y(v)) for t, v in series]
         if len(points) >= 2:
@@ -3717,7 +3834,8 @@ class EdgeBatchGUI:
             draw.ellipse([points[0][0] - 1, points[0][1] - 1, points[0][0] + 1, points[0][1] + 1], fill=(0, 80, 160))
         return img
 
-    def _render_multi_graph(self, series_list, title, labels, colors, width=400, height=220):
+    def _render_multi_graph(self, series_list, title, labels, colors, width=400, height=220, display_mode=None):
+        display_mode = display_mode or (self.score_display_mode.get() if self.score_display_mode else "scaled")
         margin_left = 52
         margin_right = 24
         margin_top = 56
@@ -3765,7 +3883,8 @@ class EdgeBatchGUI:
             ty = bottom - i * (bottom - top) / ticks
             y_val = min_y + i * (max_y - min_y) / ticks
             draw.line([(left - 5, ty), (left, ty)], fill=(40, 40, 40), width=1)
-            draw.text((2, ty - 7), f"{y_val:.2f}", fill=(30, 30, 30))
+            y_str = self._format_score_for_display(y_val, display_mode) if display_mode == "raw" else f"{y_val:.2f}"
+            draw.text((2, ty - 7), y_str, fill=(30, 30, 30))
 
         for series, label, color in zip(series_list, labels, colors):
             if not series:
@@ -4075,15 +4194,17 @@ class EdgeBatchGUI:
             self._refresh_auto_graphs()
             eta_text = f" ETA {self._format_eta(eta_seconds)}" if eta_seconds is not None else ""
             phase_text = f"{phase} " if phase else ""
+            score_str = self._format_score_for_display(score, None)
+            best_str = self._format_score_for_display(best_score, None)
             self.status_var.set(
-                f"Auto optimizing... ({phase_text}{idx}/{total}) score={score_disp:.12f} "
-                f"best={best_disp:.12f}{eta_text}"
+                f"Auto optimizing... ({phase_text}{idx}/{total}) score={score_str} "
+                f"best={best_str}{eta_text}"
             )
         elif msg_type == "auto_best":
             best_score, elapsed = msg[1], msg[2]
-            best_disp = self._score_to_display(best_score)
+            best_str = self._format_score_for_display(best_score, None)
             minutes = elapsed / 60.0
-            self._log(f"[AUTO] Best improved to {best_disp:.12f} at {minutes:.1f} min")
+            self._log(f"[AUTO] Best improved to {best_str} at {minutes:.1f} min")
         elif msg_type == "auto_done":
             settings, report_path = msg[1], msg[2]
             stop_reason = msg[3] if len(msg) > 3 else None

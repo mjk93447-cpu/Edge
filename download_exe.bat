@@ -1,13 +1,14 @@
 @echo off
 chcp 65001 >nul
 setlocal
-:: Edge Batch GUI - GitHub에서 EXE 다운로드 (ver19)
+
+:: Edge Batch GUI - GitHub Releases에서 EXE 다운로드 (ver20)
 :: 사용: download_exe.bat [버전]
-:: 예: download_exe.bat        → v19 다운로드
-:: 예: download_exe.bat v19    → v19 다운로드
+:: 예: download_exe.bat      → v20 다운로드
+:: 예: download_exe.bat v20  → v20 다운로드
 
 set "VER=%~1"
-if "%VER%"=="" set "VER=v19"
+if "%VER%"=="" set "VER=v20"
 
 set "URL=https://github.com/mjk93447-cpu/Edge/releases/download/%VER%/edge_batch_gui.exe"
 set "OUT=%~dp0edge_batch_gui.exe"
@@ -31,7 +32,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
 if %ERRORLEVEL% neq 0 (
   echo.
   echo ※ GitHub에서 태그 %VER% 로 릴리스가 생성되어 있어야 합니다.
-  echo   저장소: https://github.com/mjk93447-cpu/Edge/releases
+  echo   https://github.com/mjk93447-cpu/Edge/releases
   pause
   exit /b 1
 )

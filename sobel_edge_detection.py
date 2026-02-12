@@ -134,6 +134,8 @@ AUTO_DEFAULTS = {
     "weight_low_quality": 0.5,
     "early_stop_enabled": True,
     "early_stop_minutes": 10.0,
+    "auto_round_early_exit_no_improve_frac": 0.25,
+    "auto_no_improve_rounds_stop": 2,
     "auto_parallel": True,
     "auto_workers": max(1, (os.cpu_count() or 4) - 1),
 }
@@ -1708,7 +1710,13 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=9, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W continuity").grid(row=10, column=0, sticky="w")
+        ttk.Button(
+            auto_frame,
+            text="Score Variables Help",
+            command=self._show_score_help,
+            width=18,
+        ).grid(row=10, column=0, columnspan=2, sticky="w", padx=(0, 12))
+        ttk.Label(auto_frame, text="W continuity").grid(row=10, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1.0,
@@ -1716,9 +1724,9 @@ class EdgeBatchGUI:
             increment=0.2,
             textvariable=self.param_vars["weight_continuity"],
             width=6,
-        ).grid(row=10, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=10, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W band fit").grid(row=10, column=2, sticky="w")
+        ttk.Label(auto_frame, text="W band fit").grid(row=10, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1.0,
@@ -1726,9 +1734,9 @@ class EdgeBatchGUI:
             increment=0.2,
             textvariable=self.param_vars["weight_band_fit"],
             width=6,
-        ).grid(row=10, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=10, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W coverage").grid(row=10, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W coverage").grid(row=11, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1736,9 +1744,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_coverage"],
             width=6,
-        ).grid(row=10, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W gap").grid(row=11, column=0, sticky="w")
+        ttk.Label(auto_frame, text="W gap").grid(row=11, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1746,9 +1754,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_gap"],
             width=6,
-        ).grid(row=11, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W outside").grid(row=11, column=2, sticky="w")
+        ttk.Label(auto_frame, text="W outside").grid(row=11, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1756,9 +1764,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_outside"],
             width=6,
-        ).grid(row=11, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W thickness").grid(row=11, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W thickness").grid(row=12, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
@@ -1766,9 +1774,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_thickness"],
             width=6,
-        ).grid(row=11, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=12, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W intrusion").grid(row=12, column=0, sticky="w")
+        ttk.Label(auto_frame, text="W intrusion").grid(row=12, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1776,9 +1784,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_intrusion"],
             width=6,
-        ).grid(row=12, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=12, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W low quality").grid(row=12, column=2, sticky="w")
+        ttk.Label(auto_frame, text="W low quality").grid(row=12, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
@@ -1786,9 +1794,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_low_quality"],
             width=6,
-        ).grid(row=12, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=12, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W endpoints").grid(row=12, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W endpoints").grid(row=13, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1796,13 +1804,13 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_endpoints"],
             width=6,
-        ).grid(row=12, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=13, column=1, sticky="w", padx=(4, 12))
 
         ttk.Checkbutton(
             auto_frame,
             text="Early stop on stagnation (min)",
             variable=self.param_vars["early_stop_enabled"],
-        ).grid(row=13, column=0, sticky="w")
+        ).grid(row=13, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1,
@@ -1810,9 +1818,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["early_stop_minutes"],
             width=6,
-        ).grid(row=13, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=13, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W wrinkle").grid(row=13, column=2, sticky="w")
+        ttk.Label(auto_frame, text="W wrinkle").grid(row=13, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1820,9 +1828,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_wrinkle"],
             width=6,
-        ).grid(row=13, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=13, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W branch").grid(row=13, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W branch").grid(row=14, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1830,9 +1838,30 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_branch"],
             width=6,
-        ).grid(row=13, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=14, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft link prob").grid(row=14, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Round early exit %").grid(row=14, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.05,
+            to=0.5,
+            increment=0.05,
+            textvariable=self.param_vars["auto_round_early_exit_no_improve_frac"],
+            width=6,
+            format="%.2f",
+        ).grid(row=14, column=3, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="No-improve rounds stop").grid(row=14, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=1,
+            to=10,
+            increment=1,
+            textvariable=self.param_vars["auto_no_improve_rounds_stop"],
+            width=6,
+        ).grid(row=14, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Soft link prob").grid(row=15, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
@@ -1840,9 +1869,9 @@ class EdgeBatchGUI:
             increment=0.05,
             textvariable=self.param_vars["auto_soft_link_prob"],
             width=6,
-        ).grid(row=14, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=15, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft high min").grid(row=14, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Soft high min").grid(row=15, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.04,
@@ -1850,9 +1879,9 @@ class EdgeBatchGUI:
             increment=0.01,
             textvariable=self.param_vars["auto_soft_high_min"],
             width=6,
-        ).grid(row=14, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=15, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft high max").grid(row=14, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Soft high max").grid(row=15, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.04,
@@ -1860,9 +1889,9 @@ class EdgeBatchGUI:
             increment=0.01,
             textvariable=self.param_vars["auto_soft_high_max"],
             width=6,
-        ).grid(row=14, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=15, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft high step").grid(row=15, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Soft high step").grid(row=16, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.005,
@@ -1872,7 +1901,7 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=15, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft low factor min").grid(row=15, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Soft low factor min").grid(row=16, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.1,
@@ -1880,9 +1909,9 @@ class EdgeBatchGUI:
             increment=0.05,
             textvariable=self.param_vars["auto_soft_low_factor_min"],
             width=6,
-        ).grid(row=15, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=16, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft low factor max").grid(row=15, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Soft low factor max").grid(row=16, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.1,
@@ -1890,9 +1919,9 @@ class EdgeBatchGUI:
             increment=0.05,
             textvariable=self.param_vars["auto_soft_low_factor_max"],
             width=6,
-        ).grid(row=15, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=16, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft low factor step").grid(row=16, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Soft low factor step").grid(row=17, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.01,
@@ -1900,9 +1929,9 @@ class EdgeBatchGUI:
             increment=0.01,
             textvariable=self.param_vars["auto_soft_low_factor_step"],
             width=6,
-        ).grid(row=16, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=17, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Link radius min").grid(row=16, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Link radius min").grid(row=17, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1,
@@ -1910,9 +1939,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_link_radius_min"],
             width=6,
-        ).grid(row=16, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=17, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Link radius max").grid(row=16, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Link radius max").grid(row=17, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1,
@@ -1920,9 +1949,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_link_radius_max"],
             width=6,
-        ).grid(row=16, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=17, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Edge smooth prob").grid(row=17, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Edge smooth prob").grid(row=18, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
@@ -1932,7 +1961,7 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=17, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Smooth radius min").grid(row=17, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Smooth radius min").grid(row=18, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0,
@@ -1940,9 +1969,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_edge_smooth_radius_min"],
             width=6,
-        ).grid(row=17, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=18, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Smooth radius max").grid(row=17, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Smooth radius max").grid(row=18, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0,
@@ -1950,7 +1979,7 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_edge_smooth_radius_max"],
             width=6,
-        ).grid(row=17, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=18, column=5, sticky="w", padx=(4, 12))
 
         ttk.Label(auto_frame, text="Smooth iters min").grid(row=18, column=0, sticky="w")
         ttk.Spinbox(
@@ -2002,7 +2031,7 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=19, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Closing radius min").grid(row=19, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Closing radius min").grid(row=20, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0,
@@ -2010,9 +2039,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_closing_radius_min"],
             width=6,
-        ).grid(row=19, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=20, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Closing radius max").grid(row=20, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Closing radius max").grid(row=21, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0,
@@ -2020,9 +2049,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_closing_radius_max"],
             width=6,
-        ).grid(row=20, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=21, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Closing iters min").grid(row=20, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Closing iters min").grid(row=21, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1,
@@ -2030,9 +2059,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_closing_iter_min"],
             width=6,
-        ).grid(row=20, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=21, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Closing iters max").grid(row=20, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Closing iters max").grid(row=21, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1,
@@ -2040,9 +2069,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_closing_iter_max"],
             width=6,
-        ).grid(row=20, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=21, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Gamma min").grid(row=21, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Gamma min").grid(row=22, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.6,
@@ -2050,9 +2079,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["auto_magnitude_gamma_min"],
             width=6,
-        ).grid(row=21, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=22, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Gamma max").grid(row=21, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Gamma max").grid(row=22, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.6,
@@ -2060,9 +2089,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["auto_magnitude_gamma_max"],
             width=6,
-        ).grid(row=21, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=22, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Gamma step").grid(row=21, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Gamma step").grid(row=22, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.05,
@@ -2070,9 +2099,9 @@ class EdgeBatchGUI:
             increment=0.05,
             textvariable=self.param_vars["auto_magnitude_gamma_step"],
             width=6,
-        ).grid(row=21, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=22, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Median kernel min").grid(row=22, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Median kernel min").grid(row=23, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=3,
@@ -2082,7 +2111,7 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=22, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Median kernel max").grid(row=22, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Median kernel max").grid(row=23, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=3,
@@ -2090,9 +2119,9 @@ class EdgeBatchGUI:
             increment=2,
             textvariable=self.param_vars["auto_median_kernel_max"],
             width=6,
-        ).grid(row=22, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=23, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Median kernel step").grid(row=22, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Median kernel step").grid(row=23, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=2,
@@ -2100,10 +2129,10 @@ class EdgeBatchGUI:
             increment=2,
             textvariable=self.param_vars["auto_median_kernel_step"],
             width=6,
-        ).grid(row=22, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=23, column=5, sticky="w", padx=(4, 12))
 
         auto_btn_frame = ttk.Frame(auto_frame)
-        auto_btn_frame.grid(row=23, column=0, columnspan=6, sticky="w", pady=(4, 0))
+        auto_btn_frame.grid(row=24, column=0, columnspan=6, sticky="w", pady=(4, 0))
         ttk.Button(auto_btn_frame, text="Save Auto Config", command=self._save_auto_config).pack(side=tk.LEFT, padx=4)
         ttk.Button(auto_btn_frame, text="Load Auto Config", command=self._load_auto_config).pack(side=tk.LEFT, padx=4)
 
@@ -2728,6 +2757,113 @@ class EdgeBatchGUI:
             self.auto_score_label.config(text=f"Auto best score: {txt}")
         else:
             self.auto_score_label.config(text="Auto best score: —")
+
+    def _show_score_help(self):
+        help_window = tk.Toplevel(self.root)
+        help_window.title("Score Variables Help")
+        help_window.geometry("700x600")
+        help_window.transient(self.root)
+        help_window.grab_set()
+
+        text_frame = ttk.Frame(help_window, padding=12)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(text_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, yscrollcommand=scrollbar.set, padx=8, pady=8, font=("Arial", 10))
+        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=text_widget.yview)
+
+        help_text = """Score Variables Explanation
+
+The final score is computed from multiple quality metrics. Each metric is converted to a quality value (0-1) using sigmoid functions, then weighted and combined.
+
+MAIN METRICS (High Weight):
+
+1. Continuity (weight_continuity, default: 24.0)
+   - Measures how continuous the detected edge is
+   - Lower continuity value = better (fewer gaps)
+   - Target: < 0.12 (sigmoid threshold)
+   - Most important metric for edge quality
+
+2. Band Fit (weight_band_fit, default: 12.0)
+   - Ratio of edge pixels within the boundary band
+   - Higher band_ratio = better (more pixels in band)
+   - Target: > 0.85 (sigmoid threshold)
+   - Second most important metric
+
+SECONDARY METRICS (Medium Weight):
+
+3. Coverage (weight_coverage, default: 1.0)
+   - Fraction of boundary band covered by edge
+   - Higher coverage = better
+   - Target: > 0.85
+
+4. Gap Ratio (weight_gap, default: 1.0)
+   - Ratio of gaps in the edge
+   - Lower gap_ratio = better
+   - Target: < 0.18
+
+5. Outside Ratio (weight_outside, default: 1.0)
+   - Ratio of edge pixels outside the boundary band
+   - Lower outside = better
+   - Target: < 0.05
+
+6. Thickness (weight_thickness, default: 1.2)
+   - Average thickness of the edge
+   - Lower thickness = better (thinner edge)
+   - Target: < 0.15
+
+7. Intrusion (weight_intrusion, default: 1.0)
+   - Ratio of edge pixels intruding into interior
+   - Lower intrusion = better
+   - Target: < 0.03
+
+8. Endpoints (weight_endpoints, default: 1.0)
+   - Ratio of endpoint pixels (degree 1)
+   - Lower endpoint_ratio = better (fewer endpoints)
+   - Target: < 0.05
+
+9. Wrinkle (weight_wrinkle, default: 1.0)
+   - Ratio of pixels that differ after smoothing
+   - Lower wrinkle_ratio = better (smoother edge)
+   - Target: < 0.20
+
+10. Branch (weight_branch, default: 2.0)
+    - Ratio of branch pixels (degree >= 3)
+    - Lower branch_ratio = better (fewer branches)
+    - Target: < 0.08
+    - Currently weighted 2x for importance
+
+PENALTY FACTORS:
+
+11. Low Quality (weight_low_quality, default: 0.5)
+    - Multiplicative penalty for low quality regions
+    - Applied as: score *= (1.0 + weight_low_quality)
+
+12. Endpoint/Wrinkle/Branch Penalty
+    - Exponential penalty: exp(-2.5 * (endpoint + wrinkle + branch))
+    - Applied automatically regardless of weights
+
+SCORING FORMULA:
+- Each metric qi is converted to quality (0-1) via sigmoid
+- Weighted geometric mean: score = exp(Σ(wi/W) * log(qi))
+- Then multiplied by exponential penalty
+- Final score clamped to [0, 1]
+
+ADJUSTING WEIGHTS:
+- Increase weight to emphasize that metric more
+- Decrease weight to reduce its influence
+- Main metrics (continuity, band_fit) have highest defaults
+- Branch is currently 2x weighted for importance
+"""
+        text_widget.insert("1.0", help_text)
+        text_widget.config(state=tk.DISABLED)
+
+        button_frame = ttk.Frame(help_window)
+        button_frame.pack(fill=tk.X, padx=12, pady=8)
+        ttk.Button(button_frame, text="Close", command=help_window.destroy).pack(side=tk.RIGHT)
 
     def _compute_boundary(self, mask):
         padded = np.pad(mask, 1, mode="edge")
@@ -3360,6 +3496,8 @@ class EdgeBatchGUI:
         last_best_time = start_time
         early_stop_enabled = bool(auto_config.get("early_stop_enabled", True))
         early_stop_minutes = float(auto_config.get("early_stop_minutes", 10.0))
+        round_early_exit_frac = float(auto_config.get("auto_round_early_exit_no_improve_frac", 0.25))
+        no_improve_rounds_stop = int(auto_config.get("auto_no_improve_rounds_stop", 2))
         processed = 0
 
         if not data_full:
@@ -3454,15 +3592,15 @@ class EdgeBatchGUI:
                         break
             if not pool:
                 no_improve_rounds += 1
-                if no_improve_rounds >= 2:
-                    stop_reason = "no_new_candidates_2_rounds"
+                if no_improve_rounds >= no_improve_rounds_stop:
+                    stop_reason = f"no_new_candidates_{no_improve_rounds_stop}_rounds"
                     break
                 report_lines.append(f"[INFO] Round {round_num}: no new candidates, best={best_score:.6e}")
                 continue
             round_improved = False
-            early_exit_after = max(8, int(0.25 * len(pool)))
+            early_exit_after = max(8, int(round_early_exit_frac * len(pool)))
             no_improve_count = 0
-            report_lines.append(f"[INFO] Round {round_num} pool={len(pool)} (explore+exploit+local)")
+            report_lines.append(f"[INFO] Round {round_num} pool={len(pool)} (explore+exploit+local), early_exit_after={early_exit_after} ({round_early_exit_frac*100:.0f}%)")
 
             for idx, settings in enumerate(pool):
                 if processed >= target_eval:
@@ -3528,12 +3666,12 @@ class EdgeBatchGUI:
 
             if not round_improved:
                 no_improve_rounds += 1
-                if no_improve_rounds >= 2:
-                    stop_reason = "no_improve_2_rounds"
+                if no_improve_rounds >= no_improve_rounds_stop:
+                    stop_reason = f"no_improve_{no_improve_rounds_stop}_rounds"
                     break
             else:
                 no_improve_rounds = 0
-            report_lines.append(f"[INFO] Round {round_num} done best={best_score:.6e} processed={processed}")
+            report_lines.append(f"[INFO] Round {round_num} done best={best_score:.6e} processed={processed} no_improve_rounds={no_improve_rounds}/{no_improve_rounds_stop}")
 
         if stop_reason:
             report_lines.append(f"[STOP] Optimization ended: {stop_reason}")

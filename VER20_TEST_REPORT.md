@@ -13,8 +13,8 @@
     - Adaptive 단계: 5라운드 (scale 0.5→0.05), top-12 중심, step_multipliers 유지.
     - **Coordinate descent**: Perfect 전용. nms_relax, high_ratio, low_ratio, boundary_band_radius, polarity_drop_margin에 대해 한 번에 한 파라미터만 소폭 변화시켜 국소 최적화 (one-at-a-time local search).
 - **UI**: Auto mode 콤보에 "Perfect" 추가.
-
-### 1.2 Score display — raw 지수 형태
+[
+### 1.2 Score display — raw 지수 형태]
 - **목적**: raw 화면에서 숫자가 너무 작아 정확한 결과를 보기 어려운 문제 해결.
 - **구현**:
   - `_format_score_for_display(value, mode)`: raw일 때 `f"{value:.4e}"` 형태로 문자열 반환.

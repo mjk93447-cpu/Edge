@@ -215,21 +215,19 @@ def compute_auto_score(metrics, weights, return_details=False):
     q_wrinkle = sigmoid((0.20 - wrinkle_ratio) / 0.06)
     q_branch = sigmoid((0.08 - branch_ratio) / 0.04)
 
-    score = (
-        (q_cont ** w_cont)
-        * (q_band ** w_band)
-        * (q_cov ** w_cov)
-        * (q_gap ** w_gap)
-        * (q_thick ** w_thick)
-        * (q_intr ** w_intr)
-        * (q_out ** w_out)
-        * (q_end ** w_end)
-        * (q_wrinkle ** w_wrinkle)
-        * (q_branch ** w_branch)
-    )
+    weights_list = [w_cont, w_band, w_cov, w_gap, w_thick, w_intr, w_out, w_end, w_wrinkle, w_branch]
+    q_list = [q_cont, q_band, q_cov, q_gap, q_thick, q_intr, q_out, q_end, q_wrinkle, q_branch]
+    total_w = sum(weights_list)
+    weighted_sum = sum(wi * qi for wi, qi in zip(weights_list, q_list)) / max(total_w, 1e-9)
+    weighted_sum = max(0.0, min(1.0, weighted_sum))
+    prod_term = 1.0
+    for qi, wi in zip(q_list, weights_list):
+        prod_term *= (qi + 1e-12) ** (wi / max(total_w, 1e-9))
+    blend = 0.5
+    score = blend * weighted_sum + (1.0 - blend) * prod_term
     exp_penalty = math.exp(-2.5 * (endpoint_ratio + wrinkle_ratio + branch_ratio))
     score *= exp_penalty
-    score = max(0.0, score)
+    score = max(0.0, min(1.0, score))
     if return_details:
         return score, {
             "q_cont": q_cont,
@@ -987,7 +985,7 @@ class EdgeBatchGUI:
         self.selected_files = []
         self.roi_map = {}
         self.roi_cache = self._load_roi_cache()
-        self.max_files = 100
+        self.max_files = 500
         self.output_root = os.path.abspath("outputs")
 
         self._message_queue = queue.Queue()
@@ -1013,6 +1011,7 @@ class EdgeBatchGUI:
         self.score_display_mode.trace_add("write", lambda *_: self._refresh_auto_graphs())
         self._auto_start_time = None
         self._auto_last_best_time = None
+        self._last_auto_best_score = None
         self._auto_pause_event = threading.Event()
         self._auto_stop_event = threading.Event()
         self.pause_button = None
@@ -1070,7 +1069,7 @@ class EdgeBatchGUI:
 
         header = ttk.Label(
             main_frame,
-            text="Select up to 100 images and process sequentially.",
+            text="Select up to 500 images and process sequentially.",
             font=("Arial", 12, "bold"),
         )
         header.pack(anchor="w")
@@ -2110,6 +2109,8 @@ class EdgeBatchGUI:
         param_btn_frame.grid(row=9, column=0, columnspan=8, sticky="w", pady=(4, 0))
         ttk.Button(param_btn_frame, text="Save Params", command=self._save_param_config).pack(side=tk.LEFT, padx=4)
         ttk.Button(param_btn_frame, text="Load Params", command=self._load_param_config).pack(side=tk.LEFT, padx=4)
+        self.auto_score_label = ttk.Label(param_frame, text="Auto best score: —")
+        self.auto_score_label.grid(row=10, column=0, columnspan=8, sticky="w", pady=(2, 0))
 
         guide_frame = ttk.LabelFrame(main_frame, text="Tuning Guide")
         guide_frame.pack(fill=tk.X, pady=(6, 6))
@@ -2716,6 +2717,15 @@ class EdgeBatchGUI:
         for key, var in self.param_vars.items():
             if key in settings:
                 var.set(settings[key])
+
+    def _update_auto_score_label(self):
+        if getattr(self, "auto_score_label", None) is None:
+            return
+        if self._last_auto_best_score is not None:
+            txt = self._format_score_for_display(self._last_auto_best_score, None)
+            self.auto_score_label.config(text=f"Auto best score: {txt}")
+        else:
+            self.auto_score_label.config(text="Auto best score: —")
 
     def _compute_boundary(self, mask):
         padded = np.pad(mask, 1, mode="edge")
@@ -3521,7 +3531,15 @@ class EdgeBatchGUI:
             for round_idx, scale in enumerate(adaptive_scales, start=1):
                 evaluated_sorted = sorted(evaluated, key=lambda item: item[0], reverse=True)
                 top_k = 12 if is_perfect else 8
-                top_settings = [item[1] for item in evaluated_sorted[:top_k]]
+                best_key = key_from(best) if best else None
+                top_settings = [best] if best else []
+                for item in evaluated_sorted[:top_k]:
+                    if item[1] is not best and key_from(item[1]) != best_key:
+                        top_settings.append(item[1])
+                        if len(top_settings) >= top_k:
+                            break
+                if not top_settings and evaluated_sorted:
+                    top_settings = [item[1] for item in evaluated_sorted[:top_k]]
                 adaptive_count = max(40, min(220, int(budget * (0.6 / round_idx)))) if not is_perfect else max(80, min(400, int(budget * (0.7 / round_idx))))
                 ai_candidates = self._build_candidates(
                     base_settings,
@@ -3649,6 +3667,15 @@ class EdgeBatchGUI:
         if stop_reason:
             report_lines.append(f"[STOP] Optimization ended: {stop_reason}")
 
+        if best is not None:
+            report_lines.append("")
+            report_lines.append("[BEST] Parameters and score at end of optimization:")
+            report_lines.append(f"  best_score (raw) = {best_score:.12e}")
+            report_lines.append(f"  best_score (display) = {self._format_score_for_display(best_score, display_mode)}")
+            report_lines.append("  nms_relax=%s high_ratio=%s low_ratio=%s boundary_band_radius=%s polarity_drop_margin=%s" % (
+                best.get("nms_relax"), best.get("high_ratio"), best.get("low_ratio"),
+                best.get("boundary_band_radius"), best.get("polarity_drop_margin")))
+
         report_dir = self._create_batch_output_dir()
         report_path = os.path.join(report_dir, "auto_optimize_report.txt")
         with open(report_path, "w", encoding="utf-8") as handle:
@@ -3673,13 +3700,13 @@ class EdgeBatchGUI:
         config_path = os.path.join(report_dir, "auto_optimize_config.json")
         with open(config_path, "w", encoding="utf-8") as handle:
             json.dump(
-                {"best": best, "auto_config": auto_config, "base_settings": base_settings},
+                {"best": best, "best_score": best_score, "auto_config": auto_config, "base_settings": base_settings},
                 handle,
                 ensure_ascii=True,
                 indent=2,
             )
 
-        self._message_queue.put(("auto_done", best, report_path, stop_reason))
+        self._message_queue.put(("auto_done", best, report_path, stop_reason, best_score))
 
     def _downsample_values(self, values, max_points=600):
         if not values:
@@ -4057,7 +4084,7 @@ class EdgeBatchGUI:
 
     def _add_files(self):
         files = filedialog.askopenfilenames(
-            title="Select image files (up to 100)",
+            title="Select image files (up to 500)",
             filetypes=[
                 ("Image Files", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff"),
                 ("All Files", "*.*"),
@@ -4068,7 +4095,7 @@ class EdgeBatchGUI:
 
         remaining = self.max_files - len(self.selected_files)
         if remaining <= 0:
-            messagebox.showwarning("Limit Reached", "You already selected 100 files.")
+            messagebox.showwarning("Limit Reached", "You already selected 500 files.")
             return
 
         files = list(files)
@@ -4208,6 +4235,10 @@ class EdgeBatchGUI:
         elif msg_type == "auto_done":
             settings, report_path = msg[1], msg[2]
             stop_reason = msg[3] if len(msg) > 3 else None
+            best_score = msg[4] if len(msg) > 4 else None
+            if best_score is not None:
+                self._last_auto_best_score = best_score
+                self._update_auto_score_label()
             if settings:
                 self._apply_settings(settings)
             if stop_reason:

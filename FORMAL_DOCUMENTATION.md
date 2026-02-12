@@ -71,7 +71,8 @@ Auto optimization -> Candidate generation -> ROI/cluster evaluation -> Apply bes
 - v17: Expanded parameter space and score display scaling
 - v18: Tested in production; score display and graph UX improvements
 - v19: Score display ×10¹⁵ (display only; learning unchanged), log/scaled modes; x1e9 removed; graph styling (spacing, thin lines, professional theme); full-window scroll margin; documentation update
-- v20: **Perfect** auto mode (importance-weighted 2–10× denser grid, ~5× time, coordinate descent; score function unchanged); **raw** score display in exponential notation; same score function and evaluation pipeline
+- v20: **Perfect** auto mode (importance-weighted 2–10× denser grid, ~5× time, coordinate descent); **raw** score display in exponential notation; Wiki-driven updates (score balance, global best, 500 images, score in report/GUI)
+- v20 (score & optimization): **Score** — Priority weights: continuity ≥20× base (default 24), band_fit ≥10× (default 12), thickness 1.2, others 1.0; **weighted geometric mean** (log-space) so 끊어짐(discontinuity) and poor band fit strongly penalize; sigmoid clipped for stability. **Auto optimization** — Refine/adaptive **early exit** when no improvement (35% / 40% of candidates); **exploitation-heavy** adaptive (step_scale 0.45→0.12, more centers around best); fewer redundant evals, faster convergence.
 
 ## Appendix A: Operator Quick Guide
 1. Select images -> set ROI -> run Auto Optimize.

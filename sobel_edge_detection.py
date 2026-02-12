@@ -121,16 +121,16 @@ AUTO_DEFAULTS = {
     "auto_median_kernel_min": 3,
     "auto_median_kernel_max": 5,
     "auto_median_kernel_step": 2,
-    "weight_continuity": 3.0,
-    "weight_band_fit": 2.4,
-    "weight_coverage": 1.8,
-    "weight_gap": 1.2,
-    "weight_outside": 1.6,
+    "weight_continuity": 24.0,
+    "weight_band_fit": 12.0,
+    "weight_coverage": 1.0,
+    "weight_gap": 1.0,
+    "weight_outside": 1.0,
     "weight_thickness": 1.2,
     "weight_intrusion": 1.0,
-    "weight_endpoints": 2.2,
-    "weight_wrinkle": 1.4,
-    "weight_branch": 1.1,
+    "weight_endpoints": 1.0,
+    "weight_wrinkle": 1.0,
+    "weight_branch": 1.0,
     "weight_low_quality": 0.5,
     "early_stop_enabled": True,
     "early_stop_minutes": 10.0,
@@ -179,6 +179,10 @@ def load_json_config(path):
 
 
 def compute_auto_score(metrics, weights, return_details=False):
+    """
+    Priority: continuity (20x+) > band_fit (10x+) > thickness > intrusion > others.
+    Uses weighted geometric mean (ML-style) so low continuity/band strongly penalizes score.
+    """
     coverage = float(metrics.get("coverage", 0.0))
     gap_ratio = float(metrics.get("gap", 1.0))
     continuity = float(metrics.get("continuity", 1.0))
@@ -190,19 +194,19 @@ def compute_auto_score(metrics, weights, return_details=False):
     wrinkle_ratio = float(metrics.get("wrinkle", 1.0))
     branch_ratio = float(metrics.get("branch", 1.0))
 
-    w_cont = float(weights.get("weight_continuity", 3.0))
-    w_band = float(weights.get("weight_band_fit", 2.4))
-    w_cov = float(weights.get("weight_coverage", 1.8))
-    w_gap = float(weights.get("weight_gap", 1.2))
-    w_out = float(weights.get("weight_outside", 1.6))
+    w_cont = float(weights.get("weight_continuity", 24.0))
+    w_band = float(weights.get("weight_band_fit", 12.0))
+    w_cov = float(weights.get("weight_coverage", 1.0))
+    w_gap = float(weights.get("weight_gap", 1.0))
+    w_out = float(weights.get("weight_outside", 1.0))
     w_thick = float(weights.get("weight_thickness", 1.2))
     w_intr = float(weights.get("weight_intrusion", 1.0))
-    w_end = float(weights.get("weight_endpoints", 2.2))
-    w_wrinkle = float(weights.get("weight_wrinkle", 1.4))
-    w_branch = float(weights.get("weight_branch", 1.1))
+    w_end = float(weights.get("weight_endpoints", 1.0))
+    w_wrinkle = float(weights.get("weight_wrinkle", 1.0))
+    w_branch = float(weights.get("weight_branch", 1.0))
 
     def sigmoid(x):
-        return 1.0 / (1.0 + math.exp(-x))
+        return 1.0 / (1.0 + math.exp(-max(-20, min(20, x))))
 
     q_cont = sigmoid((0.12 - continuity) / 0.04)
     q_band = sigmoid((band_ratio - 0.85) / 0.08)
@@ -218,13 +222,11 @@ def compute_auto_score(metrics, weights, return_details=False):
     weights_list = [w_cont, w_band, w_cov, w_gap, w_thick, w_intr, w_out, w_end, w_wrinkle, w_branch]
     q_list = [q_cont, q_band, q_cov, q_gap, q_thick, q_intr, q_out, q_end, q_wrinkle, q_branch]
     total_w = sum(weights_list)
-    weighted_sum = sum(wi * qi for wi, qi in zip(weights_list, q_list)) / max(total_w, 1e-9)
-    weighted_sum = max(0.0, min(1.0, weighted_sum))
-    prod_term = 1.0
+    eps = 1e-12
+    log_score = 0.0
     for qi, wi in zip(q_list, weights_list):
-        prod_term *= (qi + 1e-12) ** (wi / max(total_w, 1e-9))
-    blend = 0.5
-    score = blend * weighted_sum + (1.0 - blend) * prod_term
+        log_score += (wi / max(total_w, eps)) * math.log(qi + eps)
+    score = math.exp(log_score)
     exp_penalty = math.exp(-2.5 * (endpoint_ratio + wrinkle_ratio + branch_ratio))
     score *= exp_penalty
     score = max(0.0, min(1.0, score))
@@ -3467,12 +3469,17 @@ class EdgeBatchGUI:
                             settings["use_boundary_band_filter"] = settings["boundary_band_radius"] > 0
                             refine_candidates.append(settings)
 
+            refine_evals_without_improvement = 0
+            refine_early_exit_after = max(10, int(0.35 * len(refine_candidates)))
             for idx, settings in enumerate(refine_candidates, start=1):
                 if not wait_if_paused():
                     stop_reason = "stopped"
                     break
                 if check_stagnation():
                     stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
+                    break
+                if refine_evals_without_improvement >= refine_early_exit_after:
+                    report_lines.append(f"[INFO] Refine early exit (no improvement after {refine_early_exit_after} evals)")
                     break
                 key = key_from(settings)
                 if key in seen_keys:
@@ -3486,6 +3493,14 @@ class EdgeBatchGUI:
                 score_base = qualities["q_cont"] * qualities["q_band"]
                 penalty = max(0.0, 1.0 - score)
                 evaluated.append((score, settings, summary))
+                if best is None or score > best_score:
+                    best_score = score
+                    best = settings
+                    last_best_time = time.time()
+                    refine_evals_without_improvement = 0
+                    self._message_queue.put(("auto_best", best_score, elapsed))
+                else:
+                    refine_evals_without_improvement += 1
                 score_disp = self._score_to_display(score, display_mode)
                 report_lines.append(
                     f"refine {idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
@@ -3498,11 +3513,6 @@ class EdgeBatchGUI:
                     f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
                 )
                 scores.append(score)
-                if best is None or score > best_score:
-                    best_score = score
-                    best = settings
-                    last_best_time = time.time()
-                    self._message_queue.put(("auto_best", best_score, elapsed))
                 best_progress.append(best_score)
                 self._auto_best_time_series.append((elapsed, best_score))
                 self._message_queue.put(
@@ -3523,11 +3533,11 @@ class EdgeBatchGUI:
                 )
         if not stop_reason:
             if mode == "Fast":
-                adaptive_scales = [0.6, 0.35]
+                adaptive_scales = [0.5, 0.25]
             elif is_perfect:
-                adaptive_scales = [0.5, 0.35, 0.2, 0.1, 0.05]
+                adaptive_scales = [0.45, 0.28, 0.15, 0.08, 0.04]
             else:
-                adaptive_scales = [0.6, 0.35, 0.2]
+                adaptive_scales = [0.45, 0.22, 0.12]
             for round_idx, scale in enumerate(adaptive_scales, start=1):
                 evaluated_sorted = sorted(evaluated, key=lambda item: item[0], reverse=True)
                 top_k = 12 if is_perfect else 8
@@ -3540,7 +3550,8 @@ class EdgeBatchGUI:
                             break
                 if not top_settings and evaluated_sorted:
                     top_settings = [item[1] for item in evaluated_sorted[:top_k]]
-                adaptive_count = max(40, min(220, int(budget * (0.6 / round_idx)))) if not is_perfect else max(80, min(400, int(budget * (0.7 / round_idx))))
+                exploitation_centers = ([best] * min(4, max(1, top_k // 2)) + top_settings[:top_k]) if best else top_settings
+                adaptive_count = max(36, min(200, int(budget * (0.55 / round_idx)))) if not is_perfect else max(70, min(380, int(budget * (0.65 / round_idx))))
                 ai_candidates = self._build_candidates(
                     base_settings,
                     mode,
@@ -3548,11 +3559,13 @@ class EdgeBatchGUI:
                     adaptive_count,
                     rng,
                     step_scale=scale,
-                    centers=top_settings,
+                    centers=exploitation_centers,
                     step_multipliers=step_mults,
                 )
                 if not ai_candidates:
                     continue
+                adap_early_exit_after = max(8, int(0.4 * len(ai_candidates)))
+                adap_no_improve = 0
                 report_lines.append(
                     f"[INFO] Adaptive round {round_idx} scale={scale:.2f} count={len(ai_candidates)}"
                 )
@@ -3562,6 +3575,9 @@ class EdgeBatchGUI:
                         break
                     if check_stagnation():
                         stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
+                        break
+                    if adap_no_improve >= adap_early_exit_after:
+                        report_lines.append(f"[INFO] Adaptive round {round_idx} early exit (no improvement)")
                         break
                     key = key_from(settings)
                     if key in seen_keys:
@@ -3575,6 +3591,14 @@ class EdgeBatchGUI:
                     score_base = qualities["q_cont"] * qualities["q_band"]
                     penalty = max(0.0, 1.0 - score)
                     evaluated.append((score, settings, summary))
+                    if best is None or score > best_score:
+                        best_score = score
+                        best = settings
+                        last_best_time = time.time()
+                        adap_no_improve = 0
+                        self._message_queue.put(("auto_best", best_score, elapsed))
+                    else:
+                        adap_no_improve += 1
                     score_disp = self._score_to_display(score, display_mode)
                     report_lines.append(
                         f"adaptive{round_idx} {idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
@@ -3587,11 +3611,6 @@ class EdgeBatchGUI:
                         f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
                     )
                     scores.append(score)
-                    if best is None or score > best_score:
-                        best_score = score
-                        best = settings
-                        last_best_time = time.time()
-                        self._message_queue.put(("auto_best", best_score, elapsed))
                     best_progress.append(best_score)
                     self._auto_best_time_series.append((elapsed, best_score))
                     self._message_queue.put(

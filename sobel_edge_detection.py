@@ -130,7 +130,7 @@ AUTO_DEFAULTS = {
     "weight_intrusion": 1.0,
     "weight_endpoints": 1.0,
     "weight_wrinkle": 1.0,
-    "weight_branch": 1.0,
+    "weight_branch": 2.0,
     "weight_low_quality": 0.5,
     "early_stop_enabled": True,
     "early_stop_minutes": 10.0,
@@ -3259,6 +3259,37 @@ class EdgeBatchGUI:
 
         return candidates
 
+    def _build_local_grid(self, best, base_settings, auto_config, size=32):
+        """Build a small grid of settings around best (nms, high_ratio, margin, band_radius)."""
+        out = []
+        nms_s = max(0.002, auto_config.get("auto_nms_step", 0.01) * 0.5)
+        high_s = max(0.002, auto_config.get("auto_high_step", 0.01) * 0.5)
+        margin_s = max(0.02, auto_config.get("auto_margin_step", 0.05) * 0.5)
+        nms_vals = [round(best["nms_relax"] + d, 3) for d in (-nms_s, 0, nms_s)]
+        high_vals = [max(0.05, best["high_ratio"] + d) for d in (-high_s, 0, high_s)]
+        margin_vals = [max(0.0, best["polarity_drop_margin"] + d) for d in (-margin_s, 0, margin_s)]
+        band_vals = [max(0, min(4, best["boundary_band_radius"] + d)) for d in (-1, 0, 1)]
+        low_factor = 0.5 * (auto_config.get("auto_low_factor_min", 0.3) + auto_config.get("auto_low_factor_max", 0.6))
+        for nms in nms_vals:
+            nms = round(min(1.0, max(0.85, nms)), 3)
+            for high in high_vals:
+                low = max(0.02, high * low_factor)
+                for margin in margin_vals:
+                    for band in band_vals:
+                        if len(out) >= size:
+                            return out
+                        s = dict(base_settings)
+                        s.update({
+                            "nms_relax": nms,
+                            "high_ratio": float(high),
+                            "low_ratio": float(low),
+                            "polarity_drop_margin": max(0.0, margin),
+                            "boundary_band_radius": int(band),
+                            "use_boundary_band_filter": int(band) > 0,
+                        })
+                        out.append(s)
+        return out
+
     def _start_auto_optimize(self):
         if self._worker_thread and self._worker_thread.is_alive():
             messagebox.showwarning("In Progress", "Processing is already running.")
@@ -3345,11 +3376,9 @@ class EdgeBatchGUI:
             target_eval = 45000
         else:
             target_eval = 9000
-        budget = int(target_eval / max(1, len(data_coarse)))
-        budget = max(80, min(budget, 600)) if not is_perfect else max(400, min(2500, budget))
+        round_budget = 200 if mode == "Fast" else (1200 if is_perfect else 500)
         step_mults = PERFECT_STEP_MULTIPLIERS if is_perfect else None
-        candidates = self._build_candidates(base_settings, mode, auto_config, budget, rng, step_scale=1.0, step_multipliers=step_mults)
-        report_lines.append(f"[INFO] Coarse candidates: {len(candidates)}")
+        report_lines.append(f"[INFO] Mixed-rounds optimization: target={target_eval} evals, round_budget={round_budget}")
 
         def wait_if_paused():
             while self._auto_pause_event.is_set() and not self._auto_stop_event.is_set():
@@ -3388,142 +3417,107 @@ class EdgeBatchGUI:
                 return True
             return False
 
-        for idx, settings in enumerate(candidates, start=1):
+        no_improve_rounds = 0
+        round_num = 0
+        seq = 0
+
+        while processed < target_eval and not stop_reason:
+            round_num += 1
             if not wait_if_paused():
                 stop_reason = "stopped"
                 break
             if check_stagnation():
                 stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
                 break
-            key = key_from(settings)
-            if key in seen_keys:
+            top_list = [e[1] for e in sorted(evaluated, key=lambda e: e[0], reverse=True)[:5]] if evaluated else []
+            centers_explore = top_list[:2] if top_list else []
+            n_explore = min(round_budget // 3, 150)
+            n_exploit = min(round_budget // 2, 220) if best else 0
+            n_local = min(round_budget // 6, 48) if best else 0
+            explore = self._build_candidates(
+                base_settings, mode, auto_config, n_explore, rng,
+                step_scale=0.75, centers=centers_explore, step_multipliers=step_mults
+            )
+            exploit = self._build_candidates(
+                base_settings, mode, auto_config, n_exploit, rng,
+                step_scale=0.2, centers=[best], step_multipliers=step_mults
+            ) if best else []
+            local_list = self._build_local_grid(best, base_settings, auto_config, size=n_local) if best else []
+            combined = (explore or []) + (exploit or []) + (local_list or [])
+            rng.shuffle(combined)
+            pool = []
+            for s in combined:
+                k = key_from(s)
+                if k not in seen_keys:
+                    pool.append(s)
+                    if len(pool) >= round_budget:
+                        break
+            if not pool:
+                no_improve_rounds += 1
+                if no_improve_rounds >= 2:
+                    stop_reason = "no_new_candidates_2_rounds"
+                    break
+                report_lines.append(f"[INFO] Round {round_num}: no new candidates, best={best_score:.6e}")
                 continue
-            seen_keys.add(key)
-            score, summary, qualities = self._evaluate_settings(data_coarse, settings, auto_config)
-            processed += 1
-            elapsed = time.time() - start_time
-            avg_time = elapsed / max(1, processed)
-            eta_seconds = avg_time * max(0, len(candidates) - processed)
-            score_base = qualities["q_cont"] * qualities["q_band"]
-            penalty = max(0.0, 1.0 - score)
-            evaluated.append((score, settings, summary))
-            score_disp = self._score_to_display(score, display_mode)
-            report_lines.append(
-                f"{idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
-                f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
-                f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
-                f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
-                f"thick={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} "
-                f"high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} "
-                f"margin={settings['polarity_drop_margin']:.2f}"
-            )
-            scores.append(score)
-            if best is None or score > best_score:
-                best_score = score
-                best = settings
-                last_best_time = time.time()
-                self._message_queue.put(("auto_best", best_score, elapsed))
-            best_progress.append(best_score)
-            self._auto_best_time_series.append((elapsed, best_score))
-            self._message_queue.put(
-                (
-                    "auto_progress",
-                    idx,
-                    len(candidates),
-                    score,
-                    best_score,
-                    eta_seconds,
-                    "coarse",
-                    elapsed,
-                    summary,
-                    qualities,
-                    score_base,
-                    penalty,
-                )
-            )
+            round_improved = False
+            early_exit_after = max(8, int(0.25 * len(pool)))
+            no_improve_count = 0
+            report_lines.append(f"[INFO] Round {round_num} pool={len(pool)} (explore+exploit+local)")
 
-        if best and mode != "Fast" and not stop_reason:
-            refine_factor = 0.2 if is_perfect else 0.5
-            refine_step = max(auto_config["auto_nms_step"] * refine_factor, 0.002 if is_perfect else 0.005)
-            high_step = max(auto_config["auto_high_step"] * refine_factor, 0.002 if is_perfect else 0.005)
-            margin_step = max(auto_config["auto_margin_step"] * refine_factor, 0.02 if is_perfect else 0.05)
-            refine_nms = (-refine_step, 0.0, refine_step) if not is_perfect else (-2*refine_step, -refine_step, 0.0, refine_step, 2*refine_step)
-            refine_high = (-high_step, 0.0, high_step) if not is_perfect else (-2*high_step, -high_step, 0.0, high_step, 2*high_step)
-            refine_candidates = []
-            dband_list = (-1, 0, 1) if not is_perfect else (-2, -1, 0, 1, 2)
-            margin_list = (-margin_step, 0.0, margin_step) if not is_perfect else (-2*margin_step, -margin_step, 0.0, margin_step, 2*margin_step)
-            for dnms in refine_nms:
-                for dhigh in refine_high:
-                    for dband in dband_list:
-                        for dmargin in margin_list:
-                            settings = dict(best)
-                            settings["nms_relax"] = round(min(1.0, max(0.85, best["nms_relax"] + dnms)), 3)
-                            settings["high_ratio"] = max(0.05, best["high_ratio"] + dhigh)
-                            low_factor = 0.5 * (
-                                auto_config["auto_low_factor_min"] + auto_config["auto_low_factor_max"]
-                            )
-                            settings["low_ratio"] = max(0.02, settings["high_ratio"] * low_factor)
-                            settings["boundary_band_radius"] = max(0, min(4, best["boundary_band_radius"] + dband))
-                            settings["polarity_drop_margin"] = max(0.0, best["polarity_drop_margin"] + dmargin)
-                            settings["use_boundary_band_filter"] = settings["boundary_band_radius"] > 0
-                            refine_candidates.append(settings)
-
-            refine_evals_without_improvement = 0
-            refine_early_exit_after = max(10, int(0.35 * len(refine_candidates)))
-            for idx, settings in enumerate(refine_candidates, start=1):
+            for idx, settings in enumerate(pool):
+                if processed >= target_eval:
+                    break
                 if not wait_if_paused():
                     stop_reason = "stopped"
                     break
                 if check_stagnation():
                     stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
                     break
-                if refine_evals_without_improvement >= refine_early_exit_after:
-                    report_lines.append(f"[INFO] Refine early exit (no improvement after {refine_early_exit_after} evals)")
+                if no_improve_count >= early_exit_after:
+                    report_lines.append(f"[INFO] Round {round_num} early exit (no improvement after {early_exit_after})")
                     break
                 key = key_from(settings)
                 if key in seen_keys:
                     continue
                 seen_keys.add(key)
-                score, summary, qualities = self._evaluate_settings(data_mid, settings, auto_config)
+                score, summary, qualities = self._evaluate_settings(data_full, settings, auto_config)
                 processed += 1
+                seq += 1
                 elapsed = time.time() - start_time
                 avg_time = elapsed / max(1, processed)
-                eta_seconds = avg_time * max(0, len(refine_candidates) - idx)
+                eta_seconds = avg_time * max(0, target_eval - processed)
                 score_base = qualities["q_cont"] * qualities["q_band"]
                 penalty = max(0.0, 1.0 - score)
                 evaluated.append((score, settings, summary))
+                score_disp = self._score_to_display(score, display_mode)
+                report_lines.append(
+                    f"r{round_num}_{seq:04d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
+                    f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
+                    f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                    f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
+                    f"nms={settings['nms_relax']:.2f} high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
+                )
+                scores.append(score)
                 if best is None or score > best_score:
                     best_score = score
                     best = settings
                     last_best_time = time.time()
-                    refine_evals_without_improvement = 0
+                    round_improved = True
+                    no_improve_count = 0
                     self._message_queue.put(("auto_best", best_score, elapsed))
                 else:
-                    refine_evals_without_improvement += 1
-                score_disp = self._score_to_display(score, display_mode)
-                report_lines.append(
-                    f"refine {idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
-                    f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                    f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
-                    f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
-                    f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
-                    f"thick={summary['thickness']:.4f} "
-                    f"nms={settings['nms_relax']:.2f} low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
-                    f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
-                )
-                scores.append(score)
+                    no_improve_count += 1
                 best_progress.append(best_score)
                 self._auto_best_time_series.append((elapsed, best_score))
                 self._message_queue.put(
                     (
                         "auto_progress",
-                        idx,
-                        len(refine_candidates),
+                        seq,
+                        target_eval,
                         score,
                         best_score,
                         eta_seconds,
-                        "refine",
+                        f"round{round_num}",
                         elapsed,
                         summary,
                         qualities,
@@ -3531,157 +3525,15 @@ class EdgeBatchGUI:
                         penalty,
                     )
                 )
-        if not stop_reason:
-            if mode == "Fast":
-                adaptive_scales = [0.5, 0.25]
-            elif is_perfect:
-                adaptive_scales = [0.45, 0.28, 0.15, 0.08, 0.04]
-            else:
-                adaptive_scales = [0.45, 0.22, 0.12]
-            for round_idx, scale in enumerate(adaptive_scales, start=1):
-                evaluated_sorted = sorted(evaluated, key=lambda item: item[0], reverse=True)
-                top_k = 12 if is_perfect else 8
-                best_key = key_from(best) if best else None
-                top_settings = [best] if best else []
-                for item in evaluated_sorted[:top_k]:
-                    if item[1] is not best and key_from(item[1]) != best_key:
-                        top_settings.append(item[1])
-                        if len(top_settings) >= top_k:
-                            break
-                if not top_settings and evaluated_sorted:
-                    top_settings = [item[1] for item in evaluated_sorted[:top_k]]
-                exploitation_centers = ([best] * min(4, max(1, top_k // 2)) + top_settings[:top_k]) if best else top_settings
-                adaptive_count = max(36, min(200, int(budget * (0.55 / round_idx)))) if not is_perfect else max(70, min(380, int(budget * (0.65 / round_idx))))
-                ai_candidates = self._build_candidates(
-                    base_settings,
-                    mode,
-                    auto_config,
-                    adaptive_count,
-                    rng,
-                    step_scale=scale,
-                    centers=exploitation_centers,
-                    step_multipliers=step_mults,
-                )
-                if not ai_candidates:
-                    continue
-                adap_early_exit_after = max(8, int(0.4 * len(ai_candidates)))
-                adap_no_improve = 0
-                report_lines.append(
-                    f"[INFO] Adaptive round {round_idx} scale={scale:.2f} count={len(ai_candidates)}"
-                )
-                for idx, settings in enumerate(ai_candidates, start=1):
-                    if not wait_if_paused():
-                        stop_reason = "stopped"
-                        break
-                    if check_stagnation():
-                        stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
-                        break
-                    if adap_no_improve >= adap_early_exit_after:
-                        report_lines.append(f"[INFO] Adaptive round {round_idx} early exit (no improvement)")
-                        break
-                    key = key_from(settings)
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-                    score, summary, qualities = self._evaluate_settings(data_full, settings, auto_config)
-                    processed += 1
-                    elapsed = time.time() - start_time
-                    avg_time = elapsed / max(1, processed)
-                    eta_seconds = avg_time * max(0, len(ai_candidates) - idx)
-                    score_base = qualities["q_cont"] * qualities["q_band"]
-                    penalty = max(0.0, 1.0 - score)
-                    evaluated.append((score, settings, summary))
-                    if best is None or score > best_score:
-                        best_score = score
-                        best = settings
-                        last_best_time = time.time()
-                        adap_no_improve = 0
-                        self._message_queue.put(("auto_best", best_score, elapsed))
-                    else:
-                        adap_no_improve += 1
-                    score_disp = self._score_to_display(score, display_mode)
-                    report_lines.append(
-                        f"adaptive{round_idx} {idx:03d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
-                        f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                        f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
-                        f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
-                        f"intr={summary['intrusion']:.4f} out={summary['outside']:.4f} "
-                        f"thick={summary['thickness']:.4f} nms={settings['nms_relax']:.2f} "
-                        f"low={settings['low_ratio']:.3f} high={settings['high_ratio']:.3f} "
-                        f"band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
-                    )
-                    scores.append(score)
-                    best_progress.append(best_score)
-                    self._auto_best_time_series.append((elapsed, best_score))
-                    self._message_queue.put(
-                        (
-                            "auto_progress",
-                            idx,
-                            len(ai_candidates),
-                            score,
-                            best_score,
-                            eta_seconds,
-                            f"adaptive{round_idx}",
-                            elapsed,
-                            summary,
-                            qualities,
-                            score_base,
-                            penalty,
-                        )
-                    )
-                if stop_reason:
-                    break
 
-        if best and is_perfect and not stop_reason:
-            report_lines.append("[INFO] Perfect mode: coordinate descent (one-at-a-time local search)")
-            cd_params = [
-                ("nms_relax", 0.002, 0.85, 1.0),
-                ("high_ratio", 0.002, 0.05, 0.25),
-                ("low_ratio", 0.005, 0.02, 0.5),
-                ("boundary_band_radius", 1, 0, 4),
-                ("polarity_drop_margin", 0.02, 0.0, 0.8),
-            ]
-            for param_name, delta, lo, hi in cd_params:
-                if not wait_if_paused() or check_stagnation():
+            if not round_improved:
+                no_improve_rounds += 1
+                if no_improve_rounds >= 2:
+                    stop_reason = "no_improve_2_rounds"
                     break
-                current = best.get(param_name)
-                if current is None:
-                    continue
-                is_int = isinstance(current, (int, np.integer))
-                deltas = [-2*delta, -delta, 0, delta, 2*delta] if not is_int else [-2*max(1,int(delta)), -max(1,int(delta)), 0, max(1,int(delta)), 2*max(1,int(delta))]
-                for d in deltas:
-                    s = dict(best)
-                    if is_int:
-                        s[param_name] = int(max(lo, min(hi, current + d)))
-                    else:
-                        s[param_name] = round(max(lo, min(hi, current + d)), 4 if param_name == "polarity_drop_margin" else 3)
-                    if param_name == "high_ratio" and "high_ratio" in s:
-                        s["low_ratio"] = max(0.02, s["high_ratio"] * 0.35)
-                    if param_name == "boundary_band_radius":
-                        s["use_boundary_band_filter"] = s["boundary_band_radius"] > 0
-                    key = key_from(s)
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-                    score, summary, qualities = self._evaluate_settings(data_full, s, auto_config)
-                    processed += 1
-                    elapsed = time.time() - start_time
-                    evaluated.append((score, s, summary))
-                    score_disp = self._score_to_display(score, display_mode)
-                    report_lines.append(
-                        f"cd_{param_name} score={self._format_score_for_display(score, display_mode)} raw={score:.12e} {param_name}={s[param_name]}"
-                    )
-                    scores.append(score)
-                    if score > best_score:
-                        best_score = score
-                        best = s
-                        last_best_time = time.time()
-                        self._message_queue.put(("auto_best", best_score, elapsed))
-                    best_progress.append(best_score)
-                    self._auto_best_time_series.append((elapsed, best_score))
-                    self._message_queue.put(
-                        ("auto_progress", processed, processed, score, best_score, 0.0, "coord_descent", elapsed, summary, qualities, qualities["q_cont"]*qualities["q_band"], max(0, 1.0-score))
-                    )
+            else:
+                no_improve_rounds = 0
+            report_lines.append(f"[INFO] Round {round_num} done best={best_score:.6e} processed={processed}")
 
         if stop_reason:
             report_lines.append(f"[STOP] Optimization ended: {stop_reason}")

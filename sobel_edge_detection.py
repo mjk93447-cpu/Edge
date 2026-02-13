@@ -2738,8 +2738,9 @@ class EdgeBatchGUI:
         band_radii = list(range(band_min, band_max + 1))
         if not band_radii:
             band_radii = [settings["boundary_band_radius"]]
-        data = []
-        for path in subset:
+        
+        # 병렬화: 이미지 로딩 및 전처리를 병렬로 수행
+        def process_one_image(path):
             image = self.detector.load_image(path)
             roi = roi_map.get(path)
             if roi:
@@ -2768,17 +2769,39 @@ class EdgeBatchGUI:
                 bands[radius] = band
                 band_pixels[radius] = int(band.sum())
 
-            data.append(
-                {
-                    "path": path,
-                    "image": image,
-                    "mask": mask,
-                    "boundary": boundary,
-                    "bands": bands,
-                    "band_pixels": band_pixels,
-                    "weight": 1.0,
-                }
-            )
+            return {
+                "path": path,
+                "image": image,
+                "mask": mask,
+                "boundary": boundary,
+                "bands": bands,
+                "band_pixels": band_pixels,
+                "weight": 1.0,
+            }
+        
+        # 병렬 처리: CPU 코어 수만큼 워커 사용
+        data = []
+        num_workers = min(max(1, (os.cpu_count() or 4) - 1), len(subset))
+        if num_workers > 1 and len(subset) > 1:
+            # 진행 상황 보고를 위한 콜백 추가
+            futures = []
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                for i, path in enumerate(subset):
+                    future = executor.submit(process_one_image, path)
+                    futures.append((i, future))
+                for i, future in enumerate(futures):
+                    result = future.result()
+                    data.append(result)
+                    # 진행 상황 업데이트 (매 2개마다 또는 마지막)
+                    if (i + 1) % max(1, len(subset) // 4) == 0 or (i + 1) == len(subset):
+                        if hasattr(self, '_message_queue'):
+                            self._message_queue.put(("auto_log", f"[INFO] Loading images: {i+1}/{len(subset)}"))
+        else:
+            for i, path in enumerate(subset):
+                result = process_one_image(path)
+                data.append(result)
+                if hasattr(self, '_message_queue') and ((i + 1) % max(1, len(subset) // 4) == 0 or (i + 1) == len(subset)):
+                    self._message_queue.put(("auto_log", f"[INFO] Loading images: {i+1}/{len(subset)}"))
         if len(data) < 4:
             return {"coarse": data, "mid": data, "full": data}
 
@@ -3783,9 +3806,22 @@ USER PRE-ANSWERS (before starting Auto):
         self.root.after(100, self._poll_messages)
 
     def _auto_optimize_worker(self, files, base_settings, auto_config, mode, roi_map, display_mode):
+        # 즉시 초기 메시지 출력
+        start_time = time.time()
+        report_lines = [f"[INFO] Auto optimization started: mode={mode}, score_display={display_mode}"]
+        self._message_queue.put(("auto_log", "[INFO] Preparing data..."))
+        self._message_queue.put(("auto_progress", 0, 1, 0.0, 0.0, 0, "preparing", 0.0, {}, {}, 0.0, 0.0))
+        
         max_files = min(8, len(files)) if mode == "Fast" else len(files)
         is_perfect = mode == "Perfect"
+        
+        # 데이터 준비 (병렬화됨)
+        prep_start = time.time()
         data = self._prepare_auto_data(files, base_settings, auto_config, roi_map, max_files)
+        prep_time = time.time() - prep_start
+        report_lines.append(f"[INFO] Data preparation completed in {prep_time:.2f}s: {len(data.get('full', []))} images")
+        self._message_queue.put(("auto_log", f"[INFO] Data ready ({prep_time:.2f}s), starting optimization..."))
+        
         data_coarse = data.get("coarse", [])
         data_mid = data.get("mid", [])
         data_full = data.get("full", [])
@@ -3795,13 +3831,11 @@ USER PRE-ANSWERS (before starting Auto):
             data_mid = data_full
         best = None
         best_score = 0.0
-        report_lines = [f"[INFO] score_display={display_mode}"]
         scores = []
         best_progress = []
         evaluated = []
         seen_keys = set()
         stop_reason = None
-        start_time = time.time()
         last_best_time = start_time
         early_stop_enabled = bool(auto_config.get("early_stop_enabled", True))
         early_stop_minutes = float(auto_config.get("early_stop_minutes", 10.0))
@@ -3836,6 +3870,12 @@ USER PRE-ANSWERS (before starting Auto):
             f"[INFO] Two-phase optimization: Phase1 (no thinning) budget={phase1_budget}, "
             f"max_thickness={phase1_max_thickness}, then Phase2 (with thinning) up to {target_eval} evals."
         )
+        candidate_workers = max(0, int(auto_config.get("auto_candidate_workers", 0)))
+        report_lines.append(
+            f"[INFO] Configuration: target_eval={target_eval}, round_budget={round_budget}, "
+            f"candidate_workers={candidate_workers}, data_coarse={len(data_coarse)}, data_full={len(data_full)}"
+        )
+        self._message_queue.put(("auto_log", f"[INFO] Starting optimization: {target_eval} evaluations planned, {len(data_full)} images"))
 
         def wait_if_paused():
             while self._auto_pause_event.is_set() and not self._auto_stop_event.is_set():
@@ -3907,6 +3947,9 @@ USER PRE-ANSWERS (before starting Auto):
                     break
 
             round_num += 1
+            if round_num == 1:
+                # 첫 번째 라운드 시작 시 즉시 피드백
+                self._message_queue.put(("auto_log", f"[INFO] Round 1: Building candidate pool..."))
             if not wait_if_paused():
                 stop_reason = "stopped"
                 break
@@ -3915,9 +3958,17 @@ USER PRE-ANSWERS (before starting Auto):
                 break
             top_list = [e[1] for e in sorted(evaluated, key=lambda e: e[0], reverse=True)[:5]] if evaluated else []
             centers_explore = top_list[:2] if top_list else []
-            n_explore = min(round_budget // 3, 150)
-            n_exploit = min(round_budget // 2, 220) if best else 0
-            n_local = min(round_budget // 6, 48) if best else 0
+            # 첫 번째 라운드에서는 더 작은 풀로 빠르게 시작
+            if round_num == 1:
+                n_explore = min(round_budget // 4, 80)  # 첫 라운드는 더 작게
+                n_exploit = 0  # 첫 라운드에는 exploit 없음
+                n_local = 0  # 첫 라운드에는 local 없음
+            else:
+                n_explore = min(round_budget // 3, 150)
+                n_exploit = min(round_budget // 2, 220) if best else 0
+                n_local = min(round_budget // 6, 48) if best else 0
+            # 후보 풀 생성 (병렬화 가능한 부분은 이미 병렬화됨)
+            pool_start = time.time()
             explore = self._build_candidates(
                 current_base, mode, auto_config, n_explore, rng,
                 step_scale=0.75, centers=centers_explore, step_multipliers=step_mults
@@ -3927,6 +3978,9 @@ USER PRE-ANSWERS (before starting Auto):
                 step_scale=0.2, centers=[best], step_multipliers=step_mults
             ) if best else []
             local_list = self._build_local_grid(best, current_base, auto_config, size=n_local) if best else []
+            pool_time = time.time() - pool_start
+            if round_num == 1 and pool_time > 0.5:
+                self._message_queue.put(("auto_log", f"[INFO] Candidate pool built ({pool_time:.2f}s), starting evaluation..."))
             combined = (explore or []) + (exploit or []) + (local_list or [])
             if phase == 1:
                 for s in combined:
@@ -3954,6 +4008,8 @@ USER PRE-ANSWERS (before starting Auto):
                 f"[INFO] Round {round_num} pool={len(pool)} (explore+exploit+local), early_exit_after={early_exit_after} ({round_early_exit_frac*100:.0f}%)"
                 + (f", candidate_workers={candidate_workers}" if candidate_workers else "")
             )
+            if round_num == 1:
+                self._message_queue.put(("auto_log", f"[INFO] Evaluating {len(pool)} candidates (workers={candidate_workers if candidate_workers else 'sequential'})..."))
 
             if candidate_workers >= 1:
                 batch_size = min(candidate_workers, 8)

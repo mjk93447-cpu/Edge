@@ -4,7 +4,7 @@ import os
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from collections import deque
 from datetime import datetime
 try:
@@ -142,6 +142,7 @@ AUTO_DEFAULTS = {
     "auto_phase1_min_evals": 150,
     "auto_parallel": True,
     "auto_workers": max(1, (os.cpu_count() or 4) - 1),
+    "auto_candidate_workers": min(4, max(1, (os.cpu_count() or 4) - 1)),
 }
 
 
@@ -174,6 +175,148 @@ def get_auto_profile_overrides(grayscale=None, low_quality=None):
         overrides["auto_blur_sigma_step"] = 0.08
         overrides["auto_nms_step"] = 0.005
     return overrides
+
+
+def _count_components_mask(mask):
+    """Module-level: count connected components in binary mask (for multiprocessing)."""
+    if mask is None or not np.any(mask):
+        return 0
+    visited = np.zeros(mask.shape, dtype=bool)
+    coords = np.argwhere(mask)
+    components = 0
+    for y, x in coords:
+        if visited[y, x]:
+            continue
+        components += 1
+        stack = [(y, x)]
+        visited[y, x] = True
+        while stack:
+            cy, cx = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1] and mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((ny, nx))
+    return components
+
+
+def evaluate_one_candidate_mp(data, settings, auto_config):
+    """
+    Evaluate one candidate in a worker process (Intel multi-core speedup).
+    Returns (score, summary, qualities). Used by ProcessPoolExecutor.
+    """
+    import sys
+    mod = sys.modules.get("sobel_edge_detection") or sys.modules.get("__main__")
+    SobelEdgeDetector = getattr(mod, "SobelEdgeDetector")
+    compute_auto_score = getattr(mod, "compute_auto_score")
+    _count_components_mask = getattr(mod, "_count_components_mask")
+    detector = SobelEdgeDetector()
+    settings_eval = dict(settings)
+    settings_eval["use_boundary_band_filter"] = False
+    total_score = total_coverage = total_intrusion = total_outside = total_gap = 0.0
+    total_thickness = total_continuity = total_band_ratio = total_endpoints = 0.0
+    total_wrinkle = total_branch = total_weight = 0.0
+    total_q_cont = total_q_band = total_q_thick = total_q_intr = total_q_end = 0.0
+    total_q_wrinkle = total_q_branch = 0.0
+
+    for item in data:
+        image = item["image"]
+        mask = item["mask"]
+        band_radius = settings["boundary_band_radius"]
+        band = item["bands"].get(band_radius)
+        if band is None:
+            band = item["boundary"] if band_radius <= 0 else detector.dilate_binary(item["boundary"], band_radius)
+        results = detector.detect_edges_array(
+            image, use_nms=True, use_hysteresis=True, **settings_eval
+        )
+        edges_raw = results["edges"] > 0
+        edge_pixels = int(edges_raw.sum())
+        band_pixels = item["band_pixels"].get(band_radius, int(band.sum()))
+        edges_in_band = int((edges_raw & band).sum()) if band_pixels else 0
+        intrusion = int((edges_raw & mask & ~band).sum())
+        outside = int((edges_raw & ~mask & ~band).sum())
+
+        if edge_pixels == 0:
+            coverage = 0.0
+            intrusion_ratio = outside_ratio = gap_ratio = 1.0
+            continuity_penalty = thickness_penalty = 1.0
+            band_ratio = 0.0
+            endpoint_ratio = wrinkle_ratio = branch_ratio = 1.0
+        else:
+            coverage = edges_in_band / band_pixels if band_pixels else 0.0
+            intrusion_ratio = intrusion / edge_pixels
+            outside_ratio = outside / edge_pixels
+            gap_ratio = max(0.0, 1.0 - coverage)
+            band_ratio = edges_in_band / edge_pixels
+            neighbor_counts = detector._neighbor_count(edges_raw)
+            endpoint_count = int((edges_raw & (neighbor_counts <= 1)).sum())
+            branch_count = int((edges_raw & (neighbor_counts >= 3)).sum())
+            endpoint_ratio = endpoint_count / edge_pixels
+            branch_ratio = branch_count / edge_pixels
+            smooth_mask = detector.erode_binary(detector.dilate_binary(edges_raw, 1), 1)
+            wrinkle_ratio = int((edges_raw ^ smooth_mask).sum()) / edge_pixels
+            components = _count_components_mask(edges_raw & band)
+            components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
+            continuity_penalty = min(1.0, components_penalty * 5.0)
+            edge_density = edge_pixels / max(band_pixels, 1)
+            thickness_penalty = max(0.0, edge_density - 1.2)
+
+        metrics = {
+            "coverage": coverage, "gap": gap_ratio, "continuity": continuity_penalty,
+            "intrusion": intrusion_ratio, "outside": outside_ratio, "thickness": thickness_penalty,
+            "band_ratio": band_ratio, "endpoints": endpoint_ratio, "wrinkle": wrinkle_ratio, "branch": branch_ratio,
+        }
+        score, details = compute_auto_score(metrics, auto_config, return_details=True)
+        p10, p90 = np.percentile(image, [10, 90])
+        contrast = max(float(p90 - p10), 1.0)
+        if contrast < settings["contrast_ref"] * 0.6:
+            score *= (1.0 + auto_config.get("weight_low_quality", 0.5))
+        weight = float(item.get("weight", 1.0))
+        total_weight += weight
+        total_score += score * weight
+        total_coverage += coverage * weight
+        total_intrusion += intrusion_ratio * weight
+        total_outside += outside_ratio * weight
+        total_gap += gap_ratio * weight
+        total_thickness += thickness_penalty * weight
+        total_continuity += continuity_penalty * weight
+        total_band_ratio += band_ratio * weight
+        total_endpoints += endpoint_ratio * weight
+        total_wrinkle += wrinkle_ratio * weight
+        total_branch += branch_ratio * weight
+        total_q_cont += details["q_cont"] * weight
+        total_q_band += details["q_band"] * weight
+        total_q_thick += details["q_thick"] * weight
+        total_q_intr += details["q_intr"] * weight
+        total_q_end += details["q_end"] * weight
+        total_q_wrinkle += details["q_wrinkle"] * weight
+        total_q_branch += details["q_branch"] * weight
+
+    if total_weight <= 0:
+        return (
+            0.0,
+            {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0, "gap": 1.0, "thickness": 1.0, "continuity": 1.0, "band_ratio": 0.0, "endpoints": 1.0, "wrinkle": 1.0, "branch": 1.0},
+            {"q_cont": 0.0, "q_band": 0.0, "q_thick": 0.0, "q_intr": 0.0, "q_end": 0.0, "q_wrinkle": 0.0, "q_branch": 0.0},
+        )
+    avg_score = max(0.0, total_score / total_weight)
+    summary = {
+        "coverage": total_coverage / total_weight, "intrusion": total_intrusion / total_weight,
+        "outside": total_outside / total_weight, "gap": total_gap / total_weight,
+        "thickness": total_thickness / total_weight, "continuity": total_continuity / total_weight,
+        "band_ratio": total_band_ratio / total_weight, "endpoints": total_endpoints / total_weight,
+        "wrinkle": total_wrinkle / total_weight, "branch": total_branch / total_weight,
+    }
+    qualities = {
+        "q_cont": total_q_cont / total_weight, "q_band": total_q_band / total_weight,
+        "q_thick": total_q_thick / total_weight, "q_intr": total_q_intr / total_weight,
+        "q_end": total_q_end / total_weight, "q_wrinkle": total_q_wrinkle / total_weight,
+        "q_branch": total_q_branch / total_weight,
+    }
+    return avg_score, summary, qualities
+
 
 PARAM_KEYS = tuple(PARAM_DEFAULTS.keys())
 AUTO_KEYS = tuple(AUTO_DEFAULTS.keys())
@@ -1746,6 +1889,16 @@ class EdgeBatchGUI:
             textvariable=self.param_vars["auto_workers"],
             width=6,
         ).grid(row=9, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Candidate parallel (0=off)").grid(row=15, column=2, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0,
+            to=8,
+            increment=1,
+            textvariable=self.param_vars["auto_candidate_workers"],
+            width=6,
+        ).grid(row=15, column=3, sticky="w", padx=(4, 12))
 
         ttk.Button(
             auto_frame,
@@ -3787,70 +3940,156 @@ USER PRE-ANSWERS (before starting Auto):
             round_improved = False
             early_exit_after = max(8, int(round_early_exit_frac * len(pool)))
             no_improve_count = 0
-            report_lines.append(f"[INFO] Round {round_num} pool={len(pool)} (explore+exploit+local), early_exit_after={early_exit_after} ({round_early_exit_frac*100:.0f}%)")
+            candidate_workers = max(0, int(auto_config.get("auto_candidate_workers", 0)))
+            report_lines.append(
+                f"[INFO] Round {round_num} pool={len(pool)} (explore+exploit+local), early_exit_after={early_exit_after} ({round_early_exit_frac*100:.0f}%)"
+                + (f", candidate_workers={candidate_workers}" if candidate_workers else "")
+            )
 
-            for idx, settings in enumerate(pool):
-                if processed >= phase_cap:
-                    break
-                if not wait_if_paused():
-                    stop_reason = "stopped"
-                    break
-                if check_stagnation():
-                    stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
-                    break
-                if no_improve_count >= early_exit_after:
-                    report_lines.append(f"[INFO] Round {round_num} early exit (no improvement after {early_exit_after})")
-                    break
-                key = key_from(settings)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                score, summary, qualities = self._evaluate_settings(data_full, settings, auto_config)
-                processed += 1
-                seq += 1
-                elapsed = time.time() - start_time
-                avg_time = elapsed / max(1, processed)
-                eta_seconds = avg_time * max(0, target_eval - processed)
-                score_base = qualities["q_cont"] * qualities["q_band"]
-                penalty = max(0.0, 1.0 - score)
-                evaluated.append((score, settings, summary))
-                score_disp = self._score_to_display(score, display_mode)
-                report_lines.append(
-                    f"r{round_num}_{seq:04d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
-                    f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
-                    f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
-                    f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
-                    f"nms={settings['nms_relax']:.2f} high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
-                )
-                scores.append(score)
-                if best is None or score > best_score:
-                    best_score = score
-                    best = settings
-                    best_thickness = summary["thickness"]
-                    last_best_time = time.time()
-                    round_improved = True
-                    no_improve_count = 0
-                    self._message_queue.put(("auto_best", best_score, elapsed))
-                else:
-                    no_improve_count += 1
-                best_progress.append(best_score)
-                self._auto_best_time_series.append((elapsed, best_score))
-                self._message_queue.put(
-                    (
-                        "auto_progress",
-                        seq,
-                        target_eval,
-                        score,
-                        best_score,
-                        eta_seconds,
-                        f"round{round_num}",
-                        elapsed,
-                        summary,
-                        qualities,
-                        score_base,
-                        penalty,
+            if candidate_workers >= 1:
+                batch_size = min(candidate_workers, 8)
+                idx = 0
+                while idx < len(pool) and not stop_reason:
+                    if processed >= phase_cap or no_improve_count >= early_exit_after:
+                        break
+                    if not wait_if_paused():
+                        stop_reason = "stopped"
+                        break
+                    if check_stagnation():
+                        stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
+                        break
+                    batch = []
+                    while idx < len(pool) and len(batch) < batch_size:
+                        s = pool[idx]
+                        idx += 1
+                        if key_from(s) in seen_keys:
+                            continue
+                        batch.append(s)
+                    if not batch:
+                        continue
+                    for s in batch:
+                        seen_keys.add(key_from(s))
+                    try:
+                        with ProcessPoolExecutor(max_workers=len(batch)) as ex:
+                            results = list(ex.map(
+                                lambda s: evaluate_one_candidate_mp(data_full, s, auto_config),
+                                batch,
+                                chunksize=1,
+                            ))
+                    except Exception as e:
+                        report_lines.append(f"[WARN] ProcessPool failed: {e}, falling back to sequential")
+                        results = [self._evaluate_settings(data_full, s, auto_config) for s in batch]
+                    for s, (score, summary, qualities) in zip(batch, results):
+                        processed += 1
+                        seq += 1
+                        elapsed = time.time() - start_time
+                        avg_time = elapsed / max(1, processed)
+                        eta_seconds = avg_time * max(0, target_eval - processed)
+                        score_base = qualities["q_cont"] * qualities["q_band"]
+                        penalty = max(0.0, 1.0 - score)
+                        evaluated.append((score, s, summary))
+                        score_disp = self._score_to_display(score, display_mode)
+                        report_lines.append(
+                            f"r{round_num}_{seq:04d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
+                            f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
+                            f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                            f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
+                            f"nms={s['nms_relax']:.2f} high={s['high_ratio']:.3f} band={s['boundary_band_radius']} margin={s['polarity_drop_margin']:.2f}"
+                        )
+                        scores.append(score)
+                        if best is None or score > best_score:
+                            best_score = score
+                            best = s
+                            best_thickness = summary["thickness"]
+                            last_best_time = time.time()
+                            round_improved = True
+                            no_improve_count = 0
+                            self._message_queue.put(("auto_best", best_score, elapsed))
+                        else:
+                            no_improve_count += 1
+                        best_progress.append(best_score)
+                        self._auto_best_time_series.append((elapsed, best_score))
+                        self._message_queue.put(
+                            (
+                                "auto_progress",
+                                seq,
+                                target_eval,
+                                score,
+                                best_score,
+                                eta_seconds,
+                                f"round{round_num}",
+                                elapsed,
+                                summary,
+                                qualities,
+                                score_base,
+                                penalty,
+                            )
+                        )
+                        if no_improve_count >= early_exit_after or processed >= phase_cap:
+                            break
+            else:
+                for idx, settings in enumerate(pool):
+                    if processed >= phase_cap:
+                        break
+                    if not wait_if_paused():
+                        stop_reason = "stopped"
+                        break
+                    if check_stagnation():
+                        stop_reason = f"stagnation>{early_stop_minutes:.0f}min"
+                        break
+                    if no_improve_count >= early_exit_after:
+                        report_lines.append(f"[INFO] Round {round_num} early exit (no improvement after {early_exit_after})")
+                        break
+                    key = key_from(settings)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    score, summary, qualities = self._evaluate_settings(data_full, settings, auto_config)
+                    processed += 1
+                    seq += 1
+                    elapsed = time.time() - start_time
+                    avg_time = elapsed / max(1, processed)
+                    eta_seconds = avg_time * max(0, target_eval - processed)
+                    score_base = qualities["q_cont"] * qualities["q_band"]
+                    penalty = max(0.0, 1.0 - score)
+                    evaluated.append((score, settings, summary))
+                    score_disp = self._score_to_display(score, display_mode)
+                    report_lines.append(
+                        f"r{round_num}_{seq:04d} score={score_disp:.12f} raw={score:.12e} base={score_base:.6f} pen={penalty:.6f} "
+                        f"coverage={summary['coverage']:.4f} gap={summary['gap']:.4f} "
+                        f"cont={summary['continuity']:.4f} band={summary['band_ratio']:.4f} "
+                        f"end={summary['endpoints']:.4f} wrk={summary['wrinkle']:.4f} br={summary['branch']:.4f} "
+                        f"nms={settings['nms_relax']:.2f} high={settings['high_ratio']:.3f} band={settings['boundary_band_radius']} margin={settings['polarity_drop_margin']:.2f}"
                     )
-                )
+                    scores.append(score)
+                    if best is None or score > best_score:
+                        best_score = score
+                        best = settings
+                        best_thickness = summary["thickness"]
+                        last_best_time = time.time()
+                        round_improved = True
+                        no_improve_count = 0
+                        self._message_queue.put(("auto_best", best_score, elapsed))
+                    else:
+                        no_improve_count += 1
+                    best_progress.append(best_score)
+                    self._auto_best_time_series.append((elapsed, best_score))
+                    self._message_queue.put(
+                        (
+                            "auto_progress",
+                            seq,
+                            target_eval,
+                            score,
+                            best_score,
+                            eta_seconds,
+                            f"round{round_num}",
+                            elapsed,
+                            summary,
+                            qualities,
+                            score_base,
+                            penalty,
+                        )
+                    )
 
             if not round_improved:
                 no_improve_rounds += 1

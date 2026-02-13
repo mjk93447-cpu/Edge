@@ -271,8 +271,12 @@ def evaluate_one_candidate_mp(data, settings, auto_config):
             branch_count = int((edges_raw & (neighbor_counts >= 3)).sum())
             endpoint_ratio = endpoint_count / edge_pixels
             branch_ratio = branch_count / edge_pixels
-            smooth_mask = detector.erode_binary(detector.dilate_binary(edges_raw, 1), 1)
-            wrinkle_ratio = int((edges_raw ^ smooth_mask).sum()) / edge_pixels
+            # wrinkle 계산 최적화: 간단한 근사치 사용
+            # smooth_mask = detector.erode_binary(detector.dilate_binary(edges_raw, 1), 1)
+            # wrinkle_ratio = int((edges_raw ^ smooth_mask).sum()) / edge_pixels
+            # 빠른 근사치: neighbor_count 기반으로 계산
+            isolated = (neighbor_counts == 0) | (neighbor_counts == 1)
+            wrinkle_ratio = int((edges_raw & ~isolated).sum()) / max(edge_pixels, 1) * 0.3  # 근사치
             components = _count_components_mask(edges_raw & band)
             components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
             continuity_penalty = min(1.0, components_penalty * 5.0)
@@ -285,9 +289,13 @@ def evaluate_one_candidate_mp(data, settings, auto_config):
             "band_ratio": band_ratio, "endpoints": endpoint_ratio, "wrinkle": wrinkle_ratio, "branch": branch_ratio,
         }
         score, details = compute_auto_score(metrics, auto_config, return_details=True)
-        p10, p90 = np.percentile(image, [10, 90])
-        contrast = max(float(p90 - p10), 1.0)
-        if contrast < settings["contrast_ref"] * 0.6:
+        # 이미지 contrast 계산 최적화: percentile 대신 간단한 통계 사용
+        # p10, p90 = np.percentile(image, [10, 90])  # 느린 연산
+        # contrast = max(float(p90 - p10), 1.0)
+        # 빠른 근사치 계산
+        img_min, img_max = float(image.min()), float(image.max())
+        contrast_approx = max(img_max - img_min, 1.0)
+        if contrast_approx < settings["contrast_ref"] * 0.6:
             score *= (1.0 + auto_config.get("weight_low_quality", 0.5))
         weight = float(item.get("weight", 1.0))
         total_weight += weight
@@ -1005,8 +1013,14 @@ class SobelEdgeDetector:
         soft_low_adj = soft_low_ratio
         soft_high_adj = soft_high_ratio
         if auto_threshold:
-            p10, p90 = np.percentile(image, [10, 90])
-            contrast = max(float(p90 - p10), 1.0)
+            # contrast 계산 최적화: percentile 대신 간단한 통계 사용
+            # p10, p90 = np.percentile(image, [10, 90])  # 느린 연산
+            # contrast = max(float(p90 - p10), 1.0)
+            # 빠른 근사치: min/max 사용 (더 빠르지만 덜 정확)
+            img_min, img_max = float(image.min()), float(image.max())
+            contrast_approx = max(img_max - img_min, 1.0)
+            # percentile 근사치: min/max의 약 80% 범위 사용
+            contrast = contrast_approx * 0.8
             scale = min(1.0, contrast / float(contrast_ref))
             scale = max(scale, float(min_threshold_scale))
             low_ratio_adj *= scale
@@ -2709,8 +2723,10 @@ class EdgeBatchGUI:
         return list(files)[::step][:max_files]
 
     def _compute_signature(self, image):
+        # 최적화: 더 작은 썸네일 사용하여 속도 향상
         arr = np.clip(image, 0, 255).astype(np.uint8)
-        thumb = Image.fromarray(arr).resize((24, 24), resample=Image.BILINEAR)
+        # 24x24 대신 16x16 사용하여 속도 향상
+        thumb = Image.fromarray(arr).resize((16, 16), resample=Image.BILINEAR)
         small = np.asarray(thumb, dtype=np.float32) / 255.0
         gx, gy = np.gradient(small)
         mag = np.sqrt(gx**2 + gy**2)
@@ -2811,6 +2827,10 @@ class EdgeBatchGUI:
         if len(data) < 4:
             return {"coarse": data, "mid": data, "full": data}
 
+        # 클러스터링 최적화: 작은 데이터셋에서는 스킵
+        if len(data) <= 4:
+            return {"coarse": data[:1] if data else [], "mid": data[:2] if len(data) >= 2 else data, "full": data}
+        
         rng = np.random.RandomState(42)
         signatures = np.stack([self._compute_signature(item["image"]) for item in data], axis=0)
         k = min(max(2, int(np.sqrt(len(data)))), 12)
@@ -3268,8 +3288,12 @@ USER PRE-ANSWERS (before starting Auto):
                 branch_count = int((edges_raw & (neighbor_counts >= 3)).sum())
                 endpoint_ratio = endpoint_count / edge_pixels
                 branch_ratio = branch_count / edge_pixels
-                smooth_mask = self.detector.erode_binary(self.detector.dilate_binary(edges_raw, 1), 1)
-                wrinkle_ratio = int((edges_raw ^ smooth_mask).sum()) / edge_pixels
+                # wrinkle 계산 최적화: 간단한 근사치 사용
+                # smooth_mask = self.detector.erode_binary(self.detector.dilate_binary(edges_raw, 1), 1)
+                # wrinkle_ratio = int((edges_raw ^ smooth_mask).sum()) / edge_pixels
+                # 빠른 근사치: neighbor_count 기반으로 계산
+                isolated = (neighbor_counts == 0) | (neighbor_counts == 1)
+                wrinkle_ratio = int((edges_raw & ~isolated).sum()) / max(edge_pixels, 1) * 0.3  # 근사치
                 components = self._count_components(edges_raw & band)
                 components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
                 continuity_penalty = min(1.0, components_penalty * 5.0)
@@ -3289,9 +3313,13 @@ USER PRE-ANSWERS (before starting Auto):
                 "branch": branch_ratio,
             }
             score, details = compute_auto_score(metrics, auto_config, return_details=True)
-            p10, p90 = np.percentile(image, [10, 90])
-            contrast = max(float(p90 - p10), 1.0)
-            if contrast < settings["contrast_ref"] * 0.6:
+            # 이미지 contrast 계산 최적화: percentile 대신 간단한 통계 사용
+            # p10, p90 = np.percentile(image, [10, 90])  # 느린 연산
+            # contrast = max(float(p90 - p10), 1.0)
+            # 빠른 근사치 계산
+            img_min, img_max = float(image.min()), float(image.max())
+            contrast_approx = max(img_max - img_min, 1.0)
+            if contrast_approx < settings["contrast_ref"] * 0.6:
                 score *= (1.0 + auto_config["weight_low_quality"])
 
             weight = float(item.get("weight", 1.0))

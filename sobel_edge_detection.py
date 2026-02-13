@@ -3834,6 +3834,9 @@ USER PRE-ANSWERS (before starting Auto):
         data_coarse = data.get("coarse", [])
         data_mid = data.get("mid", [])
         data_full = data.get("full", [])
+        
+        # 첫 번째 평가를 빠르게 하기 위해 coarse 데이터 사용 (이미 준비됨)
+        # 첫 평가 후 full 데이터로 전환
         if not data_coarse:
             data_coarse = data_full
         if not data_mid:
@@ -4047,8 +4050,10 @@ USER PRE-ANSWERS (before starting Auto):
                         seen_keys.add(key_from(s))
                     try:
                         # 모듈 레벨 함수 사용하여 pickle 문제 해결
+                        # 첫 번째 평가는 coarse 데이터로 빠르게, 이후 full 데이터 사용
+                        eval_data = data_coarse if (round_num == 1 and processed == 0) else data_full
                         with ProcessPoolExecutor(max_workers=len(batch)) as ex:
-                            args_list = [(data_full, s, auto_config) for s in batch]
+                            args_list = [(eval_data, s, auto_config) for s in batch]
                             results = list(ex.map(_eval_candidate_wrapper_mp, args_list, chunksize=1))
                     except Exception as e:
                         report_lines.append(f"[WARN] ProcessPool failed: {e}, falling back to sequential")
@@ -4118,7 +4123,9 @@ USER PRE-ANSWERS (before starting Auto):
                     if key in seen_keys:
                         continue
                     seen_keys.add(key)
-                    score, summary, qualities = self._evaluate_settings(data_full, settings, auto_config)
+                    # 첫 번째 평가는 coarse 데이터로 빠르게, 이후 full 데이터 사용
+                    eval_data = data_coarse if (round_num == 1 and processed == 0) else data_full
+                    score, summary, qualities = self._evaluate_settings(eval_data, settings, auto_config)
                     processed += 1
                     seq += 1
                     elapsed = time.time() - start_time

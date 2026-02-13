@@ -1,7 +1,9 @@
 import json
 import math
+import multiprocessing
 import os
 import queue
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
@@ -208,11 +210,18 @@ def evaluate_one_candidate_mp(data, settings, auto_config):
     Evaluate one candidate in a worker process (Intel multi-core speedup).
     Returns (score, summary, qualities). Used by ProcessPoolExecutor.
     """
-    import sys
-    mod = sys.modules.get("sobel_edge_detection") or sys.modules.get("__main__")
-    SobelEdgeDetector = getattr(mod, "SobelEdgeDetector")
-    compute_auto_score = getattr(mod, "compute_auto_score")
-    _count_components_mask = getattr(mod, "_count_components_mask")
+    # Import the module directly to avoid __main__ issues on Windows
+    try:
+        import sobel_edge_detection as mod
+    except ImportError:
+        # Fallback: try to get from sys.modules
+        import sys
+        mod = sys.modules.get("sobel_edge_detection")
+        if mod is None:
+            raise RuntimeError("Cannot import sobel_edge_detection module in worker process")
+    SobelEdgeDetector = mod.SobelEdgeDetector
+    compute_auto_score = mod.compute_auto_score
+    _count_components_mask = mod._count_components_mask
     detector = SobelEdgeDetector()
     settings_eval = dict(settings)
     settings_eval["use_boundary_band_filter"] = False
@@ -4700,6 +4709,9 @@ USER PRE-ANSWERS (before starting Auto):
 
 
 def main():
+    # Prevent GUI from opening in worker processes (Windows multiprocessing)
+    if multiprocessing.current_process().name != "MainProcess":
+        return
     if tk is None:
         raise RuntimeError("tkinter is not installed. Install it to run the GUI.")
     root = tk.Tk()
@@ -4708,4 +4720,13 @@ def main():
 
 
 if __name__ == "__main__":
+    # Windows multiprocessing support: prevent GUI from opening in worker processes
+    if sys.platform == "win32":
+        multiprocessing.freeze_support()
+        # Use spawn method on Windows to avoid re-importing the module
+        try:
+            multiprocessing.set_start_method('spawn', force=True)
+        except RuntimeError:
+            # Already set, ignore
+            pass
     main()

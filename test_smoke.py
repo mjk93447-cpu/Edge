@@ -10,6 +10,7 @@ from sobel_edge_detection import (
     PARAM_DEFAULTS,
     SobelEdgeDetector,
     compute_auto_score,
+    get_auto_profile_overrides,
     load_json_config,
     save_json_config,
 )
@@ -57,6 +58,18 @@ class SobelSmokeTest(unittest.TestCase):
         }
         score = compute_auto_score(metrics, AUTO_DEFAULTS)
         self.assertGreater(score, 0.0)
+
+    def test_get_auto_profile_overrides(self):
+        self.assertEqual(get_auto_profile_overrides(None, None), {})
+        o = get_auto_profile_overrides(True, None)
+        self.assertIn("auto_contrast_ref_min", o)
+        self.assertIn("auto_contrast_ref_max", o)
+        o2 = get_auto_profile_overrides(None, True)
+        self.assertIn("auto_blur_sigma_min", o2)
+        self.assertIn("auto_nms_min", o2)
+        o3 = get_auto_profile_overrides(False, False)
+        self.assertIn("auto_contrast_ref_min", o3)
+        self.assertIn("auto_blur_sigma_step", o3)
 
 
 if __name__ == "__main__":

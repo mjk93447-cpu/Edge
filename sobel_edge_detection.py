@@ -63,60 +63,61 @@ PARAM_DEFAULTS = {
     "polarity_drop_margin": 0.5,
 }
 
+# Optimal defaults: high-impact params use finer steps; low-impact use coarser or fixed ranges.
 AUTO_DEFAULTS = {
-    "auto_nms_min": 0.88,
-    "auto_nms_max": 1.00,
-    "auto_nms_step": 0.01,
-    "auto_high_min": 0.06,
-    "auto_high_max": 0.18,
-    "auto_high_step": 0.01,
-    "auto_low_factor_min": 0.25,
-    "auto_low_factor_max": 0.45,
-    "auto_low_factor_step": 0.05,
+    "auto_nms_min": 0.90,
+    "auto_nms_max": 0.97,
+    "auto_nms_step": 0.005,
+    "auto_high_min": 0.07,
+    "auto_high_max": 0.14,
+    "auto_high_step": 0.005,
+    "auto_low_factor_min": 0.30,
+    "auto_low_factor_max": 0.42,
+    "auto_low_factor_step": 0.02,
     "auto_band_min": 1,
-    "auto_band_max": 4,
-    "auto_margin_min": 0.0,
-    "auto_margin_max": 0.6,
-    "auto_margin_step": 0.05,
-    "auto_blur_sigma_min": 0.8,
-    "auto_blur_sigma_max": 1.6,
-    "auto_blur_sigma_step": 0.2,
+    "auto_band_max": 3,
+    "auto_margin_min": 0.10,
+    "auto_margin_max": 0.45,
+    "auto_margin_step": 0.02,
+    "auto_blur_sigma_min": 1.0,
+    "auto_blur_sigma_max": 1.4,
+    "auto_blur_sigma_step": 0.1,
     "auto_blur_kernel_min": 3,
     "auto_blur_kernel_max": 7,
     "auto_blur_kernel_step": 2,
-    "auto_thinning_min": 8,
-    "auto_thinning_max": 20,
-    "auto_thinning_step": 4,
-    "auto_contrast_ref_min": 60.0,
-    "auto_contrast_ref_max": 120.0,
-    "auto_contrast_ref_step": 10.0,
-    "auto_min_scale_min": 0.4,
-    "auto_min_scale_max": 0.8,
-    "auto_min_scale_step": 0.1,
+    "auto_thinning_min": 10,
+    "auto_thinning_max": 18,
+    "auto_thinning_step": 2,
+    "auto_contrast_ref_min": 70.0,
+    "auto_contrast_ref_max": 110.0,
+    "auto_contrast_ref_step": 5.0,
+    "auto_min_scale_min": 0.50,
+    "auto_min_scale_max": 0.75,
+    "auto_min_scale_step": 0.05,
     "auto_soft_high_min": 0.08,
-    "auto_soft_high_max": 0.18,
+    "auto_soft_high_max": 0.16,
     "auto_soft_high_step": 0.02,
-    "auto_soft_low_factor_min": 0.25,
-    "auto_soft_low_factor_max": 0.45,
+    "auto_soft_low_factor_min": 0.28,
+    "auto_soft_low_factor_max": 0.42,
     "auto_soft_low_factor_step": 0.05,
     "auto_link_radius_min": 1,
     "auto_link_radius_max": 4,
     "auto_link_radius_step": 1,
-    "auto_soft_link_prob": 0.5,
+    "auto_soft_link_prob": 0.4,
     "auto_edge_smooth_radius_min": 0,
     "auto_edge_smooth_radius_max": 2,
     "auto_edge_smooth_iters_min": 1,
     "auto_edge_smooth_iters_max": 2,
     "auto_spur_prune_min": 0,
-    "auto_spur_prune_max": 3,
-    "auto_use_edge_smooth_prob": 0.6,
-    "auto_use_closing_prob": 0.3,
+    "auto_spur_prune_max": 2,
+    "auto_use_edge_smooth_prob": 0.5,
+    "auto_use_closing_prob": 0.25,
     "auto_closing_radius_min": 1,
     "auto_closing_radius_max": 2,
     "auto_closing_iter_min": 1,
     "auto_closing_iter_max": 2,
-    "auto_magnitude_gamma_min": 0.8,
-    "auto_magnitude_gamma_max": 1.4,
+    "auto_magnitude_gamma_min": 0.9,
+    "auto_magnitude_gamma_max": 1.2,
     "auto_magnitude_gamma_step": 0.1,
     "auto_median_kernel_min": 3,
     "auto_median_kernel_max": 5,
@@ -136,9 +137,43 @@ AUTO_DEFAULTS = {
     "early_stop_minutes": 10.0,
     "auto_round_early_exit_no_improve_frac": 0.25,
     "auto_no_improve_rounds_stop": 2,
+    "auto_phase1_max_thickness": 0.25,
+    "auto_phase1_frac": 0.5,
+    "auto_phase1_min_evals": 150,
     "auto_parallel": True,
     "auto_workers": max(1, (os.cpu_count() or 4) - 1),
 }
+
+
+def get_auto_profile_overrides(grayscale=None, low_quality=None):
+    """Return dict of auto_config overrides based on user answers. None = not sure (no override)."""
+    overrides = {}
+    if grayscale is True:
+        overrides["auto_contrast_ref_min"] = 75.0
+        overrides["auto_contrast_ref_max"] = 105.0
+        overrides["auto_contrast_ref_step"] = 5.0
+        overrides["auto_magnitude_gamma_min"] = 0.95
+        overrides["auto_magnitude_gamma_max"] = 1.15
+    elif grayscale is False:
+        overrides["auto_contrast_ref_min"] = 65.0
+        overrides["auto_contrast_ref_max"] = 115.0
+        overrides["auto_contrast_ref_step"] = 5.0
+    if low_quality is True:
+        overrides["auto_blur_sigma_min"] = 1.1
+        overrides["auto_blur_sigma_max"] = 1.8
+        overrides["auto_blur_sigma_step"] = 0.15
+        overrides["auto_nms_min"] = 0.88
+        overrides["auto_nms_max"] = 0.98
+        overrides["auto_nms_step"] = 0.008
+        overrides["auto_spur_prune_max"] = 3
+        overrides["auto_use_edge_smooth_prob"] = 0.6
+        overrides["weight_low_quality"] = 0.7
+    elif low_quality is False:
+        overrides["auto_blur_sigma_min"] = 1.0
+        overrides["auto_blur_sigma_max"] = 1.35
+        overrides["auto_blur_sigma_step"] = 0.08
+        overrides["auto_nms_step"] = 0.005
+    return overrides
 
 PARAM_KEYS = tuple(PARAM_DEFAULTS.keys())
 AUTO_KEYS = tuple(AUTO_DEFAULTS.keys())
@@ -1012,6 +1047,8 @@ class EdgeBatchGUI:
         self._auto_wrinkle_scores = []
         self._auto_endpoint_scores = []
         self._auto_branch_scores = []
+        self._auto_image_grayscale = None
+        self._auto_image_low_quality = None
         self.score_display_mode.trace_add("write", lambda *_: self._refresh_auto_graphs())
         self._auto_start_time = None
         self._auto_last_best_time = None
@@ -1716,7 +1753,13 @@ class EdgeBatchGUI:
             command=self._show_score_help,
             width=18,
         ).grid(row=10, column=0, columnspan=2, sticky="w", padx=(0, 12))
-        ttk.Label(auto_frame, text="W continuity").grid(row=10, column=2, sticky="w")
+        ttk.Button(
+            auto_frame,
+            text="Auto Search Params Help",
+            command=self._show_auto_params_help,
+            width=20,
+        ).grid(row=10, column=2, columnspan=2, sticky="w", padx=(0, 12))
+        ttk.Label(auto_frame, text="W continuity").grid(row=10, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1.0,
@@ -1724,9 +1767,9 @@ class EdgeBatchGUI:
             increment=0.2,
             textvariable=self.param_vars["weight_continuity"],
             width=6,
-        ).grid(row=10, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=10, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W band fit").grid(row=10, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W band fit").grid(row=11, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1.0,
@@ -1734,9 +1777,9 @@ class EdgeBatchGUI:
             increment=0.2,
             textvariable=self.param_vars["weight_band_fit"],
             width=6,
-        ).grid(row=10, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W coverage").grid(row=11, column=0, sticky="w")
+        ttk.Label(auto_frame, text="W coverage").grid(row=11, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1744,9 +1787,8 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_coverage"],
             width=6,
-        ).grid(row=11, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W gap").grid(row=11, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1754,9 +1796,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_gap"],
             width=6,
-        ).grid(row=11, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=11, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W outside").grid(row=11, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W outside").grid(row=12, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1764,9 +1806,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_outside"],
             width=6,
-        ).grid(row=11, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=12, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W thickness").grid(row=12, column=0, sticky="w")
+        ttk.Label(auto_frame, text="W thickness").grid(row=12, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
@@ -1774,9 +1816,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_thickness"],
             width=6,
-        ).grid(row=12, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=12, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W intrusion").grid(row=12, column=2, sticky="w")
+        ttk.Label(auto_frame, text="W intrusion").grid(row=12, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1784,9 +1826,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_intrusion"],
             width=6,
-        ).grid(row=12, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=12, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W low quality").grid(row=12, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W low quality").grid(row=13, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
@@ -1794,9 +1836,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_low_quality"],
             width=6,
-        ).grid(row=12, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=13, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W endpoints").grid(row=13, column=0, sticky="w")
+        ttk.Label(auto_frame, text="W endpoints").grid(row=13, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1804,13 +1846,13 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_endpoints"],
             width=6,
-        ).grid(row=13, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=13, column=3, sticky="w", padx=(4, 12))
 
         ttk.Checkbutton(
             auto_frame,
             text="Early stop on stagnation (min)",
             variable=self.param_vars["early_stop_enabled"],
-        ).grid(row=13, column=2, sticky="w")
+        ).grid(row=13, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1,
@@ -1818,9 +1860,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["early_stop_minutes"],
             width=6,
-        ).grid(row=13, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=13, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W wrinkle").grid(row=13, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W wrinkle").grid(row=14, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1828,9 +1870,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_wrinkle"],
             width=6,
-        ).grid(row=13, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=14, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="W branch").grid(row=14, column=0, sticky="w")
+        ttk.Label(auto_frame, text="W branch").grid(row=14, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.5,
@@ -1838,9 +1880,9 @@ class EdgeBatchGUI:
             increment=0.1,
             textvariable=self.param_vars["weight_branch"],
             width=6,
-        ).grid(row=14, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=14, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Round early exit %").grid(row=14, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Round early exit %").grid(row=14, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.05,
@@ -1849,9 +1891,9 @@ class EdgeBatchGUI:
             textvariable=self.param_vars["auto_round_early_exit_no_improve_frac"],
             width=6,
             format="%.2f",
-        ).grid(row=14, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=14, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="No-improve rounds stop").grid(row=14, column=4, sticky="w")
+        ttk.Label(auto_frame, text="No-improve rounds stop").grid(row=15, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1,
@@ -1859,9 +1901,9 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_no_improve_rounds_stop"],
             width=6,
-        ).grid(row=14, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=15, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft link prob").grid(row=15, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Soft link prob").grid(row=16, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.0,
@@ -1869,9 +1911,9 @@ class EdgeBatchGUI:
             increment=0.05,
             textvariable=self.param_vars["auto_soft_link_prob"],
             width=6,
-        ).grid(row=15, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=16, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft high min").grid(row=15, column=2, sticky="w")
+        ttk.Label(auto_frame, text="Soft high min").grid(row=16, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.04,
@@ -1879,9 +1921,9 @@ class EdgeBatchGUI:
             increment=0.01,
             textvariable=self.param_vars["auto_soft_high_min"],
             width=6,
-        ).grid(row=15, column=3, sticky="w", padx=(4, 12))
+        ).grid(row=16, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft high max").grid(row=15, column=4, sticky="w")
+        ttk.Label(auto_frame, text="Soft high max").grid(row=16, column=4, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.04,
@@ -1889,9 +1931,9 @@ class EdgeBatchGUI:
             increment=0.01,
             textvariable=self.param_vars["auto_soft_high_max"],
             width=6,
-        ).grid(row=15, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=16, column=5, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Soft high step").grid(row=16, column=0, sticky="w")
+        ttk.Label(auto_frame, text="Soft high step").grid(row=17, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.005,
@@ -1899,7 +1941,7 @@ class EdgeBatchGUI:
             increment=0.005,
             textvariable=self.param_vars["auto_soft_high_step"],
             width=6,
-        ).grid(row=15, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=17, column=1, sticky="w", padx=(4, 12))
 
         ttk.Label(auto_frame, text="Soft low factor min").grid(row=16, column=2, sticky="w")
         ttk.Spinbox(
@@ -2689,7 +2731,12 @@ class EdgeBatchGUI:
         return settings
 
     def _get_auto_config(self):
-        return self._collect_values(AUTO_KEYS)
+        config = self._collect_values(AUTO_KEYS)
+        overrides = get_auto_profile_overrides(
+            getattr(self, "_auto_image_grayscale", None),
+            getattr(self, "_auto_image_low_quality", None),
+        )
+        return {**config, **overrides}
 
     def _save_param_config(self):
         config = {"params": self._collect_values(PARAM_KEYS)}
@@ -2864,6 +2911,62 @@ ADJUSTING WEIGHTS:
         button_frame = ttk.Frame(help_window)
         button_frame.pack(fill=tk.X, padx=12, pady=8)
         ttk.Button(button_frame, text="Close", command=help_window.destroy).pack(side=tk.RIGHT)
+
+    def _show_auto_params_help(self):
+        win = tk.Toplevel(self.root)
+        win.title("Auto Search Params Help")
+        win.geometry("720x580")
+        win.transient(self.root)
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(f)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        txt = tk.Text(f, wrap=tk.WORD, yscrollcommand=sb.set, padx=8, pady=8, font=("Consolas", 9))
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=txt.yview)
+        content = """Auto Search Range / Scoring — Parameter Impact and Steps
+
+HIGH IMPACT (use fine steps; small changes affect edge quality a lot):
+
+• NMS min/max/step — Non-maximum suppression threshold. Higher = fewer, stronger edges; lower = more edges, risk of noise. Step: 0.005 recommended.
+• High min/max/step — High hysteresis threshold (strong edge pixels). Directly sets edge strength. Step: 0.005.
+• Low factor min/max/step — Ratio of low to high threshold. Affects edge continuity. Step: 0.02.
+• Margin min/max/step — Polarity drop margin; removes opposite-gradient pixels. Step: 0.02.
+• Blur sigma min/max/step — Pre-blur strength. Smooths noise; too high loses detail. Step: 0.1 (0.15 if low-quality images).
+• Contrast ref min/max/step — Reference contrast for normalization. Grayscale images often suit 75–105. Step: 5.
+• Min scale min/max/step — Minimum threshold scale. Step: 0.05.
+
+MEDIUM IMPACT:
+
+• Band min/max — Boundary band radius (pixels). Step: 1.
+• Thinning min/max/step — Zhang-Suen iterations. Step: 2.
+• Blur kernel min/max/step — Blur kernel size (odd). Step: 2.
+• Magnitude gamma min/max/step — Gradient magnitude curve. Step: 0.1.
+
+LOWER IMPACT (coarser steps or leave default):
+
+• Soft high/min/step, Soft low factor — Soft linking; step 0.02–0.05.
+• Link radius min/max — Step 1.
+• Edge smooth prob, radius, iters — Post-process smoothing; small effect.
+• Spur prune min/max — Removes short spurs; 0–2, step 1.
+• Closing prob, radius, iters — Morphological closing; minor.
+• Median kernel — Step 2.
+
+SCORING WEIGHTS (importance in final score):
+
+• weight_continuity, weight_band_fit — Highest (24, 12). Edge continuity and band fit.
+• weight_thickness, weight_branch — Important (1.2, 2.0). Thinner edges; fewer branches.
+• weight_coverage, weight_gap, weight_outside, weight_endpoints, weight_wrinkle, weight_intrusion — Normal (1.0).
+• weight_low_quality — Penalty for low-contrast regions (0.5).
+
+USER PRE-ANSWERS (before starting Auto):
+
+• Grayscale? Yes → narrower contrast_ref, tighter magnitude_gamma. No → wider contrast range.
+• Low quality? Yes → more blur, wider NMS range, higher spur prune, higher low_quality penalty. No → finer steps, less blur.
+"""
+        txt.insert("1.0", content)
+        txt.config(state=tk.DISABLED)
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=8)
 
     def _compute_boundary(self, mask):
         padded = np.pad(mask, 1, mode="edge")
@@ -3426,6 +3529,48 @@ ADJUSTING WEIGHTS:
                         out.append(s)
         return out
 
+    def _ask_image_type_and_quality(self):
+        """Show dialog: grayscale? low quality? Returns True to proceed, False to cancel."""
+        win = tk.Toplevel(self.root)
+        win.title("Input Image Type (for Auto Search Defaults)")
+        win.transient(self.root)
+        win.grab_set()
+        win.geometry("480x280")
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(f, text="Answer the following so auto search defaults can be tuned. You can skip with 'Not sure'.", wraplength=420).pack(anchor="w", pady=(0, 12))
+        grayscale_var = tk.StringVar(value="not_sure")
+        ttk.Label(f, text="Are the input images grayscale (black/white only)?", font=("", 10, "bold")).pack(anchor="w", pady=(4, 2))
+        ttk.Radiobutton(f, text="Yes (grayscale)", variable=grayscale_var, value="yes").pack(anchor="w")
+        ttk.Radiobutton(f, text="No (color)", variable=grayscale_var, value="no").pack(anchor="w")
+        ttk.Radiobutton(f, text="Not sure", variable=grayscale_var, value="not_sure").pack(anchor="w")
+        low_quality_var = tk.StringVar(value="not_sure")
+        ttk.Label(f, text="Is the image quality low (noisy, low resolution, blurry)?", font=("", 10, "bold")).pack(anchor="w", pady=(12, 2))
+        ttk.Radiobutton(f, text="Yes (low quality)", variable=low_quality_var, value="yes").pack(anchor="w")
+        ttk.Radiobutton(f, text="No (normal or high quality)", variable=low_quality_var, value="no").pack(anchor="w")
+        ttk.Radiobutton(f, text="Not sure", variable=low_quality_var, value="not_sure").pack(anchor="w")
+        result = [None]
+
+        def on_ok():
+            g = grayscale_var.get()
+            self._auto_image_grayscale = True if g == "yes" else (False if g == "no" else None)
+            q = low_quality_var.get()
+            self._auto_image_low_quality = True if q == "yes" else (False if q == "no" else None)
+            result[0] = True
+            win.destroy()
+
+        def on_cancel():
+            result[0] = False
+            win.destroy()
+
+        btn_f = ttk.Frame(f)
+        btn_f.pack(fill=tk.X, pady=(16, 0))
+        ttk.Button(btn_f, text="OK (apply and start)", command=on_ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_f, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=4)
+        win.protocol("WM_DELETE_WINDOW", on_cancel)
+        win.wait_window()
+        return result[0] is True
+
     def _start_auto_optimize(self):
         if self._worker_thread and self._worker_thread.is_alive():
             messagebox.showwarning("In Progress", "Processing is already running.")
@@ -3433,6 +3578,8 @@ ADJUSTING WEIGHTS:
         if not self.selected_files:
             self._add_files()
         if not self.selected_files:
+            return
+        if not self._ask_image_type_and_quality():
             return
 
         try:
@@ -3516,7 +3663,17 @@ ADJUSTING WEIGHTS:
             target_eval = 9000
         round_budget = 200 if mode == "Fast" else (1200 if is_perfect else 500)
         step_mults = PERFECT_STEP_MULTIPLIERS if is_perfect else None
-        report_lines.append(f"[INFO] Mixed-rounds optimization: target={target_eval} evals, round_budget={round_budget}")
+        phase1_frac = float(auto_config.get("auto_phase1_frac", 0.5))
+        phase1_max_thickness = float(auto_config.get("auto_phase1_max_thickness", 0.25))
+        phase1_min_evals = int(auto_config.get("auto_phase1_min_evals", 150))
+        phase1_budget = max(phase1_min_evals, int(target_eval * phase1_frac))
+        phase2_budget = target_eval
+        base_pre = dict(base_settings)
+        base_pre["use_thinning"] = False
+        report_lines.append(
+            f"[INFO] Two-phase optimization: Phase1 (no thinning) budget={phase1_budget}, "
+            f"max_thickness={phase1_max_thickness}, then Phase2 (with thinning) up to {target_eval} evals."
+        )
 
         def wait_if_paused():
             while self._auto_pause_event.is_set() and not self._auto_stop_event.is_set():
@@ -3525,6 +3682,7 @@ ADJUSTING WEIGHTS:
 
         def key_from(settings):
             return (
+                bool(settings.get("use_thinning", True)),
                 round(settings["nms_relax"], 3),
                 round(settings["high_ratio"], 3),
                 round(settings["low_ratio"], 3),
@@ -3558,8 +3716,34 @@ ADJUSTING WEIGHTS:
         no_improve_rounds = 0
         round_num = 0
         seq = 0
+        best_thickness = None
+        current_base = base_pre
+        phase = 1
+        phase_cap = phase1_budget
+        thinning_min = min(auto_config["auto_thinning_min"], auto_config["auto_thinning_max"])
+        thinning_max = max(auto_config["auto_thinning_min"], auto_config["auto_thinning_max"])
+        mid_thinning = max(1, (thinning_min + thinning_max) // 2)
 
-        while processed < target_eval and not stop_reason:
+        while not stop_reason:
+            if processed >= phase_cap:
+                if phase == 1:
+                    report_lines.append(
+                        f"[INFO] Phase 1 (pre-thinning) done: processed={processed}, best_thickness={best_thickness}, best_score={best_score:.6e}"
+                    )
+                    if best is not None:
+                        base_phase2 = dict(best)
+                        base_phase2["use_thinning"] = True
+                        base_phase2["thinning_max_iter"] = mid_thinning
+                        current_base = base_phase2
+                        phase_cap = target_eval
+                        phase = 2
+                        no_improve_rounds = 0
+                        report_lines.append("[INFO] Starting Phase 2 (with thinning).")
+                    else:
+                        break
+                else:
+                    break
+
             round_num += 1
             if not wait_if_paused():
                 stop_reason = "stopped"
@@ -3573,15 +3757,18 @@ ADJUSTING WEIGHTS:
             n_exploit = min(round_budget // 2, 220) if best else 0
             n_local = min(round_budget // 6, 48) if best else 0
             explore = self._build_candidates(
-                base_settings, mode, auto_config, n_explore, rng,
+                current_base, mode, auto_config, n_explore, rng,
                 step_scale=0.75, centers=centers_explore, step_multipliers=step_mults
             )
             exploit = self._build_candidates(
-                base_settings, mode, auto_config, n_exploit, rng,
+                current_base, mode, auto_config, n_exploit, rng,
                 step_scale=0.2, centers=[best], step_multipliers=step_mults
             ) if best else []
-            local_list = self._build_local_grid(best, base_settings, auto_config, size=n_local) if best else []
+            local_list = self._build_local_grid(best, current_base, auto_config, size=n_local) if best else []
             combined = (explore or []) + (exploit or []) + (local_list or [])
+            if phase == 1:
+                for s in combined:
+                    s["use_thinning"] = False
             rng.shuffle(combined)
             pool = []
             for s in combined:
@@ -3603,7 +3790,7 @@ ADJUSTING WEIGHTS:
             report_lines.append(f"[INFO] Round {round_num} pool={len(pool)} (explore+exploit+local), early_exit_after={early_exit_after} ({round_early_exit_frac*100:.0f}%)")
 
             for idx, settings in enumerate(pool):
-                if processed >= target_eval:
+                if processed >= phase_cap:
                     break
                 if not wait_if_paused():
                     stop_reason = "stopped"
@@ -3639,6 +3826,7 @@ ADJUSTING WEIGHTS:
                 if best is None or score > best_score:
                     best_score = score
                     best = settings
+                    best_thickness = summary["thickness"]
                     last_best_time = time.time()
                     round_improved = True
                     no_improve_count = 0
@@ -3672,6 +3860,19 @@ ADJUSTING WEIGHTS:
             else:
                 no_improve_rounds = 0
             report_lines.append(f"[INFO] Round {round_num} done best={best_score:.6e} processed={processed} no_improve_rounds={no_improve_rounds}/{no_improve_rounds_stop}")
+
+            if phase == 1 and best is not None and best_thickness is not None and best_thickness <= phase1_max_thickness and processed >= phase1_min_evals:
+                report_lines.append(
+                    f"[INFO] Phase 1 (pre-thinning) thickness target met: best_thickness={best_thickness:.4f}<={phase1_max_thickness}, switching to Phase 2."
+                )
+                base_phase2 = dict(best)
+                base_phase2["use_thinning"] = True
+                base_phase2["thinning_max_iter"] = mid_thinning
+                current_base = base_phase2
+                phase_cap = target_eval
+                phase = 2
+                no_improve_rounds = 0
+                report_lines.append("[INFO] Starting Phase 2 (with thinning).")
 
         if stop_reason:
             report_lines.append(f"[STOP] Optimization ended: {stop_reason}")

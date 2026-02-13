@@ -205,6 +205,12 @@ def _count_components_mask(mask):
     return components
 
 
+def _eval_candidate_wrapper_mp(args):
+    """ProcessPoolExecutor용 wrapper (모듈 레벨 함수)"""
+    data, settings, auto_config = args
+    return evaluate_one_candidate_mp(data, settings, auto_config)
+
+
 def evaluate_one_candidate_mp(data, settings, auto_config):
     """
     Evaluate one candidate in a worker process (Intel multi-core speedup).
@@ -4007,14 +4013,16 @@ USER PRE-ANSWERS (before starting Auto):
             early_exit_after = max(8, int(round_early_exit_frac * len(pool)))
             no_improve_count = 0
             candidate_workers = max(0, int(auto_config.get("auto_candidate_workers", 0)))
+            # 첫 번째 라운드 첫 번째 평가는 순차로 빠르게 시작, 이후 병렬화
+            use_parallel = candidate_workers >= 1 and (round_num > 1 or processed > 0)
             report_lines.append(
                 f"[INFO] Round {round_num} pool={len(pool)} (explore+exploit+local), early_exit_after={early_exit_after} ({round_early_exit_frac*100:.0f}%)"
-                + (f", candidate_workers={candidate_workers}" if candidate_workers else "")
+                + (f", candidate_workers={candidate_workers}" if use_parallel else ", sequential")
             )
             if round_num == 1:
-                self._message_queue.put(("auto_log", f"[INFO] Evaluating {len(pool)} candidates (workers={candidate_workers if candidate_workers else 'sequential'})..."))
+                self._message_queue.put(("auto_log", f"[INFO] Evaluating {len(pool)} candidates ({'sequential (first)' if not use_parallel else f'workers={candidate_workers}'})..."))
 
-            if candidate_workers >= 1:
+            if use_parallel:
                 batch_size = min(candidate_workers, 8)
                 idx = 0
                 while idx < len(pool) and not stop_reason:
@@ -4038,12 +4046,10 @@ USER PRE-ANSWERS (before starting Auto):
                     for s in batch:
                         seen_keys.add(key_from(s))
                     try:
+                        # 모듈 레벨 함수 사용하여 pickle 문제 해결
                         with ProcessPoolExecutor(max_workers=len(batch)) as ex:
-                            results = list(ex.map(
-                                lambda s: evaluate_one_candidate_mp(data_full, s, auto_config),
-                                batch,
-                                chunksize=1,
-                            ))
+                            args_list = [(data_full, s, auto_config) for s in batch]
+                            results = list(ex.map(_eval_candidate_wrapper_mp, args_list, chunksize=1))
                     except Exception as e:
                         report_lines.append(f"[WARN] ProcessPool failed: {e}, falling back to sequential")
                         results = [self._evaluate_settings(data_full, s, auto_config) for s in batch]

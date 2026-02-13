@@ -3795,7 +3795,10 @@ USER PRE-ANSWERS (before starting Auto):
         self._auto_wrinkle_scores = []
         self._auto_endpoint_scores = []
         self._auto_branch_scores = []
+        # 초기 그래프 업데이트로 빈 그래프 표시
         self._refresh_auto_graphs()
+        # 초기 상태 메시지
+        self._message_queue.put(("auto_progress", 0, 1, 0.0, 0.0, None, "initializing", 0.0, {}, {}, 0.0, 0.0))
         display_mode = self.score_display_mode.get()
         self._worker_thread = threading.Thread(
             target=self._auto_optimize_worker,
@@ -4461,10 +4464,10 @@ USER PRE-ANSWERS (before starting Auto):
         if not self.score_graph_label or not self.best_graph_label:
             return
         mode_label = self.score_display_mode.get() if self.score_display_mode else "raw"
-        display_scores = [self._score_to_display(v) for v in self._auto_scores]
+        display_scores = [self._score_to_display(v) for v in self._auto_scores] if self._auto_scores else [0.0]
         display_best_series = [
             (t, self._score_to_display(v)) for t, v in self._auto_best_time_series
-        ] or [(i, self._score_to_display(v)) for i, v in enumerate(self._auto_best_scores)]
+        ] if self._auto_best_time_series else ([(i, self._score_to_display(v)) for i, v in enumerate(self._auto_best_scores)] if self._auto_best_scores else [(0, 0.0)])
         score_img = self._render_graph(display_scores, f"Score ({mode_label})", width=460, height=260)
         best_img = self._render_time_graph(display_best_series, f"Best score ({mode_label})", width=460, height=260)
         metric_img = self._render_multi_graph(
@@ -4741,6 +4744,10 @@ USER PRE-ANSWERS (before starting Auto):
                 f"Auto optimizing... ({phase_text}{idx}/{total}) score={score_str} "
                 f"best={best_str}{eta_text}"
             )
+        elif msg_type == "auto_log":
+            # 로그 메시지 처리 추가
+            log_msg = msg[1] if len(msg) > 1 else ""
+            self._log(log_msg)
         elif msg_type == "auto_best":
             best_score, elapsed = msg[1], msg[2]
             best_str = self._format_score_for_display(best_score, None)

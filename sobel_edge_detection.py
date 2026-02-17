@@ -145,7 +145,67 @@ AUTO_DEFAULTS = {
     "auto_parallel": True,
     "auto_workers": max(1, (os.cpu_count() or 4) - 1),
     "auto_candidate_workers": min(4, max(1, (os.cpu_count() or 4) - 1)),
+    "auto_target_score": 0.3,
+    "auto_target_score_rounds_after": 1,
 }
+
+
+def get_strategy_for_target_score(target_score):
+    """
+    목표 점수에 맞춘 학습 전략 반환. 사용자 목표(0.3~0.6 등)에 따라
+    평가 예산·라운드 크기·조기종료·phase 비율 등을 튜닝한다.
+    Returns: dict with auto_config overrides and optional CLI keys:
+      eval_budget, round_size, round_early_exit_frac, phase1_frac,
+      auto_target_score_rounds_after, strategy_name.
+    """
+    t = float(target_score)
+    t = max(0.0, min(1.0, t))
+    out = {
+        "auto_target_score": t,
+        "strategy_name": "default",
+    }
+    if t <= 0.35:
+        out["auto_round_early_exit_no_improve_frac"] = 0.20
+        out["auto_no_improve_rounds_stop"] = 1
+        out["auto_target_score_rounds_after"] = 0
+        out["auto_phase1_frac"] = 0.4
+        out["auto_phase1_min_evals"] = 80
+        out["strategy_name"] = "aggressive_low"
+    elif t <= 0.45:
+        out["auto_round_early_exit_no_improve_frac"] = 0.22
+        out["auto_no_improve_rounds_stop"] = 2
+        out["auto_target_score_rounds_after"] = 1
+        out["auto_phase1_frac"] = 0.45
+        out["auto_phase1_min_evals"] = 120
+        out["strategy_name"] = "medium_04"
+    elif t <= 0.55:
+        out["auto_round_early_exit_no_improve_frac"] = 0.25
+        out["auto_no_improve_rounds_stop"] = 2
+        out["auto_target_score_rounds_after"] = 1
+        out["auto_phase1_frac"] = 0.5
+        out["auto_phase1_min_evals"] = 150
+        out["strategy_name"] = "medium_05"
+    else:
+        out["auto_round_early_exit_no_improve_frac"] = 0.28
+        out["auto_no_improve_rounds_stop"] = 3
+        out["auto_target_score_rounds_after"] = 2
+        out["auto_phase1_frac"] = 0.55
+        out["auto_phase1_min_evals"] = 200
+        out["strategy_name"] = "careful_06"
+    # CLI/standalone 전용: 목표별 평가 예산·라운드 크기 (빠른 도달용)
+    if t <= 0.35:
+        out["_cli_eval_budget"] = 250
+        out["_cli_round_size"] = 30
+    elif t <= 0.45:
+        out["_cli_eval_budget"] = 400
+        out["_cli_round_size"] = 35
+    elif t <= 0.55:
+        out["_cli_eval_budget"] = 600
+        out["_cli_round_size"] = 40
+    else:
+        out["_cli_eval_budget"] = 900
+        out["_cli_round_size"] = 45
+    return out
 
 
 def get_auto_profile_overrides(grayscale=None, low_quality=None):
@@ -379,6 +439,58 @@ def save_json_config(path, payload):
 def load_json_config(path):
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def get_boundary_score_weights():
+    """4회 루프 튜닝 결과(boundary_score_weights.json)가 있으면 로드. 없으면 None."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "boundary_score_weights.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def compute_boundary_optimized_score(metrics_gt, return_details=False, weights=None):
+    """
+    실제 테두리 감지에 최적화된 점수: 하나의 끊어지지 않고 연결된 얇은 선이
+    GT 경계를 정확히 따라가는지를 평가한다.
+    metrics_gt: recall_gt, precision_gt, f1_gt, thinness, n_components,
+                endpoint_ratio, branch_ratio(, pred_pixels, gt_pixels).
+    weights: optional dict (w_align, w_thin, w_conn, w_line, connectivity_penalty_per_component,
+             endpoint_penalty, branch_penalty). None이면 boundary_score_weights.json 로드 시도 후 기본값.
+    """
+    if weights is None:
+        weights = get_boundary_score_weights()
+    f1_gt = float(metrics_gt.get("f1_gt", 0.0))
+    thinness = float(metrics_gt.get("thinness", 0.0))
+    n_components = int(metrics_gt.get("n_components", 1))
+    endpoint_ratio = float(metrics_gt.get("endpoint_ratio", 0.0))
+    branch_ratio = float(metrics_gt.get("branch_ratio", 0.0))
+
+    alignment = f1_gt
+    c_pen = 0.25 if weights is None else float(weights.get("connectivity_penalty_per_component", 0.25))
+    connectivity = 1.0 if n_components <= 1 else max(0.0, 1.0 - c_pen * (n_components - 1))
+    e_pen = 0.4 if weights is None else float(weights.get("endpoint_penalty", 0.4))
+    b_pen = 0.25 if weights is None else float(weights.get("branch_penalty", 0.25))
+    single_line = max(0.0, 1.0 - e_pen * endpoint_ratio - b_pen * branch_ratio)
+
+    w_align = 0.45 if weights is None else float(weights.get("w_align", 0.45))
+    w_thin = 0.25 if weights is None else float(weights.get("w_thin", 0.25))
+    w_conn = 0.20 if weights is None else float(weights.get("w_conn", 0.20))
+    w_line = 0.10 if weights is None else float(weights.get("w_line", 0.10))
+    score = w_align * alignment + w_thin * thinness + w_conn * connectivity + w_line * single_line
+    score = max(0.0, min(1.0, score))
+    if return_details:
+        return score, {
+            "alignment": alignment,
+            "thinness": thinness,
+            "connectivity": connectivity,
+            "single_line": single_line,
+        }
+    return score
 
 
 def compute_auto_score(metrics, weights, return_details=False):
@@ -981,7 +1093,7 @@ class SobelEdgeDetector:
     ):
         """전체 에지 검출 파이프라인"""
         # 1. 입력 배열 준비
-        image = np.array(image, dtype=np.float32, copy=False)
+        image = np.asarray(image, dtype=np.float32)
         original = image.copy()
 
         # 1-1. 메디안 필터로 약한 노이즈 제거
@@ -2801,29 +2913,35 @@ class EdgeBatchGUI:
                 "weight": 1.0,
             }
         
-        # 병렬 처리: CPU 코어 수만큼 워커 사용
+        # 병렬 처리: 소량(6장 이하)이면 순차 처리로 진행 상황 표시 및 개별 이미지 실패 시 스킵
         data = []
         num_workers = min(max(1, (os.cpu_count() or 4) - 1), len(subset))
-        if num_workers > 1 and len(subset) > 1:
-            # 진행 상황 보고를 위한 콜백 추가
-            futures = []
+        use_parallel = num_workers > 1 and len(subset) > 6
+        
+        def process_one_safe(path, idx_onebased, total):
+            try:
+                return process_one_image(path)
+            except Exception as e:
+                if hasattr(self, '_message_queue'):
+                    self._message_queue.put(("auto_log", f"[WARN] Skip image {idx_onebased}/{total}: {e}"))
+                return None
+        
+        if use_parallel:
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                for i, path in enumerate(subset):
-                    future = executor.submit(process_one_image, path)
-                    futures.append((i, future))
+                futures = [executor.submit(process_one_safe, path, i + 1, len(subset)) for i, path in enumerate(subset)]
                 for i, future in enumerate(futures):
                     result = future.result()
-                    data.append(result)
-                    # 진행 상황 업데이트 (매 2개마다 또는 마지막)
-                    if (i + 1) % max(1, len(subset) // 4) == 0 or (i + 1) == len(subset):
-                        if hasattr(self, '_message_queue'):
-                            self._message_queue.put(("auto_log", f"[INFO] Loading images: {i+1}/{len(subset)}"))
+                    if result is not None:
+                        data.append(result)
+                    if hasattr(self, '_message_queue') and ((i + 1) % max(1, len(subset) // 4) == 0 or (i + 1) == len(subset)):
+                        self._message_queue.put(("auto_log", f"[INFO] Loading images: {i+1}/{len(subset)} (ok={len(data)})"))
         else:
             for i, path in enumerate(subset):
-                result = process_one_image(path)
-                data.append(result)
-                if hasattr(self, '_message_queue') and ((i + 1) % max(1, len(subset) // 4) == 0 or (i + 1) == len(subset)):
-                    self._message_queue.put(("auto_log", f"[INFO] Loading images: {i+1}/{len(subset)}"))
+                if hasattr(self, '_message_queue'):
+                    self._message_queue.put(("auto_log", f"[INFO] Loading images: {i+1}/{len(subset)}..."))
+                result = process_one_safe(path, i + 1, len(subset))
+                if result is not None:
+                    data.append(result)
         if len(data) < 4:
             return {"coarse": data, "mid": data, "full": data}
 
@@ -3790,6 +3908,34 @@ USER PRE-ANSWERS (before starting Auto):
         win.wait_window()
         return result[0] is True
 
+    def _ask_target_score(self):
+        """목표 점수(0.3/0.4/0.5/0.6) 선택. None = 취소, float = 선택값."""
+        win = tk.Toplevel(self.root)
+        win.title("목표 점수 선택")
+        win.transient(self.root)
+        win.grab_set()
+        win.geometry("380x200")
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(f, text="달성하고 싶은 목표 점수를 선택하세요 (해당 점수 도달 시 전략에 따라 조기 종료).", wraplength=340).pack(anchor="w", pady=(0, 10))
+        result = [None]
+        var = tk.StringVar(value="0.4")
+        for label, value in [("0.3 (영점삼)", "0.3"), ("0.4 (영점사)", "0.4"), ("0.5 (영점오)", "0.5"), ("0.6 (영점육)", "0.6")]:
+            ttk.Radiobutton(f, text=label, variable=var, value=value).pack(anchor="w")
+        def on_ok():
+            result[0] = float(var.get())
+            win.destroy()
+        def on_cancel():
+            result[0] = None
+            win.destroy()
+        btn_f = ttk.Frame(f)
+        btn_f.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(btn_f, text="OK", command=on_ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_f, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=4)
+        win.protocol("WM_DELETE_WINDOW", on_cancel)
+        win.wait_window()
+        return result[0]
+
     def _start_auto_optimize(self):
         if self._worker_thread and self._worker_thread.is_alive():
             messagebox.showwarning("In Progress", "Processing is already running.")
@@ -3801,12 +3947,20 @@ USER PRE-ANSWERS (before starting Auto):
         if not self._ask_image_type_and_quality():
             return
 
+        target_score = self._ask_target_score()
+        if target_score is None:
+            return
+
         try:
             base_settings = self._get_param_settings()
         except ValueError as exc:
             messagebox.showerror("Parameter Error", str(exc))
             return
         auto_config = self._get_auto_config()
+        strategy = get_strategy_for_target_score(target_score)
+        for k, v in strategy.items():
+            if not k.startswith("_"):
+                auto_config[k] = v
 
         mode = self.auto_mode.get()
         self.status_var.set("Auto optimization started...")
@@ -3852,10 +4006,20 @@ USER PRE-ANSWERS (before starting Auto):
         max_files = min(8, len(files)) if mode == "Fast" else len(files)
         is_perfect = mode == "Perfect"
         
-        # 데이터 준비 (병렬화됨)
-        prep_start = time.time()
-        data = self._prepare_auto_data(files, base_settings, auto_config, roi_map, max_files)
-        prep_time = time.time() - prep_start
+        try:
+            # 데이터 준비 (병렬화됨)
+            prep_start = time.time()
+            data = self._prepare_auto_data(files, base_settings, auto_config, roi_map, max_files)
+            prep_time = time.time() - prep_start
+        except Exception as e:
+            report_lines.append(f"[ERROR] Data preparation failed: {e}")
+            self._message_queue.put(("auto_log", f"[ERROR] Data preparation failed: {e}"))
+            report_dir = self._create_batch_output_dir()
+            report_path = os.path.join(report_dir, "auto_optimize_report.txt")
+            with open(report_path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(report_lines))
+            self._message_queue.put(("auto_done", None, report_path, "prep_failed"))
+            return
         report_lines.append(f"[INFO] Data preparation completed in {prep_time:.2f}s: {len(data.get('full', []))} images")
         self._message_queue.put(("auto_log", f"[INFO] Data ready ({prep_time:.2f}s), starting optimization..."))
         
@@ -3881,6 +4045,8 @@ USER PRE-ANSWERS (before starting Auto):
         early_stop_minutes = float(auto_config.get("early_stop_minutes", 10.0))
         round_early_exit_frac = float(auto_config.get("auto_round_early_exit_no_improve_frac", 0.25))
         no_improve_rounds_stop = int(auto_config.get("auto_no_improve_rounds_stop", 2))
+        target_score = float(auto_config.get("auto_target_score", 0.0)) or 0.0
+        target_score_rounds_after = max(0, int(auto_config.get("auto_target_score_rounds_after", 1)))
         processed = 0
 
         if not data_full:
@@ -3962,6 +4128,8 @@ USER PRE-ANSWERS (before starting Auto):
         current_base = base_pre
         phase = 1
         phase_cap = phase1_budget
+        target_reached = False
+        rounds_since_target = 0
         thinning_min = min(auto_config["auto_thinning_min"], auto_config["auto_thinning_max"])
         thinning_max = max(auto_config["auto_thinning_min"], auto_config["auto_thinning_max"])
         mid_thinning = max(1, (thinning_min + thinning_max) // 2)
@@ -4111,6 +4279,8 @@ USER PRE-ANSWERS (before starting Auto):
                             last_best_time = time.time()
                             round_improved = True
                             no_improve_count = 0
+                            if target_score > 0 and best_score >= target_score:
+                                target_reached = True
                             self._message_queue.put(("auto_best", best_score, elapsed))
                         else:
                             no_improve_count += 1
@@ -4178,6 +4348,8 @@ USER PRE-ANSWERS (before starting Auto):
                         last_best_time = time.time()
                         round_improved = True
                         no_improve_count = 0
+                        if target_score > 0 and best_score >= target_score:
+                            target_reached = True
                         self._message_queue.put(("auto_best", best_score, elapsed))
                     else:
                         no_improve_count += 1
@@ -4200,6 +4372,14 @@ USER PRE-ANSWERS (before starting Auto):
                         )
                     )
 
+            if target_reached and target_score > 0:
+                rounds_since_target += 1
+                if rounds_since_target > target_score_rounds_after:
+                    stop_reason = "target_score_reached"
+                    report_lines.append(
+                        f"[INFO] Target score {target_score} reached; stopping after {target_score_rounds_after} round(s)."
+                    )
+                    break
             if not round_improved:
                 no_improve_rounds += 1
                 if no_improve_rounds >= no_improve_rounds_stop:

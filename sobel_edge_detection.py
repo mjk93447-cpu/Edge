@@ -127,13 +127,13 @@ AUTO_DEFAULTS = {
     "weight_continuity": 24.0,
     "weight_band_fit": 12.0,
     "weight_coverage": 1.0,
-    "weight_gap": 1.0,
+    "weight_gap": 0.0,
     "weight_outside": 1.0,
     "weight_thickness": 8.0,
     "weight_intrusion": 1.0,
-    "weight_endpoints": 1.0,
-    "weight_wrinkle": 1.0,
-    "weight_branch": 2.0,
+    "weight_endpoints": 0.0,
+    "weight_wrinkle": 0.0,
+    "weight_branch": 0.0,
     "weight_excess_dots": 14.0,
     "weight_low_quality": 0.5,
     "auto_phase1_max_thickness": 0.18,
@@ -504,6 +504,8 @@ def compute_auto_score(metrics, weights, return_details=False):
     """
     Priority: continuity (20x+) > band_fit (10x+) > thickness > intrusion > others.
     Uses weighted geometric mean (ML-style) so low continuity/band strongly penalizes score.
+    Only terms with weight > 0 contribute. gap and wrinkle default to 0 (validated as
+    redundant/low discriminative power in score_penalty_analysis.py).
     """
     coverage = float(metrics.get("coverage", 0.0))
     gap_ratio = float(metrics.get("gap", 1.0))
@@ -546,14 +548,17 @@ def compute_auto_score(metrics, weights, return_details=False):
 
     weights_list = [w_cont, w_band, w_cov, w_gap, w_thick, w_intr, w_out, w_end, w_wrinkle, w_branch, w_excess_dots]
     q_list = [q_cont, q_band, q_cov, q_gap, q_thick, q_intr, q_out, q_end, q_wrinkle, q_branch, q_excess_dots]
-    total_w = sum(weights_list)
+    total_w = sum(wi for wi in weights_list if wi > 0)
     eps = 1e-12
     log_score = 0.0
     for qi, wi in zip(q_list, weights_list):
-        log_score += (wi / max(total_w, eps)) * math.log(qi + eps)
-    score = math.exp(log_score)
-    exp_penalty = math.exp(-2.5 * (endpoint_ratio + wrinkle_ratio + branch_ratio))
-    score *= exp_penalty
+        if wi > 0:
+            log_score += (wi / max(total_w, eps)) * math.log(qi + eps)
+    score = math.exp(log_score) if total_w > 0 else 0.0
+    apply_end_br_penalty = (float(weights.get("weight_endpoints", 0.0)) > 0 or float(weights.get("weight_branch", 0.0)) > 0)
+    if apply_end_br_penalty:
+        exp_penalty = math.exp(-2.5 * (endpoint_ratio + branch_ratio))
+        score *= exp_penalty
     score = max(0.0, min(1.0, score))
     if return_details:
         return score, {
@@ -3197,10 +3202,9 @@ SECONDARY METRICS (Medium Weight):
    - Higher coverage = better
    - Target: > 0.85
 
-4. Gap Ratio (weight_gap, default: 1.0)
-   - Ratio of gaps in the edge
-   - Lower gap_ratio = better
-   - Target: < 0.18
+4. Gap Ratio (weight_gap, default: 0.0)
+   - Redundant with coverage (gap = 1 - coverage). Disabled by default (score_penalty_analysis).
+   - Lower gap_ratio = better; target: < 0.18
 
 5. Outside Ratio (weight_outside, default: 1.0)
    - Ratio of edge pixels outside the boundary band
@@ -3217,21 +3221,17 @@ SECONDARY METRICS (Medium Weight):
    - Lower intrusion = better
    - Target: < 0.03
 
-8. Endpoints (weight_endpoints, default: 1.0)
-   - Ratio of endpoint pixels (degree 1)
-   - Lower endpoint_ratio = better (fewer endpoints)
-   - Target: < 0.05
+8. Endpoints (weight_endpoints, default: 0.0)
+   - Disabled by default; weak discriminative power in branch_endpoint_impact_test.
+   - Lower endpoint_ratio = better; target: < 0.05
 
-9. Wrinkle (weight_wrinkle, default: 1.0)
-   - Ratio of pixels that differ after smoothing
-   - Lower wrinkle_ratio = better (smoother edge)
-   - Target: < 0.20
+9. Wrinkle (weight_wrinkle, default: 0.0)
+   - Low discriminative power in validation; disabled by default (score_penalty_analysis).
+   - Lower wrinkle_ratio = better; target: < 0.20
 
-10. Branch (weight_branch, default: 2.0)
-    - Ratio of branch pixels (degree >= 3)
-    - Lower branch_ratio = better (fewer branches)
-    - Target: < 0.08
-    - Currently weighted 2x for importance
+10. Branch (weight_branch, default: 0.0)
+    - Disabled by default; ranking preserved without it in branch_endpoint_impact_test.
+    - Lower branch_ratio = better; target: < 0.08
 
 PENALTY FACTORS:
 
@@ -3239,9 +3239,9 @@ PENALTY FACTORS:
     - Multiplicative penalty for low quality regions
     - Applied as: score *= (1.0 + weight_low_quality)
 
-12. Endpoint/Wrinkle/Branch Penalty
-    - Exponential penalty: exp(-2.5 * (endpoint + wrinkle + branch))
-    - Applied automatically regardless of weights
+12. Endpoint/Branch Penalty
+    - Applied only when weight_endpoints > 0 or weight_branch > 0: exp(-2.5 * (endpoint + branch))
+    - Default weights 0 -> no exp penalty by default (branch_endpoint_impact_test)
 
 SCORING FORMULA:
 - Each metric qi is converted to quality (0-1) via sigmoid
@@ -3305,8 +3305,9 @@ LOWER IMPACT (coarser steps or leave default):
 SCORING WEIGHTS (importance in final score):
 
 • weight_continuity, weight_band_fit — Highest (24, 12). Edge continuity and band fit.
-• weight_thickness, weight_branch — Important (1.2, 2.0). Thinner edges; fewer branches.
-• weight_coverage, weight_gap, weight_outside, weight_endpoints, weight_wrinkle, weight_intrusion — Normal (1.0).
+• weight_thickness — Important (8.0). Thinner edges.
+• weight_coverage, weight_outside, weight_intrusion — Normal (1.0).
+• weight_gap, weight_wrinkle, weight_endpoints, weight_branch — 0 (disabled per score_penalty_analysis / branch_endpoint_impact_test).
 • weight_low_quality — Penalty for low-contrast regions (0.5).
 
 USER PRE-ANSWERS (before starting Auto):

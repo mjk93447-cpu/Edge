@@ -1301,7 +1301,7 @@ class EdgeBatchGUI:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Sobel Edge Batch Processor (ver20)")
+        self.root.title("Sobel Edge Batch Processor (ver21)")
         self.root.geometry("1920x1080")
 
         self.detector = SobelEdgeDetector()

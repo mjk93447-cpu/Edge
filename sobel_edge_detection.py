@@ -26,13 +26,13 @@ from PIL import Image, ImageTk, ImageDraw
 SCORE_DISPLAY_SCALE = 1e15
 
 PARAM_DEFAULTS = {
-    "nms_relax": 0.95,
-    "low_ratio": 0.04,
-    "high_ratio": 0.12,
+    "nms_relax": 0.97,
+    "low_ratio": 0.035,
+    "high_ratio": 0.10,
     "use_median_filter": True,
     "median_kernel_size": 3,
     "use_blur": True,
-    "blur_sigma": 1.2,
+    "blur_sigma": 1.0,
     "blur_kernel_size": 5,
     "magnitude_gamma": 1.0,
     "use_contrast_stretch": False,
@@ -49,11 +49,11 @@ PARAM_DEFAULTS = {
     "closing_radius": 1,
     "closing_iterations": 1,
     "use_thinning": True,
-    "thinning_max_iter": 15,
+    "thinning_max_iter": 18,
     "use_edge_smooth": False,
     "edge_smooth_radius": 1,
     "edge_smooth_iters": 1,
-    "spur_prune_iters": 0,
+    "spur_prune_iters": 1,
     "use_boundary_band_filter": True,
     "boundary_band_radius": 2,
     "object_is_dark": True,
@@ -62,16 +62,16 @@ PARAM_DEFAULTS = {
     "mask_blur_kernel_size": 5,
     "mask_close_radius": 1,
     "use_polarity_filter": True,
-    "polarity_drop_margin": 0.5,
+    "polarity_drop_margin": 0.4,
 }
 
-# Optimal defaults: high-impact params use finer steps; low-impact use coarser or fixed ranges.
+# Optimal defaults: 얇은 단일 테두리(저화질 곡선 양면 합쳐짐 억제)에 맞춤.
 AUTO_DEFAULTS = {
-    "auto_nms_min": 0.90,
-    "auto_nms_max": 0.97,
+    "auto_nms_min": 0.92,
+    "auto_nms_max": 0.98,
     "auto_nms_step": 0.005,
-    "auto_high_min": 0.07,
-    "auto_high_max": 0.14,
+    "auto_high_min": 0.06,
+    "auto_high_max": 0.12,
     "auto_high_step": 0.005,
     "auto_low_factor_min": 0.30,
     "auto_low_factor_max": 0.42,
@@ -81,14 +81,14 @@ AUTO_DEFAULTS = {
     "auto_margin_min": 0.10,
     "auto_margin_max": 0.45,
     "auto_margin_step": 0.02,
-    "auto_blur_sigma_min": 1.0,
-    "auto_blur_sigma_max": 1.4,
+    "auto_blur_sigma_min": 0.8,
+    "auto_blur_sigma_max": 1.2,
     "auto_blur_sigma_step": 0.1,
     "auto_blur_kernel_min": 3,
     "auto_blur_kernel_max": 7,
     "auto_blur_kernel_step": 2,
-    "auto_thinning_min": 10,
-    "auto_thinning_max": 18,
+    "auto_thinning_min": 12,
+    "auto_thinning_max": 20,
     "auto_thinning_step": 2,
     "auto_contrast_ref_min": 70.0,
     "auto_contrast_ref_max": 110.0,
@@ -129,17 +129,18 @@ AUTO_DEFAULTS = {
     "weight_coverage": 1.0,
     "weight_gap": 1.0,
     "weight_outside": 1.0,
-    "weight_thickness": 1.2,
+    "weight_thickness": 8.0,
     "weight_intrusion": 1.0,
     "weight_endpoints": 1.0,
     "weight_wrinkle": 1.0,
     "weight_branch": 2.0,
+    "weight_excess_dots": 14.0,
     "weight_low_quality": 0.5,
+    "auto_phase1_max_thickness": 0.18,
     "early_stop_enabled": True,
     "early_stop_minutes": 10.0,
     "auto_round_early_exit_no_improve_frac": 0.25,
     "auto_no_improve_rounds_stop": 2,
-    "auto_phase1_max_thickness": 0.25,
     "auto_phase1_frac": 0.5,
     "auto_phase1_min_evals": 150,
     "auto_parallel": True,
@@ -293,9 +294,9 @@ def evaluate_one_candidate_mp(data, settings, auto_config):
     settings_eval["use_boundary_band_filter"] = False
     total_score = total_coverage = total_intrusion = total_outside = total_gap = 0.0
     total_thickness = total_continuity = total_band_ratio = total_endpoints = 0.0
-    total_wrinkle = total_branch = total_weight = 0.0
+    total_wrinkle = total_branch = total_excess_dots = total_weight = 0.0
     total_q_cont = total_q_band = total_q_thick = total_q_intr = total_q_end = 0.0
-    total_q_wrinkle = total_q_branch = 0.0
+    total_q_wrinkle = total_q_branch = total_q_excess_dots = 0.0
 
     for item in data:
         image = item["image"]
@@ -320,6 +321,7 @@ def evaluate_one_candidate_mp(data, settings, auto_config):
             continuity_penalty = thickness_penalty = 1.0
             band_ratio = 0.0
             endpoint_ratio = wrinkle_ratio = branch_ratio = 1.0
+            excess_dots_penalty = 0.0
         else:
             coverage = edges_in_band / band_pixels if band_pixels else 0.0
             intrusion_ratio = intrusion / edge_pixels
@@ -332,21 +334,22 @@ def evaluate_one_candidate_mp(data, settings, auto_config):
             endpoint_ratio = endpoint_count / edge_pixels
             branch_ratio = branch_count / edge_pixels
             # wrinkle 계산 최적화: 간단한 근사치 사용
-            # smooth_mask = detector.erode_binary(detector.dilate_binary(edges_raw, 1), 1)
-            # wrinkle_ratio = int((edges_raw ^ smooth_mask).sum()) / edge_pixels
-            # 빠른 근사치: neighbor_count 기반으로 계산
             isolated = (neighbor_counts == 0) | (neighbor_counts == 1)
             wrinkle_ratio = int((edges_raw & ~isolated).sum()) / max(edge_pixels, 1) * 0.3  # 근사치
             components = _count_components_mask(edges_raw & band)
             components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
             continuity_penalty = min(1.0, components_penalty * 5.0)
             edge_density = edge_pixels / max(band_pixels, 1)
-            thickness_penalty = max(0.0, edge_density - 1.2)
+            thickness_penalty = max(0.0, edge_density - 0.95)
+            ideal_thin_length = band_pixels / max(2 * band_radius + 1, 1)
+            excess_ratio = edge_pixels / max(ideal_thin_length, 1)
+            excess_dots_penalty = min(1.0, max(0.0, (excess_ratio - 1.0) * 0.5))
 
         metrics = {
             "coverage": coverage, "gap": gap_ratio, "continuity": continuity_penalty,
             "intrusion": intrusion_ratio, "outside": outside_ratio, "thickness": thickness_penalty,
             "band_ratio": band_ratio, "endpoints": endpoint_ratio, "wrinkle": wrinkle_ratio, "branch": branch_ratio,
+            "excess_dots": excess_dots_penalty,
         }
         score, details = compute_auto_score(metrics, auto_config, return_details=True)
         # 이미지 contrast 계산 최적화: percentile 대신 간단한 통계 사용
@@ -377,12 +380,14 @@ def evaluate_one_candidate_mp(data, settings, auto_config):
         total_q_end += details["q_end"] * weight
         total_q_wrinkle += details["q_wrinkle"] * weight
         total_q_branch += details["q_branch"] * weight
+        total_excess_dots += metrics["excess_dots"] * weight
+        total_q_excess_dots += details.get("q_excess_dots", 1.0) * weight
 
     if total_weight <= 0:
         return (
             0.0,
-            {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0, "gap": 1.0, "thickness": 1.0, "continuity": 1.0, "band_ratio": 0.0, "endpoints": 1.0, "wrinkle": 1.0, "branch": 1.0},
-            {"q_cont": 0.0, "q_band": 0.0, "q_thick": 0.0, "q_intr": 0.0, "q_end": 0.0, "q_wrinkle": 0.0, "q_branch": 0.0},
+            {"coverage": 0.0, "intrusion": 1.0, "outside": 1.0, "gap": 1.0, "thickness": 1.0, "continuity": 1.0, "band_ratio": 0.0, "endpoints": 1.0, "wrinkle": 1.0, "branch": 1.0, "excess_dots": 0.0},
+            {"q_cont": 0.0, "q_band": 0.0, "q_thick": 0.0, "q_intr": 0.0, "q_end": 0.0, "q_wrinkle": 0.0, "q_branch": 0.0, "q_excess_dots": 0.0},
         )
     avg_score = max(0.0, total_score / total_weight)
     summary = {
@@ -391,12 +396,14 @@ def evaluate_one_candidate_mp(data, settings, auto_config):
         "thickness": total_thickness / total_weight, "continuity": total_continuity / total_weight,
         "band_ratio": total_band_ratio / total_weight, "endpoints": total_endpoints / total_weight,
         "wrinkle": total_wrinkle / total_weight, "branch": total_branch / total_weight,
+        "excess_dots": total_excess_dots / total_weight,
     }
     qualities = {
         "q_cont": total_q_cont / total_weight, "q_band": total_q_band / total_weight,
         "q_thick": total_q_thick / total_weight, "q_intr": total_q_intr / total_weight,
         "q_end": total_q_end / total_weight, "q_wrinkle": total_q_wrinkle / total_weight,
         "q_branch": total_q_branch / total_weight,
+        "q_excess_dots": total_q_excess_dots / total_weight,
     }
     return avg_score, summary, qualities
 
@@ -508,17 +515,19 @@ def compute_auto_score(metrics, weights, return_details=False):
     endpoint_ratio = float(metrics.get("endpoints", 1.0))
     wrinkle_ratio = float(metrics.get("wrinkle", 1.0))
     branch_ratio = float(metrics.get("branch", 1.0))
+    excess_dots = float(metrics.get("excess_dots", 0.0))
 
     w_cont = float(weights.get("weight_continuity", 24.0))
     w_band = float(weights.get("weight_band_fit", 12.0))
     w_cov = float(weights.get("weight_coverage", 1.0))
     w_gap = float(weights.get("weight_gap", 1.0))
     w_out = float(weights.get("weight_outside", 1.0))
-    w_thick = float(weights.get("weight_thickness", 1.2))
+    w_thick = float(weights.get("weight_thickness", 8.0))
     w_intr = float(weights.get("weight_intrusion", 1.0))
     w_end = float(weights.get("weight_endpoints", 1.0))
     w_wrinkle = float(weights.get("weight_wrinkle", 1.0))
-    w_branch = float(weights.get("weight_branch", 1.0))
+    w_branch = float(weights.get("weight_branch", 2.0))
+    w_excess_dots = float(weights.get("weight_excess_dots", 14.0))
 
     def sigmoid(x):
         return 1.0 / (1.0 + math.exp(-max(-20, min(20, x))))
@@ -528,14 +537,15 @@ def compute_auto_score(metrics, weights, return_details=False):
     q_cov = sigmoid((coverage - 0.85) / 0.08)
     q_gap = sigmoid((0.18 - gap_ratio) / 0.06)
     q_out = sigmoid((0.05 - outside) / 0.03)
-    q_thick = sigmoid((0.15 - thickness) / 0.08)
+    q_thick = sigmoid((0.08 - thickness) / 0.06)
     q_intr = sigmoid((0.03 - intrusion) / 0.02)
     q_end = sigmoid((0.05 - endpoint_ratio) / 0.02)
     q_wrinkle = sigmoid((0.20 - wrinkle_ratio) / 0.06)
     q_branch = sigmoid((0.08 - branch_ratio) / 0.04)
+    q_excess_dots = sigmoid((0.0 - excess_dots) / 0.12)
 
-    weights_list = [w_cont, w_band, w_cov, w_gap, w_thick, w_intr, w_out, w_end, w_wrinkle, w_branch]
-    q_list = [q_cont, q_band, q_cov, q_gap, q_thick, q_intr, q_out, q_end, q_wrinkle, q_branch]
+    weights_list = [w_cont, w_band, w_cov, w_gap, w_thick, w_intr, w_out, w_end, w_wrinkle, w_branch, w_excess_dots]
+    q_list = [q_cont, q_band, q_cov, q_gap, q_thick, q_intr, q_out, q_end, q_wrinkle, q_branch, q_excess_dots]
     total_w = sum(weights_list)
     eps = 1e-12
     log_score = 0.0
@@ -557,6 +567,7 @@ def compute_auto_score(metrics, weights, return_details=False):
             "q_end": q_end,
             "q_wrinkle": q_wrinkle,
             "q_branch": q_branch,
+            "q_excess_dots": q_excess_dots,
         }
     return score
 
@@ -2176,7 +2187,17 @@ class EdgeBatchGUI:
             width=6,
         ).grid(row=14, column=3, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="Round early exit %").grid(row=14, column=4, sticky="w")
+        ttk.Label(auto_frame, text="W excess dots").grid(row=14, column=4, sticky="w")
+        ttk.Spinbox(
+            auto_frame,
+            from_=0.0,
+            to=20.0,
+            increment=1.0,
+            textvariable=self.param_vars["weight_excess_dots"],
+            width=6,
+        ).grid(row=14, column=5, sticky="w", padx=(4, 12))
+
+        ttk.Label(auto_frame, text="Round early exit %").grid(row=15, column=0, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=0.05,
@@ -2185,9 +2206,9 @@ class EdgeBatchGUI:
             textvariable=self.param_vars["auto_round_early_exit_no_improve_frac"],
             width=6,
             format="%.2f",
-        ).grid(row=14, column=5, sticky="w", padx=(4, 12))
+        ).grid(row=15, column=1, sticky="w", padx=(4, 12))
 
-        ttk.Label(auto_frame, text="No-improve rounds stop").grid(row=15, column=0, sticky="w")
+        ttk.Label(auto_frame, text="No-improve rounds stop").grid(row=15, column=2, sticky="w")
         ttk.Spinbox(
             auto_frame,
             from_=1,
@@ -2195,7 +2216,7 @@ class EdgeBatchGUI:
             increment=1,
             textvariable=self.param_vars["auto_no_improve_rounds_stop"],
             width=6,
-        ).grid(row=15, column=1, sticky="w", padx=(4, 12))
+        ).grid(row=15, column=3, sticky="w", padx=(4, 12))
 
         ttk.Label(auto_frame, text="Soft link prob").grid(row=16, column=0, sticky="w")
         ttk.Spinbox(
@@ -3356,6 +3377,8 @@ USER PRE-ANSWERS (before starting Auto):
         total_q_end = 0.0
         total_q_wrinkle = 0.0
         total_q_branch = 0.0
+        total_excess_dots = 0.0
+        total_q_excess_dots = 0.0
 
         settings_eval = dict(settings)
         settings_eval["use_boundary_band_filter"] = False
@@ -3395,6 +3418,7 @@ USER PRE-ANSWERS (before starting Auto):
                 endpoint_ratio = 1.0
                 wrinkle_ratio = 1.0
                 branch_ratio = 1.0
+                excess_dots_penalty = 0.0
             else:
                 coverage = edges_in_band / band_pixels if band_pixels else 0.0
                 intrusion_ratio = intrusion / edge_pixels
@@ -3406,17 +3430,16 @@ USER PRE-ANSWERS (before starting Auto):
                 branch_count = int((edges_raw & (neighbor_counts >= 3)).sum())
                 endpoint_ratio = endpoint_count / edge_pixels
                 branch_ratio = branch_count / edge_pixels
-                # wrinkle 계산 최적화: 간단한 근사치 사용
-                # smooth_mask = self.detector.erode_binary(self.detector.dilate_binary(edges_raw, 1), 1)
-                # wrinkle_ratio = int((edges_raw ^ smooth_mask).sum()) / edge_pixels
-                # 빠른 근사치: neighbor_count 기반으로 계산
                 isolated = (neighbor_counts == 0) | (neighbor_counts == 1)
                 wrinkle_ratio = int((edges_raw & ~isolated).sum()) / max(edge_pixels, 1) * 0.3  # 근사치
                 components = self._count_components(edges_raw & band)
                 components_penalty = max(0.0, components - 1) / max(1, edges_in_band)
                 continuity_penalty = min(1.0, components_penalty * 5.0)
                 edge_density = edge_pixels / max(band_pixels, 1)
-                thickness_penalty = max(0.0, edge_density - 1.2)
+                thickness_penalty = max(0.0, edge_density - 0.95)
+                ideal_thin_length = band_pixels / max(2 * band_radius + 1, 1)
+                excess_ratio = edge_pixels / max(ideal_thin_length, 1)
+                excess_dots_penalty = min(1.0, max(0.0, (excess_ratio - 1.0) * 0.5))
 
             metrics = {
                 "coverage": coverage,
@@ -3429,6 +3452,7 @@ USER PRE-ANSWERS (before starting Auto):
                 "endpoints": endpoint_ratio,
                 "wrinkle": wrinkle_ratio,
                 "branch": branch_ratio,
+                "excess_dots": excess_dots_penalty,
             }
             score, details = compute_auto_score(metrics, auto_config, return_details=True)
             # 이미지 contrast 계산 최적화: percentile 대신 간단한 통계 사용
@@ -3454,6 +3478,7 @@ USER PRE-ANSWERS (before starting Auto):
                 endpoint_ratio,
                 wrinkle_ratio,
                 branch_ratio,
+                excess_dots_penalty,
                 details,
             )
 
@@ -3480,6 +3505,7 @@ USER PRE-ANSWERS (before starting Auto):
             endpoint_ratio,
             wrinkle_ratio,
             branch_ratio,
+            excess_dots_penalty,
             details,
         ) in results:
             total_weight += weight
@@ -3494,6 +3520,7 @@ USER PRE-ANSWERS (before starting Auto):
             total_endpoints += endpoint_ratio * weight
             total_wrinkle += wrinkle_ratio * weight
             total_branch += branch_ratio * weight
+            total_excess_dots += excess_dots_penalty * weight
             total_q_cont += details["q_cont"] * weight
             total_q_band += details["q_band"] * weight
             total_q_thick += details["q_thick"] * weight
@@ -3501,6 +3528,7 @@ USER PRE-ANSWERS (before starting Auto):
             total_q_end += details["q_end"] * weight
             total_q_wrinkle += details["q_wrinkle"] * weight
             total_q_branch += details["q_branch"] * weight
+            total_q_excess_dots += details.get("q_excess_dots", 1.0) * weight
 
         if total_weight <= 0:
             return (
@@ -3516,6 +3544,7 @@ USER PRE-ANSWERS (before starting Auto):
                     "endpoints": 1.0,
                     "wrinkle": 1.0,
                     "branch": 1.0,
+                    "excess_dots": 0.0,
                 },
                 {
                     "q_cont": 0.0,
@@ -3525,6 +3554,7 @@ USER PRE-ANSWERS (before starting Auto):
                     "q_end": 0.0,
                     "q_wrinkle": 0.0,
                     "q_branch": 0.0,
+                    "q_excess_dots": 0.0,
                 },
             )
 
@@ -3540,6 +3570,7 @@ USER PRE-ANSWERS (before starting Auto):
             "endpoints": total_endpoints / total_weight,
             "wrinkle": total_wrinkle / total_weight,
             "branch": total_branch / total_weight,
+            "excess_dots": total_excess_dots / total_weight,
         }
         qualities = {
             "q_cont": total_q_cont / total_weight,
@@ -3549,6 +3580,7 @@ USER PRE-ANSWERS (before starting Auto):
             "q_end": total_q_end / total_weight,
             "q_wrinkle": total_q_wrinkle / total_weight,
             "q_branch": total_q_branch / total_weight,
+            "q_excess_dots": total_q_excess_dots / total_weight,
         }
         return avg_score, summary, qualities
 

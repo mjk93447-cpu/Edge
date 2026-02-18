@@ -84,6 +84,15 @@ python edge_performance_eval.py
 
 ---
 
+## GPU 가속 (NVIDIA RTX 2070 Super 등)
+
+- **설치**: `pip install cupy-cuda12x` (CUDA 12) 또는 `cupy-cuda11x` (CUDA 11)
+- **GUI**: Parameter Settings → "GPU acceleration" 체크박스 활성화
+- **효과**: Auto optimization의 edge detection 단계 가속 (CuPy 기반 Sobel/블러/NMS)
+- **벤치마크**: `python gpu_benchmark.py` — 합성 이미지로 CPU vs GPU 속도 측정
+
+---
+
 ## EXE 빌드 (오프라인 배포)
 
 ```bash

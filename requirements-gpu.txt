@@ -1,0 +1,5 @@
+# Optional: GPU acceleration (NVIDIA CUDA)
+# Install based on your CUDA version:
+#   CUDA 11.x: pip install cupy-cuda11x
+#   CUDA 12.x: pip install cupy-cuda12x
+cupy-cuda12x

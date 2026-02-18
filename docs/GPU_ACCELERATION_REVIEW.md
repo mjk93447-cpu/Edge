@@ -1,5 +1,14 @@
 # Auto Optimization 속도 개선 검토: GPU 및 내장그래픽
 
+## 구현 현황 (CuPy 기반 GPU 가속)
+
+- **GUI**: Parameter Settings에 "GPU acceleration" 체크박스 추가.
+- **파이프라인**: `detect_edges_array(use_gpu=True)` 시 CuPy로 median, blur, Sobel, NMS까지 GPU 실행 후 CPU로 전송하여 edge_tracking/thinning 수행.
+- **설치**: `pip install cupy-cuda12x` (CUDA 12) 또는 `cupy-cuda11x` (CUDA 11). RTX 2070 Super 권장.
+- **벤치마크**: `python gpu_benchmark.py` — 합성 이미지로 CPU vs GPU 속도 측정.
+
+---
+
 ## 1. 현재 구조와 병목
 
 - **파이프라인**: `detect_edges_array()` — NumPy 기반 (OpenCV 미사용)

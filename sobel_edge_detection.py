@@ -22,6 +22,27 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image, ImageTk, ImageDraw
 
+# Optional CuPy for GPU acceleration (NVIDIA CUDA)
+_CUPY_AVAILABLE = False
+try:
+    import cupy as cp
+    from cupyx.scipy import ndimage as cp_ndimage
+    _CUPY_AVAILABLE = True
+except ImportError:
+    cp = None
+    cp_ndimage = None
+
+
+def is_gpu_available():
+    """Return True if CuPy and CUDA GPU are available."""
+    if not _CUPY_AVAILABLE:
+        return False
+    try:
+        cp.cuda.Stream.null.synchronize()
+        return True
+    except Exception:
+        return False
+
 # Display scale for small scores so UI shows readable numbers (learning uses raw score only)
 SCORE_DISPLAY_SCALE = 1e15
 
@@ -63,6 +84,7 @@ PARAM_DEFAULTS = {
     "mask_close_radius": 1,
     "use_polarity_filter": True,
     "polarity_drop_margin": 0.4,
+    "use_gpu": False,
 }
 
 # Optimal defaults: 얇은 단일 테두리(저화질 곡선 양면 합쳐짐 억제)에 맞춤.
@@ -305,9 +327,9 @@ def evaluate_one_candidate_mp(data, settings, auto_config):
         band = item["bands"].get(band_radius)
         if band is None:
             band = item["boundary"] if band_radius <= 0 else detector.dilate_binary(item["boundary"], band_radius)
-        results = detector.detect_edges_array(
-            image, use_nms=True, use_hysteresis=True, **settings_eval
-        )
+        settings_eval["use_nms"] = True
+        settings_eval["use_hysteresis"] = True
+        results = detector.detect_edges_array(image, **settings_eval)
         edges_raw = results["edges"] > 0
         edge_pixels = int(edges_raw.sum())
         band_pixels = item["band_pixels"].get(band_radius, int(band.sum()))
@@ -598,6 +620,13 @@ class SobelEdgeDetector:
         img = Image.open(image_path).convert('L')  # 그레이스케일 변환
         return np.array(img, dtype=np.float32)
     
+    def _apply_convolution_gpu(self, image_gpu, kernel):
+        """GPU 컨볼루션 (CuPy)"""
+        if not _CUPY_AVAILABLE:
+            raise RuntimeError("CuPy not available")
+        kernel_gpu = cp.asarray(kernel.astype(np.float32))
+        return cp_ndimage.convolve(image_gpu, kernel_gpu, mode="nearest")
+
     def apply_convolution(self, image, kernel):
         """컨볼루션 연산 적용"""
         h, w = image.shape
@@ -625,6 +654,27 @@ class SobelEdgeDetector:
         kernel = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
         kernel /= np.sum(kernel)
         return self.apply_convolution(image, kernel)
+
+    def _apply_gaussian_blur_gpu(self, image_gpu, kernel_size=5, sigma=1.2):
+        """GPU 가우시안 블러 (CuPy)"""
+        if not _CUPY_AVAILABLE:
+            raise RuntimeError("CuPy not available")
+        if kernel_size < 3:
+            return image_gpu
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        sigma = max(float(sigma), 0.1)
+        return cp_ndimage.gaussian_filter(image_gpu, sigma, mode="nearest")
+
+    def _apply_median_filter_gpu(self, image_gpu, kernel_size=3):
+        """GPU 메디안 필터 (CuPy)"""
+        if not _CUPY_AVAILABLE:
+            raise RuntimeError("CuPy not available")
+        if kernel_size < 3:
+            return image_gpu
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        return cp_ndimage.median_filter(image_gpu, size=kernel_size, mode="nearest")
 
     def apply_median_filter(self, image, kernel_size=3):
         """메디안 필터로 노이즈를 줄이고 경계를 보존"""
@@ -684,6 +734,83 @@ class SobelEdgeDetector:
         direction = np.arctan2(grad_y, grad_x)
         
         return magnitude, direction, grad_x, grad_y
+
+    def _compute_gradient_gpu(self, image_gpu):
+        """GPU Sobel 그래디언트 (CuPy)"""
+        grad_x = self._apply_convolution_gpu(image_gpu, self.sobel_x)
+        grad_y = self._apply_convolution_gpu(image_gpu, self.sobel_y)
+        magnitude = cp.sqrt(grad_x**2 + grad_y**2)
+        direction = cp.arctan2(grad_y, grad_x)
+        return magnitude, direction, grad_x, grad_y
+
+    def _non_maximum_suppression_gpu(self, magnitude, direction, relax=1.0):
+        """GPU NMS (CuPy)"""
+        relax = float(max(0.01, min(1.0, relax)))
+        angle = direction * 180.0 / cp.pi
+        angle = cp.where(angle < 0, angle + 180, angle)
+        padded = cp.pad(magnitude, ((1, 1), (1, 1)), mode="constant", constant_values=0)
+        center = padded[1:-1, 1:-1]
+        right = padded[1:-1, 2:]
+        left = padded[1:-1, :-2]
+        up = padded[:-2, 1:-1]
+        down = padded[2:, 1:-1]
+        up_left = padded[:-2, :-2]
+        up_right = padded[:-2, 2:]
+        down_left = padded[2:, :-2]
+        down_right = padded[2:, 2:]
+
+        mask_0 = (angle < 22.5) | (angle >= 157.5)
+        mask_45 = (angle >= 22.5) & (angle < 67.5)
+        mask_90 = (angle >= 67.5) & (angle < 112.5)
+        mask_135 = (angle >= 112.5) & (angle < 157.5)
+        keep_0 = mask_0 & (center >= right * relax) & (center >= left * relax)
+        keep_45 = mask_45 & (center >= up_right * relax) & (center >= down_left * relax)
+        keep_90 = mask_90 & (center >= up * relax) & (center >= down * relax)
+        keep_135 = mask_135 & (center >= up_left * relax) & (center >= down_right * relax)
+
+        suppressed = cp.zeros_like(magnitude, dtype=cp.float32)
+        keep = keep_0 | keep_45 | keep_90 | keep_135
+        suppressed[keep] = center[keep]
+        suppressed[0, :] = 0
+        suppressed[-1, :] = 0
+        suppressed[:, 0] = 0
+        suppressed[:, -1] = 0
+        return suppressed
+
+    def _double_threshold_gpu(self, image_gpu, low_ratio, high_ratio, method, low_percentile, high_percentile,
+                              min_threshold, mad_low_k, mad_high_k):
+        """GPU 이중 임계값 (CuPy) - returns (result_gpu, weak, strong)"""
+        strong = 255
+        weak = 75
+        if method == "percentile":
+            sample = image_gpu[image_gpu > 0]
+            if sample.size == 0:
+                high_threshold = float(cp.max(image_gpu)) * high_ratio
+                low_threshold = float(cp.max(image_gpu)) * low_ratio
+            else:
+                high_threshold = float(cp.percentile(sample, high_percentile))
+                low_threshold = float(cp.percentile(sample, low_percentile))
+        elif method == "mad":
+            sample = image_gpu[image_gpu > 0]
+            if sample.size < 10:
+                sample = image_gpu
+            median = float(cp.median(sample))
+            mad = float(cp.median(cp.abs(sample - median)))
+            sigma = 1.4826 * mad
+            high_threshold = median + mad_high_k * sigma
+            low_threshold = median + mad_low_k * sigma
+        else:
+            high_threshold = float(cp.max(image_gpu)) * high_ratio
+            low_threshold = float(cp.max(image_gpu)) * low_ratio
+        high_threshold = max(high_threshold, min_threshold)
+        low_threshold = max(low_threshold, min_threshold)
+        if low_threshold > high_threshold:
+            low_threshold = high_threshold
+
+        result = cp.zeros_like(image_gpu)
+        result[image_gpu >= high_threshold] = strong
+        result[(image_gpu <= high_threshold) & (image_gpu >= low_threshold)] = weak
+        return result, weak, strong
     
     def non_maximum_suppression(self, magnitude, direction, relax=1.0):
         """Non-Maximum Suppression으로 얇은 에지 생성"""
@@ -1106,35 +1233,56 @@ class SobelEdgeDetector:
         use_thinning=True,
         thinning_max_iter=15,
         spur_prune_iters=0,
+        use_gpu=False,
     ):
         """전체 에지 검출 파이프라인"""
         # 1. 입력 배열 준비
         image = np.asarray(image, dtype=np.float32)
         original = image.copy()
 
-        # 1-1. 메디안 필터로 약한 노이즈 제거
-        if use_median_filter:
-            image = self.apply_median_filter(image, median_kernel_size)
+        gpu_active = bool(use_gpu) and _CUPY_AVAILABLE and is_gpu_available()
 
-        # 1-2. 블러로 노이즈 완화
-        if use_blur:
-            image = self.apply_gaussian_blur(image, blur_kernel_size, blur_sigma)
+        if gpu_active:
+            try:
+                img_gpu = cp.asarray(image)
+                if use_median_filter:
+                    img_gpu = self._apply_median_filter_gpu(img_gpu, median_kernel_size)
+                if use_blur:
+                    img_gpu = self._apply_gaussian_blur_gpu(img_gpu, blur_kernel_size, blur_sigma)
+                if use_contrast_stretch:
+                    img_gpu_cpu = cp.asnumpy(img_gpu)
+                    img_gpu_cpu = self.contrast_stretch(img_gpu_cpu, contrast_low_pct, contrast_high_pct)
+                    img_gpu = cp.asarray(img_gpu_cpu)
+                magnitude, direction, grad_x, grad_y = self._compute_gradient_gpu(img_gpu)
+                if magnitude_gamma != 1.0:
+                    magnitude = cp.power(magnitude, magnitude_gamma)
+                if use_nms:
+                    edges_gpu = self._non_maximum_suppression_gpu(magnitude, direction, relax=nms_relax)
+                else:
+                    edges_gpu = magnitude
+                edges = cp.asnumpy(edges_gpu)
+                magnitude = cp.asnumpy(magnitude)
+                grad_x = cp.asnumpy(grad_x)
+                grad_y = cp.asnumpy(grad_y)
+                image = cp.asnumpy(img_gpu)
+            except Exception:
+                gpu_active = False
 
-        # 1-3. 저대비 보정
-        if use_contrast_stretch:
-            image = self.contrast_stretch(image, contrast_low_pct, contrast_high_pct)
-        
-        # 2. Sobel 필터 적용
-        magnitude, direction, grad_x, grad_y = self.compute_gradient(image)
-        if magnitude_gamma != 1.0:
-            magnitude = np.power(magnitude, magnitude_gamma)
-        
-        # 3. Non-Maximum Suppression (얇은 에지)
-        if use_nms:
-            edges = self.non_maximum_suppression(magnitude, direction, relax=nms_relax)
-        else:
-            edges = magnitude
-        
+        if not gpu_active:
+            if use_median_filter:
+                image = self.apply_median_filter(image, median_kernel_size)
+            if use_blur:
+                image = self.apply_gaussian_blur(image, blur_kernel_size, blur_sigma)
+            if use_contrast_stretch:
+                image = self.contrast_stretch(image, contrast_low_pct, contrast_high_pct)
+            magnitude, direction, grad_x, grad_y = self.compute_gradient(image)
+            if magnitude_gamma != 1.0:
+                magnitude = np.power(magnitude, magnitude_gamma)
+            if use_nms:
+                edges = self.non_maximum_suppression(magnitude, direction, relax=nms_relax)
+            else:
+                edges = magnitude
+
         # 4. 이중 임계값 및 에지 추적 (연결된 에지)
         low_ratio_adj = low_ratio
         high_ratio_adj = high_ratio
@@ -1503,6 +1651,12 @@ class EdgeBatchGUI:
             text="Median filter",
             variable=self.param_vars["use_median_filter"],
         ).grid(row=1, column=6, sticky="w", padx=(6, 0))
+
+        ttk.Checkbutton(
+            param_frame,
+            text="GPU acceleration",
+            variable=self.param_vars["use_gpu"],
+        ).grid(row=1, column=7, sticky="w", padx=(6, 0))
 
         ttk.Label(param_frame, text="Median kernel").grid(row=1, column=7, sticky="w")
         ttk.Spinbox(
@@ -3076,6 +3230,7 @@ class EdgeBatchGUI:
             "mask_close_radius": max(0, get_int("mask_close_radius")),
             "use_polarity_filter": bool(self.param_vars["use_polarity_filter"].get()),
             "polarity_drop_margin": get_float("polarity_drop_margin"),
+            "use_gpu": bool(self.param_vars["use_gpu"].get()),
             "polarity_min_diff": 1.0,
             "polarity_min_support": 50,
             "mask_min_area": 0.05,
@@ -3395,12 +3550,9 @@ USER PRE-ANSWERS (before starting Auto):
                 else:
                     band = self.detector.dilate_binary(item["boundary"], band_radius)
 
-            results = self.detector.detect_edges_array(
-                image,
-                use_nms=True,
-                use_hysteresis=True,
-                **settings_eval,
-            )
+            settings_eval["use_nms"] = True
+            settings_eval["use_hysteresis"] = True
+            results = self.detector.detect_edges_array(image, **settings_eval)
             edges_raw = results["edges"] > 0
             edge_pixels = int(edges_raw.sum())
             band_pixels = item["band_pixels"].get(band_radius, int(band.sum()))

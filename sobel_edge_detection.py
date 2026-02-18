@@ -1652,12 +1652,6 @@ class EdgeBatchGUI:
             variable=self.param_vars["use_median_filter"],
         ).grid(row=1, column=6, sticky="w", padx=(6, 0))
 
-        ttk.Checkbutton(
-            param_frame,
-            text="GPU acceleration",
-            variable=self.param_vars["use_gpu"],
-        ).grid(row=1, column=7, sticky="w", padx=(6, 0))
-
         ttk.Label(param_frame, text="Median kernel").grid(row=1, column=7, sticky="w")
         ttk.Spinbox(
             param_frame,
@@ -2713,6 +2707,11 @@ class EdgeBatchGUI:
         ).pack(side=tk.LEFT)
         self.auto_button = ttk.Button(button_frame, text="Auto Optimize", command=self._start_auto_optimize)
         self.auto_button.pack(side=tk.LEFT, padx=6)
+        ttk.Checkbutton(
+            button_frame,
+            text="GPU acceleration",
+            variable=self.param_vars["use_gpu"],
+        ).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Label(button_frame, text="Score display").pack(side=tk.LEFT, padx=(6, 2))
         ttk.Combobox(
             button_frame,

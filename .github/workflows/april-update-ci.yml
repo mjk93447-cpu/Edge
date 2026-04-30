@@ -80,7 +80,7 @@ jobs:
 
       - name: Build EXE
         shell: cmd
-        run: pyinstaller --onefile --windowed --name edge_batch_gui --hidden-import=multiprocessing --hidden-import=concurrent.futures --hidden-import=numpy.lib.stride_tricks --hidden-import=PIL._tkinter_finder --collect-all=numpy --collect-all=PIL sobel_edge_detection.py
+        run: pyinstaller --onefile --windowed --name edge_batch_gui --hidden-import=multiprocessing --hidden-import=concurrent.futures --hidden-import=numpy.lib.stride_tricks --hidden-import=PIL._tkinter_finder --hidden-import=torch --hidden-import=torch.nn --hidden-import=torch.nn.functional --hidden-import=torch.utils.data --hidden-import=torch.optim --collect-all=numpy --collect-all=PIL sobel_edge_detection.py
 
       - name: Verify EXE
         shell: cmd

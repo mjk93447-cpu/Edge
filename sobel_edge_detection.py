@@ -2955,43 +2955,12 @@ class EdgeBatchGUI:
 
         load_index(idx)
 
-    def _open_edge_label_editor(self):
-        selection = self.file_listbox.curselection()
+     def _open_edge_label_editor(self):
         if not self.selected_files:
             messagebox.showinfo("Info", "Select a file before creating a 1px label.")
             return
+        selection = self.file_listbox.curselection()
         idx = selection[0] if selection else 0
-        path = self.selected_files[idx]
-        if path not in self.roi_map:
-            messagebox.showinfo("ROI Required", "Set an ROI before drawing the 1px correct edge label.")
-            return
-        if not os.path.exists(path):
-            messagebox.showerror("File Missing", path)
-            return
-
-        x1, y1, x2, y2 = self.roi_map[path]
-        img = Image.open(path).convert("L")
-        roi_img = img.crop((x1, y1, x2, y2))
-        label_dir = ensure_label_dir()
-        h, w = roi_img.height, roi_img.width
-        display_max_w, display_max_h = 1100, 680
-        scale = min(display_max_w / max(w, 1), display_max_h / max(h, 1), 4.0)
-        scale = max(scale, 1.0)
-        disp_w, disp_h = int(w * scale), int(h * scale)
-        display = roi_img.resize((disp_w, disp_h), resample=Image.BILINEAR).convert("RGB")
-
-        index = load_edge_label_index()
-        existing = index.get("records", {}).get(os.path.abspath(path))
-        polylines = []
-        brush_mask = np.zeros((h, w), dtype=bool)
-        if existing:
-            try:
-                with open(existing.get("vector_path"), "r", encoding="utf-8") as handle:
-                    polylines = json.load(handle).get("polylines", [])
-                if os.path.exists(existing.get("mask_path", "")):
-                    brush_mask = np.asarray(Image.open(existing["mask_path"]).convert("L")) > 0
-            except (OSError, json.JSONDecodeError, TypeError):
-                polylines = []
 
         win = tk.Toplevel(self.root)
         win.title("ROI + 1px Edge Label Editor")
@@ -3008,89 +2977,174 @@ class EdgeBatchGUI:
         ttk.Checkbutton(top, text="Pixel snap", variable=snap_var).pack(side=tk.LEFT, padx=8)
         ttk.Label(win, textvariable=status_var).pack(anchor="w", padx=8)
 
-        canvas = tk.Canvas(win, width=disp_w, height=disp_h, background="black")
+        canvas = tk.Canvas(win, width=100, height=100, background="black")
         canvas.pack(padx=8, pady=6)
-        canvas_img = ImageTk.PhotoImage(display)
-        canvas.create_image(0, 0, anchor="nw", image=canvas_img)
-        canvas.image = canvas_img
+
+        file_label = ttk.Label(win, text="")
+        file_label.pack(pady=2)
 
         state = {
+            "idx": idx,
             "current": [],
             "line_items": [],
             "mask_items": [],
             "undo": [],
+            "polylines": [],
+            "brush_mask": None,
+            "path": None,
+            "img": None,
+            "roi": None,
+            "h": 0,
+            "w": 0,
+            "scale": 1.0,
+            "disp_w": 100,
+            "disp_h": 100,
+            "canvas_img": None,
         }
 
-        def to_roi(event):
-            x = event.x / scale
-            y = event.y / scale
-            if snap_var.get():
-                x = round(x)
-                y = round(y)
-            return int(max(0, min(w - 1, x))), int(max(0, min(h - 1, y)))
+        def load_index(new_idx):
+            if new_idx < 0 or new_idx >= len(self.selected_files):
+                return
+            state["idx"] = new_idx
+            path = self.selected_files[new_idx]
+            state["path"] = path
 
-        def redraw():
-            for item in state["line_items"] + state["mask_items"]:
+            if path not in self.roi_map:
+                status_var.set(f"File {new_idx+1}/{len(self.selected_files)}: ROI not set - set ROI first")
+                file_label.config(text=f"File {new_idx + 1}/{len(self.selected_files)}: {os.path.basename(path)}")
+                canvas.config(width=200, height=100)
+                canvas.delete("all")
+                canvas.create_text(100, 50, text="Set ROI first", fill="white")
+                return
+
+            x1, y1, x2, y2 = self.roi_map[path]
+            state["roi"] = (x1, y1, x2, y2)
+
+            if not os.path.exists(path):
+                status_var.set("File Missing")
+                return
+
+            img = Image.open(path).convert("L")
+            roi_img = img.crop((x1, y1, x2, y2))
+            h, w = roi_img.height, roi_img.width
+            state["h"] = h
+            state["w"] = w
+            state["img"] = img
+
+            display_max_w, display_max_h = 1100, 680
+            scale = min(display_max_w / max(w, 1), display_max_h / max(h, 1), 4.0)
+            scale = max(scale, 1.0)
+            state["scale"] = scale
+            disp_w, disp_h = int(w * scale), int(h * scale)
+            state["disp_w"] = disp_w
+            state["disp_h"] = disp_h
+
+            state["polylines"] = []
+            state["brush_mask"] = np.zeros((h, w), dtype=bool)
+
+            label_dir = ensure_label_dir()
+            index = load_edge_label_index()
+            existing = index.get("records", {}).get(os.path.abspath(path))
+            if existing:
+                try:
+                    with open(existing.get("vector_path"), "r", encoding="utf-8") as handle:
+                        state["polylines"] = json.load(handle).get("polylines", [])
+                    if os.path.exists(existing.get("mask_path", "")):
+                        state["brush_mask"] = np.asarray(Image.open(existing["mask_path"]).convert("L")) > 0
+                except (OSError, json.JSONDecodeError, TypeError):
+                    state["polylines"] = []
+
+            display = roi_img.resize((disp_w, disp_h), resample=Image.BILINEAR).convert("RGB")
+            canvas.config(width=disp_w, height=disp_h)
+            canvas.delete("all")
+            state["canvas_img"] = ImageTk.PhotoImage(display)
+            canvas.create_image(0, 0, anchor="nw", image=state["canvas_img"])
+
+            redraw_label(state)
+
+            file_label.config(text=f"File {new_idx + 1}/{len(self.selected_files)}: {os.path.basename(path)}")
+            status_var.set(f"Loaded. Total lines: {len(state['polylines'])}")
+            self.file_listbox.selection_clear(0, tk.END)
+            self.file_listbox.selection_set(new_idx)
+            self.file_listbox.see(new_idx)
+
+        def redraw_label(st):
+            for item in st["line_items"] + st["mask_items"]:
                 canvas.delete(item)
-            state["line_items"] = []
-            state["mask_items"] = []
-            overlay = np.argwhere(brush_mask)
+            st["line_items"] = []
+            st["mask_items"] = []
+            if st["brush_mask"] is None:
+                return
+            overlay = np.argwhere(st["brush_mask"])
             if overlay.size:
-                # Draw sparse mask preview efficiently enough for ROI labeling.
                 step = max(1, len(overlay) // 5000)
                 for yy, xx in overlay[::step]:
-                    xd, yd = xx * scale, yy * scale
-                    state["mask_items"].append(
-                        canvas.create_rectangle(xd, yd, xd + max(1, scale), yd + max(1, scale), outline="", fill="#00ff40")
+                    xd, yd = xx * st["scale"], yy * st["scale"]
+                    st["mask_items"].append(
+                        canvas.create_rectangle(xd, yd, xd + max(1, st["scale"]), yd + max(1, st["scale"]), outline="", fill="#00ff40")
                     )
-            for line in polylines:
+            for line in st["polylines"]:
                 pts = line.get("points", [])
                 if len(pts) >= 2:
                     flat = []
+                    scale = st["scale"]
                     for px, py in pts:
                         flat.extend([px * scale, py * scale])
-                    state["line_items"].append(canvas.create_line(*flat, fill="yellow", width=2))
-            if len(state["current"]) >= 1:
-                for px, py in state["current"]:
-                    state["line_items"].append(
+                    st["line_items"].append(canvas.create_line(*flat, fill="yellow", width=2))
+            if len(st["current"]) >= 1:
+                scale = st["scale"]
+                for px, py in st["current"]:
+                    st["line_items"].append(
                         canvas.create_oval(px * scale - 2, py * scale - 2, px * scale + 2, py * scale + 2, fill="cyan")
                     )
 
-        def paint_at(x, y, erase=False):
+        def to_roi(event, st):
+            x = event.x / st["scale"]
+            y = event.y / st["scale"]
+            if snap_var.get():
+                x = round(x)
+                y = round(y)
+            return int(max(0, min(st["w"] - 1, x))), int(max(0, min(st["h"] - 1, y)))
+
+        def paint_at(x, y, erase=False, st=None):
             radius = max(0, int(width_var.get()) // 2)
-            yy, xx = np.ogrid[:h, :w]
+            yy, xx = np.ogrid[:st["h"], :st["w"]]
             disk = (xx - x) ** 2 + (yy - y) ** 2 <= radius * radius
             if erase:
-                brush_mask[disk] = False
+                st["brush_mask"][disk] = False
             else:
-                brush_mask[disk] = True
+                st["brush_mask"][disk] = True
 
         def on_press(event):
-            x, y = to_roi(event)
+            if state["path"] is None or state["path"] not in self.roi_map:
+                return
+            x, y = to_roi(event, state)
             mode = mode_var.get()
             if mode == "polyline":
                 state["current"].append((x, y))
-                redraw()
+                redraw_label(state)
             else:
-                state["undo"].append(brush_mask.copy())
-                paint_at(x, y, erase=(mode == "eraser"))
-                redraw()
+                state["undo"].append(state["brush_mask"].copy())
+                paint_at(x, y, erase=(mode == "eraser"), st=state)
+                redraw_label(state)
 
         def on_drag(event):
+            if state["path"] is None or state["path"] not in self.roi_map:
+                return
             mode = mode_var.get()
             if mode not in ("brush", "eraser"):
                 return
-            x, y = to_roi(event)
-            paint_at(x, y, erase=(mode == "eraser"))
-            redraw()
+            x, y = to_roi(event, state)
+            paint_at(x, y, erase=(mode == "eraser"), st=state)
+            redraw_label(state)
 
         def finish_polyline(_event=None):
             if len(state["current"]) >= 2:
-                polylines.append({"points": list(state["current"]), "width": int(width_var.get()), "closed": False})
-                state["undo"].append(("polyline", polylines[-1]))
+                state["polylines"].append({"points": list(state["current"]), "width": int(width_var.get()), "closed": False})
+                state["undo"].append(("polyline", state["polylines"][-1]))
                 state["current"] = []
-                status_var.set(f"Saved vector line. Total lines: {len(polylines)}")
-                redraw()
+                status_var.set(f"Saved vector line. Total lines: {len(state['polylines'])}")
+                redraw_label(state)
 
         canvas.bind("<ButtonPress-1>", on_press)
         canvas.bind("<B1-Motion>", on_drag)
@@ -3101,39 +3155,57 @@ class EdgeBatchGUI:
                 state["current"] = state["current"][:-1]
             elif state["undo"]:
                 last = state["undo"].pop()
-                if isinstance(last, tuple) and last[0] == "polyline" and polylines:
-                    polylines.pop()
+                if isinstance(last, tuple) and last[0] == "polyline" and state["polylines"]:
+                    state["polylines"].pop()
                 elif isinstance(last, np.ndarray):
-                    brush_mask[:, :] = last
-            redraw()
+                    state["brush_mask"][:, :] = last
+            redraw_label(state)
 
         def clear():
-            polylines.clear()
-            brush_mask[:, :] = False
+            state["polylines"].clear()
+            if state["brush_mask"] is not None:
+                state["brush_mask"][:, :] = False
             state["current"] = []
-            redraw()
+            redraw_label(state)
 
-        def save_and_close():
+        def save_current():
+            if state["path"] is None:
+                return
             rec = save_edge_label(
-                path,
-                self.roi_map[path],
-                polylines,
-                brush_mask=brush_mask,
+                state["path"],
+                state["roi"],
+                state["polylines"],
+                brush_mask=state["brush_mask"],
                 meta_zones={},
-                root=label_dir,
+                root=ensure_label_dir(),
             )
             self._log(f"[LABEL] Saved 1px GT: {os.path.basename(rec.mask_path)}")
-            status_var.set(f"Saved: {rec.mask_path}")
-            win.destroy()
+            status_var.set(f"Saved: {os.path.basename(rec.mask_path)}")
 
-        btns = ttk.Frame(win, padding=6)
-        btns.pack(fill=tk.X)
-        ttk.Button(btns, text="Finish Line", command=finish_polyline).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Undo", command=undo).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Clear Label", command=clear).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Save 1px GT", command=save_and_close).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns, text="Close", command=win.destroy).pack(side=tk.RIGHT, padx=4)
-        redraw()
+        def save_all():
+            save_current()
+            messagebox.showinfo("Save Complete", "Current file saved. Use Prev/Next to save other files.")
+
+        def prev_file():
+            load_index(state["idx"] - 1)
+
+        def next_file():
+            load_index(state["idx"] + 1)
+
+        btns_main = ttk.Frame(win, padding=6)
+        btns_main.pack(fill=tk.X)
+        ttk.Button(btns_main, text="Finish Line", command=finish_polyline).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns_main, text="Undo", command=undo).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns_main, text="Clear Label", command=clear).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns_main, text="Save Current", command=save_all).pack(side=tk.LEFT, padx=4)
+
+        btns_nav = ttk.Frame(win, padding=6)
+        btns_nav.pack(fill=tk.X)
+        ttk.Button(btns_nav, text="Previous", command=prev_file).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns_nav, text="Next", command=next_file).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns_nav, text="Close", command=win.destroy).pack(side=tk.RIGHT, padx=4)
+
+        load_index(idx)
 
     def _clear_roi(self):
         path = self._get_selected_file()

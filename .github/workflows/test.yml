@@ -1,0 +1,50 @@
+name: Test and CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '**.py'
+      - '.github/workflows/test.yml'
+  pull_request:
+    branches: [ main ]
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pillow pytest
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run smoke tests
+        run: python -m pytest test_smoke.py -v
+
+      - name: Run edge labeling tests
+        run: python -m pytest test_edge_labeling.py -v
+
+      - name: Run edge training tests
+        run: python -m pytest test_edge_training.py -v
+
+      - name: Run deep edge grid audit tests
+        run: python -m pytest test_deep_edge_grid_audit.py -v
+
+      - name: Run all tests summary
+        run: python -m pytest test_smoke.py test_edge_labeling.py test_edge_training.py test_deep_edge_grid_audit.py --tb=short -q

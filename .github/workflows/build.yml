@@ -1,0 +1,104 @@
+name: Build Windows EXE with PyTorch
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'sobel_edge_detection.py'
+      - 'edge_labeling.py'
+      - 'edge_training.py'
+      - 'requirements-dev.txt'
+      - '.github/workflows/build.yml'
+      - 'test_smoke.py'
+    tags:
+      - 'v*'
+
+env:
+  PYTHON_VERSION: '3.12'
+  
+jobs:
+  build:
+    name: Build Windows EXE with PyTorch
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pillow pytest
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements-dev.txt
+          python -m pip install pyinstaller
+
+      - name: Run smoke tests
+        run: python -m unittest test_smoke -v
+
+      - name: Build EXE with PyTorch
+        shell: cmd
+        run: |
+          pyinstaller --onefile --windowed --name edge_batch_gui^
+            --hidden-import=multiprocessing^
+            --hidden-import=concurrent.futures^
+            --hidden-import=numpy.lib.stride_tricks^
+            --hidden-import=PIL._tkinter_finder^
+            --hidden-import=torch^
+            --hidden-import=torch.nn^
+            --hidden-import=torch.nn.functional^
+            --hidden-import=torch.utils.data^
+            --hidden-import=torch.optim^
+            --hidden-import=torch.backends.cudnn^
+            --collect-all=numpy^
+            --collect-all=PIL^
+            --collect-all=torch^
+            sobel_edge_detection.py
+
+      - name: Verify EXE
+        shell: cmd
+        run: |
+          if exist dist\edge_batch_gui.exe (
+            echo EXE built successfully
+            dir dist\
+          ) else (
+            echo EXE build failed
+            exit 1
+          )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-batch-gui-windows-latest
+          path: dist/edge_batch_gui.exe
+          retention-days: 30
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/edge_batch_gui.exe
+          generate_release_notes: true
+          body: |
+            ## Edge Batch GUI - Windows EXE Release
+            
+            ### Features
+            - 1px edge label editor with polyline/brush tools
+            - Deep Auto Optimize (PyTorch supervised learning)
+            - Classical Auto Optimize (Sobel-based)
+            - Multi-file label navigation
+            - GPU acceleration support (CuPy)
+            
+            ### Requirements
+            - Windows 10/11
+            - No Python installation needed (standalone EXE)

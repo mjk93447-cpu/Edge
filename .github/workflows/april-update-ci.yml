@@ -80,21 +80,11 @@ jobs:
 
       - name: Build EXE
         shell: cmd
-        run: |
-          pyinstaller --onefile --windowed --name edge_batch_gui \
-            --hidden-import=multiprocessing \
-            --hidden-import=concurrent.futures \
-            --hidden-import=numpy.lib.stride_tricks \
-            --hidden-import=PIL._tkinter_finder \
-            --collect-all=numpy \
-            --collect-all=PIL \
-            sobel_edge_detection.py
+        run: pyinstaller --onefile --windowed --name edge_batch_gui --hidden-import=multiprocessing --hidden-import=concurrent.futures --hidden-import=numpy.lib.stride_tricks --hidden-import=PIL._tkinter_finder --collect-all=numpy --collect-all=PIL sobel_edge_detection.py
 
       - name: Verify EXE
         shell: cmd
-        run: |
-          dir dist\
-          if exist dist\edge_batch_gui.exe (echo EXE built successfully) else (echo EXE build failed & exit 1)
+        run: if exist dist\edge_batch_gui.exe (echo EXE built successfully) else (echo EXE build failed & exit 1)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

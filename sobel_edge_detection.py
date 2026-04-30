@@ -2954,8 +2954,7 @@ class EdgeBatchGUI:
         ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side=tk.LEFT, padx=4)
 
         load_index(idx)
-
-     def _open_edge_label_editor(self):
+    def _open_edge_label_editor(self):
         if not self.selected_files:
             messagebox.showinfo("Info", "Select a file before creating a 1px label.")
             return
@@ -3197,7 +3196,7 @@ class EdgeBatchGUI:
         ttk.Button(btns_main, text="Finish Line", command=finish_polyline).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns_main, text="Undo", command=undo).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns_main, text="Clear Label", command=clear).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btns_main, text="Save Current", command=save_all).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns_main, text="Save 1px GT", command=save_all).pack(side=tk.LEFT, padx=4)
 
         btns_nav = ttk.Frame(win, padding=6)
         btns_nav.pack(fill=tk.X)

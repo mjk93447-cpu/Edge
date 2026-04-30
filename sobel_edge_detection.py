@@ -22,6 +22,22 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image, ImageTk, ImageDraw
 
+from edge_labeling import (
+    compute_edge_label_score,
+    ensure_label_dir,
+    load_edge_labels,
+    load_edge_label_index,
+    save_edge_label,
+)
+
+try:
+    from edge_training import HPOConfig, optimize_edge_training
+    _DEEP_TRAINING_AVAILABLE = True
+except Exception:
+    HPOConfig = None
+    optimize_edge_training = None
+    _DEEP_TRAINING_AVAILABLE = False
+
 # Optional CuPy for GPU acceleration (NVIDIA CUDA)
 _CUPY_AVAILABLE = False
 try:
@@ -2696,6 +2712,7 @@ class EdgeBatchGUI:
         ttk.Button(button_frame, text="Add Files", command=self._add_files).pack(side=tk.LEFT)
         ttk.Button(button_frame, text="Clear List", command=self._clear_files).pack(side=tk.LEFT, padx=6)
         ttk.Button(button_frame, text="Set ROI", command=self._open_roi_editor).pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_frame, text="1px Label", command=self._open_edge_label_editor).pack(side=tk.LEFT, padx=6)
         ttk.Button(button_frame, text="Clear ROI", command=self._clear_roi).pack(side=tk.LEFT, padx=6)
         ttk.Label(button_frame, text="Auto mode").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Combobox(
@@ -2707,6 +2724,7 @@ class EdgeBatchGUI:
         ).pack(side=tk.LEFT)
         self.auto_button = ttk.Button(button_frame, text="Auto Optimize", command=self._start_auto_optimize)
         self.auto_button.pack(side=tk.LEFT, padx=6)
+        ttk.Button(button_frame, text="Classical Auto", command=self._start_classical_auto_optimize).pack(side=tk.LEFT, padx=4)
         ttk.Checkbutton(
             button_frame,
             text="GPU acceleration",
@@ -2936,6 +2954,186 @@ class EdgeBatchGUI:
         ttk.Button(btn_frame, text="Close", command=win.destroy).pack(side=tk.LEFT, padx=4)
 
         load_index(idx)
+
+    def _open_edge_label_editor(self):
+        selection = self.file_listbox.curselection()
+        if not self.selected_files:
+            messagebox.showinfo("Info", "Select a file before creating a 1px label.")
+            return
+        idx = selection[0] if selection else 0
+        path = self.selected_files[idx]
+        if path not in self.roi_map:
+            messagebox.showinfo("ROI Required", "Set an ROI before drawing the 1px correct edge label.")
+            return
+        if not os.path.exists(path):
+            messagebox.showerror("File Missing", path)
+            return
+
+        x1, y1, x2, y2 = self.roi_map[path]
+        img = Image.open(path).convert("L")
+        roi_img = img.crop((x1, y1, x2, y2))
+        label_dir = ensure_label_dir()
+        h, w = roi_img.height, roi_img.width
+        display_max_w, display_max_h = 1100, 680
+        scale = min(display_max_w / max(w, 1), display_max_h / max(h, 1), 4.0)
+        scale = max(scale, 1.0)
+        disp_w, disp_h = int(w * scale), int(h * scale)
+        display = roi_img.resize((disp_w, disp_h), resample=Image.BILINEAR).convert("RGB")
+
+        index = load_edge_label_index()
+        existing = index.get("records", {}).get(os.path.abspath(path))
+        polylines = []
+        brush_mask = np.zeros((h, w), dtype=bool)
+        if existing:
+            try:
+                with open(existing.get("vector_path"), "r", encoding="utf-8") as handle:
+                    polylines = json.load(handle).get("polylines", [])
+                if os.path.exists(existing.get("mask_path", "")):
+                    brush_mask = np.asarray(Image.open(existing["mask_path"]).convert("L")) > 0
+            except (OSError, json.JSONDecodeError, TypeError):
+                polylines = []
+
+        win = tk.Toplevel(self.root)
+        win.title("ROI + 1px Edge Label Editor")
+        top = ttk.Frame(win, padding=6)
+        top.pack(fill=tk.X)
+        mode_var = tk.StringVar(value="polyline")
+        width_var = tk.IntVar(value=1)
+        snap_var = tk.BooleanVar(value=True)
+        status_var = tk.StringVar(value="Polyline: left-click points, double-click to finish. Brush/Eraser draw directly.")
+        for label, value in [("Polyline", "polyline"), ("Brush", "brush"), ("Eraser", "eraser")]:
+            ttk.Radiobutton(top, text=label, variable=mode_var, value=value).pack(side=tk.LEFT, padx=4)
+        ttk.Label(top, text="Width").pack(side=tk.LEFT, padx=(14, 2))
+        ttk.Combobox(top, textvariable=width_var, values=[1, 2, 3], width=4, state="readonly").pack(side=tk.LEFT)
+        ttk.Checkbutton(top, text="Pixel snap", variable=snap_var).pack(side=tk.LEFT, padx=8)
+        ttk.Label(win, textvariable=status_var).pack(anchor="w", padx=8)
+
+        canvas = tk.Canvas(win, width=disp_w, height=disp_h, background="black")
+        canvas.pack(padx=8, pady=6)
+        canvas_img = ImageTk.PhotoImage(display)
+        canvas.create_image(0, 0, anchor="nw", image=canvas_img)
+        canvas.image = canvas_img
+
+        state = {
+            "current": [],
+            "line_items": [],
+            "mask_items": [],
+            "undo": [],
+        }
+
+        def to_roi(event):
+            x = event.x / scale
+            y = event.y / scale
+            if snap_var.get():
+                x = round(x)
+                y = round(y)
+            return int(max(0, min(w - 1, x))), int(max(0, min(h - 1, y)))
+
+        def redraw():
+            for item in state["line_items"] + state["mask_items"]:
+                canvas.delete(item)
+            state["line_items"] = []
+            state["mask_items"] = []
+            overlay = np.argwhere(brush_mask)
+            if overlay.size:
+                # Draw sparse mask preview efficiently enough for ROI labeling.
+                step = max(1, len(overlay) // 5000)
+                for yy, xx in overlay[::step]:
+                    xd, yd = xx * scale, yy * scale
+                    state["mask_items"].append(
+                        canvas.create_rectangle(xd, yd, xd + max(1, scale), yd + max(1, scale), outline="", fill="#00ff40")
+                    )
+            for line in polylines:
+                pts = line.get("points", [])
+                if len(pts) >= 2:
+                    flat = []
+                    for px, py in pts:
+                        flat.extend([px * scale, py * scale])
+                    state["line_items"].append(canvas.create_line(*flat, fill="yellow", width=2))
+            if len(state["current"]) >= 1:
+                for px, py in state["current"]:
+                    state["line_items"].append(
+                        canvas.create_oval(px * scale - 2, py * scale - 2, px * scale + 2, py * scale + 2, fill="cyan")
+                    )
+
+        def paint_at(x, y, erase=False):
+            radius = max(0, int(width_var.get()) // 2)
+            yy, xx = np.ogrid[:h, :w]
+            disk = (xx - x) ** 2 + (yy - y) ** 2 <= radius * radius
+            if erase:
+                brush_mask[disk] = False
+            else:
+                brush_mask[disk] = True
+
+        def on_press(event):
+            x, y = to_roi(event)
+            mode = mode_var.get()
+            if mode == "polyline":
+                state["current"].append((x, y))
+                redraw()
+            else:
+                state["undo"].append(brush_mask.copy())
+                paint_at(x, y, erase=(mode == "eraser"))
+                redraw()
+
+        def on_drag(event):
+            mode = mode_var.get()
+            if mode not in ("brush", "eraser"):
+                return
+            x, y = to_roi(event)
+            paint_at(x, y, erase=(mode == "eraser"))
+            redraw()
+
+        def finish_polyline(_event=None):
+            if len(state["current"]) >= 2:
+                polylines.append({"points": list(state["current"]), "width": int(width_var.get()), "closed": False})
+                state["undo"].append(("polyline", polylines[-1]))
+                state["current"] = []
+                status_var.set(f"Saved vector line. Total lines: {len(polylines)}")
+                redraw()
+
+        canvas.bind("<ButtonPress-1>", on_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<Double-Button-1>", finish_polyline)
+
+        def undo():
+            if state["current"]:
+                state["current"] = state["current"][:-1]
+            elif state["undo"]:
+                last = state["undo"].pop()
+                if isinstance(last, tuple) and last[0] == "polyline" and polylines:
+                    polylines.pop()
+                elif isinstance(last, np.ndarray):
+                    brush_mask[:, :] = last
+            redraw()
+
+        def clear():
+            polylines.clear()
+            brush_mask[:, :] = False
+            state["current"] = []
+            redraw()
+
+        def save_and_close():
+            rec = save_edge_label(
+                path,
+                self.roi_map[path],
+                polylines,
+                brush_mask=brush_mask,
+                meta_zones={},
+                root=label_dir,
+            )
+            self._log(f"[LABEL] Saved 1px GT: {os.path.basename(rec.mask_path)}")
+            status_var.set(f"Saved: {rec.mask_path}")
+            win.destroy()
+
+        btns = ttk.Frame(win, padding=6)
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="Finish Line", command=finish_polyline).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Undo", command=undo).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Clear Label", command=clear).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Save 1px GT", command=save_and_close).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side=tk.RIGHT, padx=4)
+        redraw()
 
     def _clear_roi(self):
         path = self._get_selected_file()
@@ -4121,6 +4319,101 @@ USER PRE-ANSWERS (before starting Auto):
         return result[0]
 
     def _start_auto_optimize(self):
+        """Default Auto Optimize: supervised 1px GT deep edge training."""
+        if self._worker_thread and self._worker_thread.is_alive():
+            messagebox.showwarning("In Progress", "Processing is already running.")
+            return
+        if not self.selected_files:
+            self._add_files()
+        if not self.selected_files:
+            return
+        records = load_edge_labels(self.selected_files)
+        if not records:
+            messagebox.showinfo(
+                "1px Labels Required",
+                "Auto Optimize now uses supervised 1px GT labels. Set ROI and click '1px Label' to create labels first.\n\n"
+                "Use 'Classical Auto' for the old Sobel heuristic optimizer.",
+            )
+            return
+        if not _DEEP_TRAINING_AVAILABLE or optimize_edge_training is None:
+            messagebox.showerror(
+                "Deep Training Unavailable",
+                "The deep edge training module could not be loaded. Install PyTorch dependencies or use Classical Auto.",
+            )
+            return
+
+        batch_dir = self._create_batch_output_dir()
+        deep_dir = os.path.join(batch_dir, "deep_edge_training")
+        self.status_var.set("Deep Auto Optimize started...")
+        self.start_button.config(state=tk.DISABLED)
+        self.auto_button.config(state=tk.DISABLED)
+        if self.pause_button:
+            self.pause_button.config(state=tk.NORMAL, text="Pause")
+        if self.stop_button:
+            self.stop_button.config(state=tk.NORMAL)
+        self._auto_pause_event.clear()
+        self._auto_stop_event.clear()
+        self._auto_scores = []
+        self._auto_best_scores = []
+        self._auto_best_time_series = []
+        self._refresh_auto_graphs()
+        self._worker_thread = threading.Thread(
+            target=self._deep_auto_optimize_worker,
+            args=(records, deep_dir),
+            daemon=True,
+        )
+        self._worker_thread.start()
+        self.root.after(100, self._poll_messages)
+
+    def _deep_auto_optimize_worker(self, records, output_dir):
+        start = time.time()
+
+        def progress(update):
+            while self._auto_pause_event.is_set() and not self._auto_stop_event.is_set():
+                time.sleep(0.2)
+            if self._auto_stop_event.is_set():
+                raise RuntimeError("stopped")
+            epoch = int(update.get("epoch", update.get("trial", 0) + 1))
+            total = int(update.get("epochs", 1))
+            score = float(update.get("best_bf1", update.get("score", 0.0)))
+            elapsed = float(update.get("elapsed", time.time() - start))
+            self._auto_best_time_series.append((elapsed, score))
+            summary = {
+                "wrinkle": 0.0,
+                "endpoints": 0.0,
+                "branch": float(update.get("merge_split_risk", 0.0)),
+            }
+            qualities = {"q_cont": float(update.get("cldice", score)), "q_band": float(update.get("boundary_iou", score))}
+            self._message_queue.put(
+                ("auto_progress", epoch, total, score, score, None, "deep", elapsed, summary, qualities, 1.0, 1.0 - score)
+            )
+            self._message_queue.put(("auto_log", f"[DEEP] progress: {update}"))
+
+        try:
+            hpo = HPOConfig(
+                output_dir=output_dir,
+                model_presets=("teed_1px_default",),
+                trial_count=1 if len(records) < 4 else 3,
+                max_epochs_per_trial=1 if len(records) < 4 else 2,
+                final_epochs=3,
+            )
+            self._message_queue.put(("auto_log", f"[DEEP] Loaded {len(records)} labeled ROI(s). Output: {output_dir}"))
+            summary = optimize_edge_training(records, hpo, progress_cb=progress)
+            best = summary.get("best") or {}
+            result = best.get("result") or {}
+            report_path = result.get("report_path") or os.path.join(output_dir, "hpo_summary.json")
+            best_score = float(best.get("score", 0.0))
+            self._message_queue.put(("auto_done", None, report_path, None, best_score))
+        except Exception as exc:
+            report_path = os.path.join(output_dir, "deep_auto_error.txt")
+            os.makedirs(output_dir, exist_ok=True)
+            with open(report_path, "w", encoding="utf-8") as handle:
+                handle.write(str(exc))
+            stop_reason = "stopped" if str(exc) == "stopped" else "deep_failed"
+            self._message_queue.put(("auto_log", f"[DEEP][ERROR] {exc}"))
+            self._message_queue.put(("auto_done", None, report_path, stop_reason, 0.0))
+
+    def _start_classical_auto_optimize(self):
         if self._worker_thread and self._worker_thread.is_alive():
             messagebox.showwarning("In Progress", "Processing is already running.")
             return

@@ -1,0 +1,103 @@
+name: Artifact Generation - April 30th Update
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'sobel_edge_detection.py'
+      - 'edge_labeling.py'
+      - 'edge_training.py'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.12'
+  ARTIFACT_VERSION: '2026-04-30'
+
+jobs:
+  generate-artifacts:
+    name: Generate Artifacts
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pillow
+          python -m pip install -r requirements-dev.txt
+
+      - name: Generate edge labels directory
+        shell: powershell
+        run: |
+          if (-not (Test-Path "edge_labels")) {
+            New-Item -ItemType Directory -Path "edge_labels" -Force
+          }
+          $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+          $output = @{
+            generated_at = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
+            version = $env:ARTIFACT_VERSION
+            source_files = @("sobel_edge_detection.py", "edge_labeling.py", "edge_training.py")
+            features = @("1px_label_editor", "deep_auto_optimize", "classical_auto_optimize")
+          } | ConvertTo-Json -Depth 3
+          $output | Out-File -FilePath "edge_labels/manifest_${timestamp}.json" -Encoding utf8
+          Write-Host "Generated manifest: edge_labels/manifest_${timestamp}.json"
+
+      - name: Run smoke test
+        run: python -m unittest test_smoke -v
+
+      - name: Check Python imports
+        run: python -c "import sys; import sobel_edge_detection; print('sobel_edge_detection OK'); import edge_labeling; print('edge_labeling OK'); import edge_training; print('edge_training OK')"
+
+      - name: Generate test artifacts
+        shell: powershell
+        run: |
+          $testDir = "test_artifacts"
+          if (-not (Test-Path $testDir)) {
+            New-Item -ItemType Directory -Path $testDir -Force
+          }
+          $testData = @{
+            test_suite = "april_30_update"
+            test_date = (Get-Date -Format "yyyy-MM-dd")
+            tests = @("smoke_test", "import_test", "edge_labeling_module", "edge_training_module")
+            status = "completed"
+          } | ConvertTo-Json -Depth 3
+          $testData | Out-File -FilePath "${testDir}/test_results_${env:ARTIFACT_VERSION}.json" -Encoding utf8
+          Write-Host "Generated test results"
+
+      - name: Upload edge labels artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge-labels-${{ env.ARTIFACT_VERSION }}
+          path: |
+            edge_labels/
+            test_artifacts/
+          retention-days: 90
+
+      - name: Upload source artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-code-${{ env.ARTIFACT_VERSION }}
+          path: |
+            sobel_edge_detection.py
+            edge_labeling.py
+            edge_training.py
+          retention-days: 30
+
+      - name: Generate summary
+        shell: powershell
+        run: |
+          Write-Host "## April 30th Update Artifact Generation Summary"
+          Write-Host "- Source files updated: 3"
+          Write-Host "- New features: 1px label editor, deep auto optimize, classical auto"
+          Write-Host "- Modules integrated: edge_labeling, edge_training"

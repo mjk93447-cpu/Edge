@@ -1,0 +1,148 @@
+name: April 30th Update - CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'sobel_edge_detection.py'
+      - 'edge_labeling.py'
+      - 'edge_training.py'
+      - '.github/workflows/april-update-ci.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'sobel_edge_detection.py'
+      - 'edge_labeling.py'
+      - 'edge_training.py'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.12'
+  VERSION_DATE: '2026-04-30'
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pillow pytest
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run smoke tests
+        run: python -m pytest test_smoke.py -v
+
+      - name: Run edge labeling tests
+        run: python -m pytest test_edge_labeling.py -v
+
+      - name: Run edge training tests
+        run: python -m pytest test_edge_training.py -v
+
+  build:
+    name: Build Windows EXE
+    needs: test
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy pillow
+          python -m pip install -r requirements-dev.txt
+          python -m pip install pyinstaller
+
+      - name: Run smoke tests
+        run: python -m unittest test_smoke -v
+
+      - name: Build EXE
+        shell: cmd
+        run: |
+          pyinstaller --onefile --windowed --name edge_batch_gui \
+            --hidden-import=multiprocessing \
+            --hidden-import=concurrent.futures \
+            --hidden-import=numpy.lib.stride_tricks \
+            --hidden-import=PIL._tkinter_finder \
+            --collect-all=numpy \
+            --collect-all=PIL \
+            sobel_edge_detection.py
+
+      - name: Verify EXE
+        shell: cmd
+        run: |
+          dir dist\
+          if exist dist\edge_batch_gui.exe (echo EXE built successfully) else (echo EXE build failed & exit 1)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: edge_batch_gui-windows-${{ env.VERSION_DATE }}
+          path: dist/edge_batch_gui.exe
+          retention-days: 30
+
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download EXE artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: edge_batch_gui-windows-${{ env.VERSION_DATE }}
+          path: ./dist
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/edge_batch_gui.exe
+          generate_release_notes: true
+          body: |
+            ## April 30th Update - Version ${{ github.ref_name }}
+            
+            ### New Features
+            - 1px edge label editor with polyline and brush tools
+            - Deep Auto Optimize mode using supervised learning
+            - Edge labeling integration with ROI support
+            - Classical Auto Optimize mode (legacy Sobel-based)
+            
+            ### Technical Improvements
+            - Integrated edge_labeling module for 1px GT generation
+            - Integrated edge_training module for deep edge model training
+            - Added "1px Label" button for manual labeling
+            - Added "Classical Auto" for traditional optimization
+
+      - name: Update release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts-${{ env.VERSION_DATE }}
+          path: |
+            dist/edge_batch_gui.exe
+            edge_labels/
+          retention-days: 90

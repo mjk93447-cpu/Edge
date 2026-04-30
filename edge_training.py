@@ -374,11 +374,11 @@ def _evaluate_model(model, records: Sequence[EdgeLabelRecord], cfg: TrainConfig,
                 resample=Image.BILINEAR,
             )
             pred_prob = np.asarray(prob_img, dtype=np.float32) / 255.0
-            _, gt_skel = load_record_masks(rec)
+            mask, gt_skel = load_record_masks(rec)
             scores.append(
                 compute_edge_label_score(
                     pred_prob,
-                    gt_skel,
+                    mask,
                     tolerance_radius=cfg.tolerance_radius,
                     topology_safe=True,
                     topology_penalty=cfg.topology_penalty,

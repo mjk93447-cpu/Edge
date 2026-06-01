@@ -15,6 +15,7 @@ import os
 import random
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
@@ -70,8 +71,9 @@ class TrainConfig:
     seed: int = 42
     epochs: int = 3
     batch_size: int = 2
-    lr_max: float = 1e-3
+    lr_max: float = 5e-4
     weight_decay: float = 1e-4
+    gradient_clip_norm: float = 1.0
     bce_weight: float = 1.0
     dice_weight: float = 1.0
     focal_weight: float = 0.0
@@ -108,6 +110,29 @@ class TrainConfig:
     final_thinning_postprocess: bool = True
     final_train: bool = False
     amp_enabled: bool = True
+    resume_from_checkpoint: Optional[str] = None
+    early_stopping_enabled: bool = True
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 0.002
+    early_stopping_metric: str = "val_ods_f1"
+    overfit_gap_limit: float = 0.15
+    num_workers: int = 0
+    prefetch_factor: int = 2
+    train_cpu_threads: int = 0
+    val_every_n_epochs: int = 2
+    val_eval_mode: str = "fast"
+    val_split_ratio: float = 0.25
+    checkpoint_every_n_epochs: int = 1
+    checkpoint_full_eval_on_improve: bool = True
+    cache_dataset_max_records: int = 100
+    augment_enabled: bool = True
+    augment_rotation_deg: float = 5.0
+    augment_brightness: float = 0.10
+    augment_contrast: float = 0.10
+    augment_gamma: float = 0.05
+    augment_apply_prob: float = 0.8
+    samples_per_record_per_epoch: int = 2
+    translate_jitter_frac: float = 0.04
 
 
 @dataclass
@@ -148,6 +173,25 @@ def _resolve_device(device: str) -> "torch.device":
     return torch.device(device)
 
 
+def _resolve_num_workers(requested: int) -> int:
+    if int(requested) > 0:
+        return int(requested)
+    cpu_count = os.cpu_count() or 4
+    if os.name == "nt":
+        return min(2, max(0, cpu_count - 1))
+    return min(4, max(0, cpu_count - 1))
+
+
+def _configure_train_threads(train_cpu_threads: int) -> int:
+    cpu_count = os.cpu_count() or 4
+    threads = int(train_cpu_threads) if int(train_cpu_threads) > 0 else cpu_count
+    torch.set_num_threads(max(1, threads))
+    return threads
+
+
+_FAST_EVAL_THRESHOLDS = tuple(float(x) for x in np.linspace(0.1, 0.9, 7))
+
+
 def _effective_preset(preset: str) -> str:
     spec = MODEL_PRESETS.get(preset, MODEL_PRESETS["teed_1px_default"])
     if spec["family"] != "compact_teed":
@@ -163,29 +207,225 @@ def _model_state_hash(model: "nn.Module") -> str:
     return digest.hexdigest()
 
 
+def _infer_label_root(records: Sequence[EdgeLabelRecord]) -> Optional[str]:
+    if not records:
+        return None
+    try:
+        return str(Path(records[0].mask_path).parent)
+    except Exception:
+        return None
+
+
+def _load_augmentation_parent_map(label_root: Optional[str]) -> Dict[str, str]:
+    if not label_root:
+        return {}
+    manifest_path = Path(label_root) / "augmentation_manifest.json"
+    if not manifest_path.exists():
+        return {}
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    mapping: Dict[str, str] = {}
+    for row in payload.get("accepted") or []:
+        parent = str(row.get("parent_record_key") or "").strip()
+        if not parent:
+            continue
+        for key in (
+            row.get("record_key"),
+            row.get("image_hash"),
+            row.get("output_image_path"),
+            row.get("image_path"),
+        ):
+            if key:
+                mapping[str(key)] = parent
+    return mapping
+
+
+def _record_group_key(rec: EdgeLabelRecord, parent_map: Dict[str, str]) -> str:
+    for candidate in (rec.image_hash, rec.image_path, Path(rec.image_path).name):
+        if candidate and candidate in parent_map:
+            return str(parent_map[candidate])
+    if rec.image_hash:
+        return str(rec.image_hash)
+    return Path(rec.image_path).stem
+
+
+def _split_records(
+    records: Sequence[EdgeLabelRecord],
+    *,
+    seed: int = 42,
+    val_ratio: float = 0.25,
+    label_root: Optional[str] = None,
+) -> tuple[List[EdgeLabelRecord], List[EdgeLabelRecord], Dict[str, str]]:
+    recs = list(records)
+    group_ids: Dict[str, str] = {}
+    if len(recs) <= 1:
+        for rec in recs:
+            group_ids[id(rec)] = _record_group_key(rec, {})
+        return recs, recs, group_ids
+    parent_map = _load_augmentation_parent_map(label_root or _infer_label_root(recs))
+    grouped: Dict[str, List[EdgeLabelRecord]] = {}
+    for rec in recs:
+        gid = _record_group_key(rec, parent_map)
+        group_ids[id(rec)] = gid
+        grouped.setdefault(gid, []).append(rec)
+    group_keys = list(grouped.keys())
+    rng = random.Random(int(seed))
+    rng.shuffle(group_keys)
+    n_val_groups = max(1, int(round(len(group_keys) * float(val_ratio))))
+    val_groups = set(group_keys[:n_val_groups])
+    train_records: List[EdgeLabelRecord] = []
+    val_records: List[EdgeLabelRecord] = []
+    for gid, items in grouped.items():
+        if gid in val_groups:
+            val_records.extend(items)
+        else:
+            train_records.extend(items)
+    if not train_records:
+        train_records = list(val_records)
+        val_records = []
+    if not val_records:
+        val_records = train_records[-1:]
+        train_records = train_records[:-1] or val_records
+    return train_records, val_records, group_ids
+
+
+def _apply_photometric_aug(img_arr: np.ndarray, cfg: TrainConfig, rng: random.Random) -> np.ndarray:
+    out = img_arr.astype(np.float32, copy=True)
+    bright = float(cfg.augment_brightness)
+    if bright > 0:
+        scale = 1.0 + rng.uniform(-bright, bright)
+        out = np.clip(out * scale, 0.0, 1.0)
+    contrast = float(cfg.augment_contrast)
+    if contrast > 0:
+        scale = 1.0 + rng.uniform(-contrast, contrast)
+        mean = float(out.mean())
+        out = np.clip((out - mean) * scale + mean, 0.0, 1.0)
+    gamma_span = float(cfg.augment_gamma)
+    if gamma_span > 0:
+        gamma = 1.0 + rng.uniform(-gamma_span, gamma_span)
+        out = np.clip(out, 0.0, 1.0) ** gamma
+    return out
+
+
+def _rotate_roi_arrays(
+    img_arr: np.ndarray,
+    mask_arr: np.ndarray,
+    angle_deg: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    fill = int(np.median(img_arr))
+    img_pil = Image.fromarray(np.clip(img_arr * 255.0, 0, 255).astype(np.uint8))
+    mask_pil = Image.fromarray((mask_arr > 0.5).astype(np.uint8) * 255)
+    img_rot = np.asarray(
+        img_pil.rotate(angle_deg, resample=Image.BILINEAR, fillcolor=fill, expand=False),
+        dtype=np.float32,
+    ) / 255.0
+    mask_rot = (np.asarray(mask_pil.rotate(angle_deg, resample=Image.NEAREST, fillcolor=0, expand=False)) > 0).astype(
+        np.float32
+    )
+    return img_rot, mask_rot
+
+
+def _load_record_sample(
+    rec: EdgeLabelRecord,
+    cfg: TrainConfig,
+    *,
+    rng: random.Random,
+    augment: bool,
+    sample_idx: int = 0,
+) -> Dict[str, Any]:
+    image = Image.open(rec.image_path).convert("L")
+    x1, y1, x2, y2 = rec.roi
+    roi_w = max(1, x2 - x1)
+    roi_h = max(1, y2 - y1)
+    _, gt_skel = load_record_masks(rec)
+    crop_size = int(cfg.crop_size)
+    roi_img = image.crop((x1, y1, x2, y2))
+    jitter = float(cfg.translate_jitter_frac) if int(cfg.samples_per_record_per_epoch) > 1 else 0.0
+    if jitter > 0 and roi_w > crop_size and roi_h > crop_size:
+        max_dx = max(0, roi_w - crop_size)
+        max_dy = max(0, roi_h - crop_size)
+        if sample_idx:
+            dx = rng.randint(0, max_dx)
+            dy = rng.randint(0, max_dy)
+        else:
+            dx = max_dx // 2
+            dy = max_dy // 2
+        roi_img = roi_img.crop((dx, dy, dx + crop_size, dy + crop_size))
+        gt_skel = gt_skel[dy : dy + crop_size, dx : dx + crop_size]
+    target_size = (crop_size, crop_size)
+    roi_img = roi_img.resize(target_size, resample=Image.BILINEAR)
+    mask_img = Image.fromarray((gt_skel.astype(np.uint8) * 255)).resize(target_size, resample=Image.NEAREST)
+    img_arr = np.asarray(roi_img, dtype=np.float32) / 255.0
+    mask_arr = (np.asarray(mask_img, dtype=np.uint8) > 0).astype(np.float32)
+    min_pixels = int(cfg.min_label_pixels)
+
+    def _build():
+        nonlocal img_arr, mask_arr
+        if augment and cfg.augment_enabled and rng.random() < float(cfg.augment_apply_prob):
+            max_rot = float(cfg.augment_rotation_deg)
+            if max_rot > 0:
+                angle = rng.uniform(-max_rot, max_rot)
+                img_arr, mask_arr = _rotate_roi_arrays(img_arr, mask_arr, angle)
+            img_arr = _apply_photometric_aug(img_arr, cfg, rng)
+        return img_arr, mask_arr
+
+    img_arr, mask_arr = _build()
+    if int(mask_arr.sum()) < min_pixels and augment:
+        img_arr, mask_arr = _build()
+    return {
+        "image": torch.from_numpy(img_arr[None, :, :]),
+        "target": torch.from_numpy(mask_arr[None, :, :]),
+    }
+
+
 class EdgeLabelDataset(Dataset):
-    def __init__(self, records: Sequence[EdgeLabelRecord], crop_size: int = 256):
+    def __init__(
+        self,
+        records: Sequence[EdgeLabelRecord],
+        crop_size: int = 256,
+        *,
+        cfg: Optional[TrainConfig] = None,
+        augment: bool = False,
+        cache_max_records: int = 100,
+    ):
         _require_torch()
         self.records = list(records)
         self.crop_size = int(crop_size)
+        self.cfg = cfg or TrainConfig(crop_size=crop_size)
+        self.augment = bool(augment)
+        self.samples_per_record = max(1, int(self.cfg.samples_per_record_per_epoch)) if augment else 1
+        self._rng = random.Random(int(self.cfg.seed))
+        self._cache: Optional[List[Dict[str, Any]]] = None
+        can_cache = (
+            cache_max_records > 0
+            and len(self.records) <= cache_max_records
+            and self.samples_per_record == 1
+            and not self.augment
+        )
+        if can_cache:
+            self._cache = [
+                _load_record_sample(rec, self.cfg, rng=self._rng, augment=False) for rec in self.records
+            ]
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.records) * self.samples_per_record
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        rec = self.records[idx]
-        image = Image.open(rec.image_path).convert("L")
-        x1, y1, x2, y2 = rec.roi
-        roi_img = image.crop((x1, y1, x2, y2))
-        gt_mask, gt_skel = load_record_masks(rec)
-        target_size = (self.crop_size, self.crop_size)
-        roi_img = roi_img.resize(target_size, resample=Image.BILINEAR)
-        mask_img = Image.fromarray((gt_skel.astype(np.uint8) * 255)).resize(target_size, resample=Image.NEAREST)
-        img_arr = np.asarray(roi_img, dtype=np.float32) / 255.0
-        mask_arr = (np.asarray(mask_img, dtype=np.uint8) > 0).astype(np.float32)
-        image_tensor = torch.from_numpy(img_arr[None, :, :])
-        target_tensor = torch.from_numpy(mask_arr[None, :, :])
-        return {"image": image_tensor, "target": target_tensor}
+        if self._cache is not None:
+            return self._cache[idx]
+        record_idx = idx // self.samples_per_record
+        sample_idx = idx % self.samples_per_record
+        rec = self.records[record_idx]
+        sample_rng = random.Random(int(self.cfg.seed) + record_idx * 9973 + sample_idx * 17)
+        return _load_record_sample(
+            rec,
+            self.cfg,
+            rng=sample_rng,
+            augment=self.augment,
+            sample_idx=sample_idx,
+        )
 
 
 class _ConvBlock(nn.Module):
@@ -347,18 +587,78 @@ def _edge_loss(outputs: Dict[str, Any], target, cfg: TrainConfig, pos_weight, ep
     return loss
 
 
-def _split_records(records: Sequence[EdgeLabelRecord]) -> tuple[List[EdgeLabelRecord], List[EdgeLabelRecord]]:
-    recs = list(records)
-    if len(recs) <= 1:
-        return recs, recs
-    n_val = max(1, int(round(len(recs) * 0.25)))
-    return recs[:-n_val], recs[-n_val:]
+def _metric_value_from_eval(metrics: Dict[str, Any], metric_key: str) -> float:
+    if metric_key in ("val_ods_f1", "ods_f1"):
+        metric_key = "best_bf1"
+    if metric_key == "val_objective":
+        metric_key = "topology_safe_objective"
+    return float(
+        metrics.get(
+            metric_key,
+            metrics.get("topology_safe_objective", metrics.get("best_bf1", -1.0)),
+        )
+    )
 
 
-def _evaluate_model(model, records: Sequence[EdgeLabelRecord], cfg: TrainConfig, device) -> Dict[str, Any]:
+def _write_split_record_manifest(
+    records: Sequence[EdgeLabelRecord],
+    path: str,
+    group_ids: Dict[str, str],
+) -> None:
+    rows = []
+    for idx, rec in enumerate(records):
+        rows.append(
+            {
+                "index": idx,
+                "image_path": rec.image_path,
+                "roi": list(rec.roi),
+                "image_hash": rec.image_hash,
+                "group_id": group_ids.get(id(rec)),
+            }
+        )
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(rows, handle, ensure_ascii=True, indent=2)
+
+
+def _append_metrics_epoch_row(output_dir: str, row: Dict[str, Any]) -> None:
+    path = os.path.join(output_dir, "metrics_epoch.csv")
+    fieldnames = [
+        "epoch",
+        "train_loss",
+        "val_pixel_loss",
+        "val_ods_f1",
+        "val_ap",
+        "val_cldice",
+        "val_objective",
+        "val_topology_risk",
+        "val_eval_mode",
+        "best_epoch",
+        "no_improve_epochs",
+    ]
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def _evaluate_model(
+    model,
+    records: Sequence[EdgeLabelRecord],
+    cfg: TrainConfig,
+    device,
+    *,
+    eval_mode: Optional[str] = None,
+) -> Dict[str, Any]:
     model.eval()
+    mode = (eval_mode or cfg.val_eval_mode or "full").strip().lower()
+    fast = mode == "fast"
+    thresholds = _FAST_EVAL_THRESHOLDS if fast else None
+    topology_safe = not fast
     scores = []
-    with torch.no_grad():
+    ctx = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
+    with ctx():
         for rec in records:
             image = Image.open(rec.image_path).convert("L")
             x1, y1, x2, y2 = rec.roi
@@ -374,13 +674,14 @@ def _evaluate_model(model, records: Sequence[EdgeLabelRecord], cfg: TrainConfig,
                 resample=Image.BILINEAR,
             )
             pred_prob = np.asarray(prob_img, dtype=np.float32) / 255.0
-            mask, gt_skel = load_record_masks(rec)
+            mask, _gt_skel = load_record_masks(rec)
             scores.append(
                 compute_edge_label_score(
                     pred_prob,
                     mask,
+                    thresholds=thresholds,
                     tolerance_radius=cfg.tolerance_radius,
-                    topology_safe=True,
+                    topology_safe=topology_safe,
                     topology_penalty=cfg.topology_penalty,
                     topology_failure_penalty=cfg.topology_failure_penalty,
                     topology_risk_tolerance=cfg.topology_risk_tolerance,
@@ -415,6 +716,39 @@ def _evaluate_model(model, records: Sequence[EdgeLabelRecord], cfg: TrainConfig,
     avg["topology_risk_high"] = bool(avg["merge_split_risk"] >= 0.10)
     avg["scores"] = scores
     return avg
+
+
+def _compute_val_pixel_loss(
+    model,
+    records: Sequence[EdgeLabelRecord],
+    cfg: TrainConfig,
+    device,
+    pos_weight,
+    *,
+    epoch: int = 0,
+) -> float:
+    """Diagnostic val loss: same _edge_loss as training, no backward (not used for checkpointing)."""
+    if not records:
+        return 0.0
+    model.eval()
+    val_dataset = EdgeLabelDataset(
+        records,
+        cfg.crop_size,
+        cfg=cfg,
+        augment=False,
+        cache_max_records=int(cfg.cache_dataset_max_records),
+    )
+    val_loader = DataLoader(val_dataset, batch_size=max(1, int(cfg.batch_size)), shuffle=False)
+    total = 0.0
+    ctx = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
+    with ctx():
+        for batch in val_loader:
+            image = batch["image"].to(device)
+            target = batch["target"].to(device)
+            outputs = model(image)
+            loss = _edge_loss(outputs, target, cfg, pos_weight, epoch=epoch)
+            total += float(loss.detach().cpu())
+    return total / max(1, len(val_loader))
 
 
 def _save_pr_curve(metrics: Dict[str, Any], output_dir: str) -> str:
@@ -508,13 +842,40 @@ def train_edge_model(
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
-    train_records, val_records = _split_records(usable)
+    label_root = _infer_label_root(usable)
+    train_records, val_records, group_ids = _split_records(
+        usable,
+        seed=int(cfg.seed),
+        val_ratio=float(cfg.val_split_ratio),
+        label_root=label_root,
+    )
+    _write_split_record_manifest(train_records, os.path.join(cfg.output_dir, "train_records.json"), group_ids)
+    _write_split_record_manifest(val_records, os.path.join(cfg.output_dir, "val_records.json"), group_ids)
     device = _resolve_device(cfg.device)
+    configured_threads = _configure_train_threads(cfg.train_cpu_threads)
     model = create_model(cfg.model_preset).to(device)
+    start_epoch = 0
     initial_weight_hash = _model_state_hash(model)
     effective_preset = _effective_preset(cfg.model_preset)
-    dataset = EdgeLabelDataset(train_records, cfg.crop_size)
-    loader = DataLoader(dataset, batch_size=max(1, int(cfg.batch_size)), shuffle=True)
+    dataset = EdgeLabelDataset(
+        train_records,
+        cfg.crop_size,
+        cfg=cfg,
+        augment=True,
+        cache_max_records=int(cfg.cache_dataset_max_records),
+    )
+    num_workers = _resolve_num_workers(cfg.num_workers)
+    loader_kwargs: Dict[str, Any] = {
+        "batch_size": max(1, int(cfg.batch_size)),
+        "shuffle": True,
+        "num_workers": num_workers,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = max(1, int(cfg.prefetch_factor))
+    loader = DataLoader(dataset, **loader_kwargs)
+    use_amp = bool(cfg.amp_enabled) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp) if use_amp else None
     total_pos = 0.0
     total_neg = 0.0
     for rec in train_records:
@@ -531,39 +892,190 @@ def train_edge_model(
     )
     best_metrics = {"best_bf1": -1.0, "best_threshold": 0.5, "topology_safe_objective": -1.0e9}
     best_state = None
+    best_epoch = 0
+    no_improve_epochs = 0
     lr_history = []
+    checkpoint_path = os.path.join(cfg.output_dir, "last_checkpoint.pt")
+    if cfg.resume_from_checkpoint and os.path.exists(cfg.resume_from_checkpoint):
+        checkpoint = torch.load(cfg.resume_from_checkpoint, map_location=device)
+        if isinstance(checkpoint, dict) and "model_state" in checkpoint:
+            model.load_state_dict(checkpoint["model_state"], strict=False)
+            if "optimizer_state" in checkpoint:
+                optim.load_state_dict(checkpoint["optimizer_state"])
+            if "scheduler_state" in checkpoint:
+                scheduler.load_state_dict(checkpoint["scheduler_state"])
+            best_metrics = checkpoint.get("best_metrics", best_metrics)
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            start_epoch = int(checkpoint.get("epoch", 0))
+            best_epoch = int(checkpoint.get("best_epoch", start_epoch))
     start = time.time()
-    for epoch in range(max(1, cfg.epochs)):
+    stop_reason = None
+    total_epochs = max(1, cfg.epochs)
+    val_interval = max(1, int(cfg.val_every_n_epochs))
+    checkpoint_interval = max(1, int(cfg.checkpoint_every_n_epochs))
+    last_metrics: Dict[str, Any] = dict(best_metrics)
+    last_val_pixel_loss: Optional[float] = None
+    metrics_csv_path = os.path.join(cfg.output_dir, "metrics_epoch.csv")
+    if start_epoch == 0 and os.path.exists(metrics_csv_path):
+        os.remove(metrics_csv_path)
+    metric_key = cfg.early_stopping_metric or "best_bf1"
+    for epoch in range(start_epoch, total_epochs):
         model.train()
         epoch_loss = 0.0
         for batch in loader:
             image = batch["image"].to(device)
             target = batch["target"].to(device)
             optim.zero_grad(set_to_none=True)
-            outputs = model(image)
-            loss = _edge_loss(outputs, target, cfg, pos_weight, epoch=epoch)
-            loss.backward()
-            optim.step()
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    outputs = model(image)
+                    loss = _edge_loss(outputs, target, cfg, pos_weight, epoch=epoch)
+                scaler.scale(loss).backward()
+                if float(cfg.gradient_clip_norm) > 0:
+                    scaler.unscale_(optim)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.gradient_clip_norm))
+                scaler.step(optim)
+                scaler.update()
+            else:
+                outputs = model(image)
+                loss = _edge_loss(outputs, target, cfg, pos_weight, epoch=epoch)
+                loss.backward()
+                if float(cfg.gradient_clip_norm) > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.gradient_clip_norm))
+                optim.step()
             scheduler.step()
             lr_history.append(float(optim.param_groups[0]["lr"]))
             epoch_loss += float(loss.detach().cpu())
-        metrics = _evaluate_model(model, val_records, cfg, device)
-        metric_value = metrics.get("topology_safe_objective", metrics.get("best_bf1", -1.0))
-        best_value = best_metrics.get("topology_safe_objective", best_metrics.get("best_bf1", -1.0))
-        if metric_value > best_value:
-            best_metrics = metrics
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        train_loss = epoch_loss / max(1, len(loader))
+        epoch_no = epoch + 1
+        is_last_epoch = epoch_no >= total_epochs
+        run_validation = is_last_epoch or (epoch_no % val_interval == 0)
+        probe_mode = "full" if is_last_epoch else (cfg.val_eval_mode or "fast")
+        val_pixel_loss: Optional[float] = None
+        eval_mode = probe_mode
+        if run_validation:
+            metrics = _evaluate_model(model, val_records, cfg, device, eval_mode=probe_mode)
+            last_metrics = metrics
+            val_pixel_loss = _compute_val_pixel_loss(
+                model, val_records, cfg, device, pos_weight, epoch=epoch
+            )
+            last_val_pixel_loss = val_pixel_loss
+        else:
+            metrics = last_metrics
+        full_val_metrics = run_validation and eval_mode == "full"
+        metric_value = _metric_value_from_eval(metrics, metric_key)
+        best_value = _metric_value_from_eval(best_metrics, metric_key)
+        improved = False
+        if run_validation:
+            fast_improved = metric_value > best_value + float(cfg.early_stopping_min_delta)
+            confirm_improved = fast_improved
+            if (
+                fast_improved
+                and probe_mode == "fast"
+                and bool(cfg.checkpoint_full_eval_on_improve)
+                and not is_last_epoch
+            ):
+                full_metrics = _evaluate_model(model, val_records, cfg, device, eval_mode="full")
+                full_value = _metric_value_from_eval(full_metrics, metric_key)
+                if full_value > best_value + float(cfg.early_stopping_min_delta):
+                    metrics = full_metrics
+                    metric_value = full_value
+                    eval_mode = "full"
+                    full_val_metrics = True
+                    confirm_improved = True
+                else:
+                    confirm_improved = False
+            elif is_last_epoch:
+                confirm_improved = fast_improved
+            improved = confirm_improved
+            if improved:
+                best_metrics = metrics
+                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                best_epoch = epoch_no
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+        val_bf1 = float(metrics.get("topology_safe_bf1", metrics.get("best_bf1", 0.0)))
+        overfit_gap = max(0.0, train_loss - (1.0 - val_bf1))
+        if epoch_no % checkpoint_interval == 0 or is_last_epoch:
+            torch.save(
+                {
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optim.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "config": asdict(cfg),
+                    "preset": cfg.model_preset,
+                    "epoch": epoch_no,
+                    "best_epoch": best_epoch,
+                    "best_metrics": best_metrics,
+                },
+                checkpoint_path,
+            )
         if progress_cb:
             progress_cb({
-                "epoch": epoch + 1,
+                "status": "epoch",
+                "epoch": epoch_no,
                 "epochs": cfg.epochs,
-                "loss": epoch_loss / max(1, len(loader)),
+                "loss": train_loss,
+                "train_loss": train_loss,
+                "val_pixel_loss": val_pixel_loss,
                 "best_bf1": best_metrics.get("topology_safe_bf1", best_metrics["best_bf1"]),
+                "val_bf1": val_bf1 if run_validation else None,
+                "val_ods_f1": val_bf1 if run_validation else None,
+                "val_ap": metrics.get("ap") if full_val_metrics else None,
+                "val_cldice": metrics.get("cldice") if full_val_metrics else None,
+                "val_exact_f1": (
+                    metrics.get("topology_safe_exact_f1", metrics.get("exact_f1")) if full_val_metrics else None
+                ),
+                "val_boundary_iou": metrics.get("boundary_iou") if full_val_metrics else None,
                 "merge_split_risk": best_metrics.get("topology_safe_merge_split_risk", best_metrics.get("merge_split_risk", 1.0)),
+                "val_merge_split_risk": metrics.get("topology_safe_merge_split_risk", metrics.get("merge_split_risk", 1.0)) if run_validation else None,
+                "val_topology_risk": metrics.get("topology_safe_merge_split_risk", metrics.get("merge_split_risk", 1.0)) if run_validation else None,
+                "val_density_ratio": metrics.get("topology_safe_density_ratio") if run_validation else None,
+                "topology_safe_objective": metrics.get("topology_safe_objective") if run_validation else None,
+                "val_objective": metrics.get("topology_safe_objective") if run_validation else None,
+                "overfit_gap": overfit_gap if run_validation else None,
+                "lr": float(optim.param_groups[0]["lr"]),
+                "best_epoch": best_epoch,
+                "no_improve_epochs": no_improve_epochs,
                 "elapsed": time.time() - start,
+                "validation_ran": run_validation,
+                "val_eval_mode": eval_mode if run_validation else None,
             })
+            _append_metrics_epoch_row(
+                cfg.output_dir,
+                {
+                    "epoch": epoch_no,
+                    "train_loss": train_loss,
+                    "val_pixel_loss": val_pixel_loss,
+                    "val_ods_f1": val_bf1 if run_validation else "",
+                    "val_ap": metrics.get("ap") if full_val_metrics else "",
+                    "val_cldice": metrics.get("cldice") if full_val_metrics else "",
+                    "val_objective": metrics.get("topology_safe_objective") if run_validation else "",
+                    "val_topology_risk": metrics.get(
+                        "topology_safe_merge_split_risk", metrics.get("merge_split_risk", "")
+                    )
+                    if run_validation
+                    else "",
+                    "val_eval_mode": eval_mode if run_validation else "",
+                    "best_epoch": best_epoch,
+                    "no_improve_epochs": no_improve_epochs,
+                },
+            )
+        if bool(cfg.early_stopping_enabled) and run_validation:
+            if no_improve_epochs >= max(1, int(cfg.early_stopping_patience)):
+                stop_reason = f"early_stopping_patience_{cfg.early_stopping_patience}"
+                break
+            if overfit_gap > float(cfg.overfit_gap_limit) and no_improve_epochs > 0:
+                stop_reason = f"overfit_gap>{cfg.overfit_gap_limit}"
+                break
     if best_state is not None:
         model.load_state_dict(best_state)
+    if val_records:
+        best_metrics = _evaluate_model(model, val_records, cfg, device, eval_mode="full")
+        last_val_pixel_loss = _compute_val_pixel_loss(
+            model, val_records, cfg, device, pos_weight, epoch=max(0, total_epochs - 1)
+        )
     model_path = os.path.join(cfg.output_dir, "best_model.pt")
     threshold_path = os.path.join(cfg.output_dir, "best_threshold.json")
     report_path = os.path.join(cfg.output_dir, "edge_training_report.json")
@@ -591,9 +1103,19 @@ def train_edge_model(
         "lr_history": lr_history,
         "pos_weight": float(pos_weight.detach().cpu().item()),
         "device": str(device),
+        "train_cpu_threads": configured_threads,
+        "dataloader_num_workers": num_workers,
+        "val_eval_mode": cfg.val_eval_mode,
+        "val_every_n_epochs": val_interval,
+        "val_pixel_loss_last": last_val_pixel_loss,
         "n_train_records": len(train_records),
         "n_val_records": len(val_records),
         "label_qc": qc_reports,
+        "start_epoch": start_epoch,
+        "best_epoch": best_epoch,
+        "completed_epochs": epoch + 1 if 'epoch' in locals() else 0,
+        "stop_reason": stop_reason,
+        "last_checkpoint": checkpoint_path,
     }
     report = {
         "metrics": best_metrics,

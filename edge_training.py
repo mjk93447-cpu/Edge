@@ -174,8 +174,17 @@ def _resolve_device(device: str) -> "torch.device":
 
 
 def _resolve_num_workers(requested: int) -> int:
-    if int(requested) > 0:
-        return int(requested)
+    """Map TrainConfig.num_workers to DataLoader workers.
+
+    - ``0``: main process only (required for PyInstaller GUI entrypoints on Windows).
+    - ``> 0``: explicit worker count.
+    - ``< 0``: auto (e.g. ``-1``) — CLI/offline only; not used from embedded GUI.
+    """
+    requested = int(requested)
+    if requested == 0:
+        return 0
+    if requested > 0:
+        return requested
     cpu_count = os.cpu_count() or 4
     if os.name == "nt":
         return min(2, max(0, cpu_count - 1))

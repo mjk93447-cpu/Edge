@@ -104,8 +104,12 @@ class TrainConfig:
     min_precision: float = 0.05
     max_density_ratio: float = 8.0
     min_component_pixels: int = 4
-    spur_prune_iters: int = 1
+    spur_prune_iters: int = 0
     max_bridge_gap: int = 0
+    same_boundary_gap_repair: bool = True
+    max_same_boundary_gap_px: int = 4
+    same_boundary_low_threshold: float = 0.15
+    same_boundary_angle_tolerance_deg: float = 40.0
     protect_topology_postprocess: bool = True
     final_thinning_postprocess: bool = True
     final_train: bool = False
@@ -114,7 +118,7 @@ class TrainConfig:
     early_stopping_enabled: bool = True
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 0.002
-    early_stopping_metric: str = "val_ods_f1"
+    early_stopping_metric: str = "val_objective"
     overfit_gap_limit: float = 0.15
     num_workers: int = 0
     prefetch_factor: int = 2
@@ -129,10 +133,10 @@ class TrainConfig:
     augment_rotation_deg: float = 5.0
     augment_brightness: float = 0.10
     augment_contrast: float = 0.10
-    augment_gamma: float = 0.05
+    augment_gamma: float = 0.0
     augment_apply_prob: float = 0.8
-    samples_per_record_per_epoch: int = 2
-    translate_jitter_frac: float = 0.04
+    samples_per_record_per_epoch: int = 1
+    translate_jitter_frac: float = 0.0
 
 
 @dataclass
@@ -640,6 +644,13 @@ def _append_metrics_epoch_row(output_dir: str, row: Dict[str, Any]) -> None:
         "val_cldice",
         "val_objective",
         "val_topology_risk",
+        "endpoint_count",
+        "component_count",
+        "split_gap_count",
+        "max_same_line_gap_px",
+        "bridge_candidate_count",
+        "branch_count",
+        "continuity_score",
         "val_eval_mode",
         "best_epoch",
         "no_improve_epochs",
@@ -703,13 +714,32 @@ def _evaluate_model(
                         "max_bridge_gap": cfg.max_bridge_gap,
                         "protect_topology": cfg.protect_topology_postprocess,
                         "final_thinning": cfg.final_thinning_postprocess,
+                        "same_boundary_gap_repair": cfg.same_boundary_gap_repair,
+                        "max_same_boundary_gap_px": cfg.max_same_boundary_gap_px,
+                        "same_boundary_low_threshold": cfg.same_boundary_low_threshold,
+                        "same_boundary_angle_tolerance_deg": cfg.same_boundary_angle_tolerance_deg,
+                        "min_expected_components": 2,
                     },
                 )
             )
     if not scores:
         return {"best_bf1": 0.0, "best_threshold": 0.5, "scores": []}
     avg = {}
-    for key in ("best_bf1", "ap", "exact_f1", "cldice", "boundary_iou", "merge_split_risk"):
+    for key in (
+        "best_bf1",
+        "ap",
+        "exact_f1",
+        "cldice",
+        "boundary_iou",
+        "merge_split_risk",
+        "endpoint_count",
+        "component_count",
+        "split_gap_count",
+        "max_same_line_gap_px",
+        "bridge_candidate_count",
+        "branch_count",
+        "continuity_score",
+    ):
         avg[key] = float(np.mean([s.get(key, 0.0) for s in scores]))
     avg["best_threshold"] = float(np.median([s.get("best_threshold", 0.5) for s in scores]))
     safe_scores = [s.get("topology_safe", {}) for s in scores if s.get("topology_safe")]
@@ -720,6 +750,12 @@ def _evaluate_model(
         avg["topology_safe_exact_f1"] = float(np.mean([s.get("exact_f1", 0.0) for s in safe_scores]))
         avg["topology_safe_merge_split_risk"] = float(np.mean([s.get("merge_split_risk", 1.0) for s in safe_scores]))
         avg["topology_safe_density_ratio"] = float(np.mean([s.get("density_ratio", 0.0) for s in safe_scores]))
+        avg["topology_safe_endpoint_count"] = float(np.mean([s.get("endpoint_count", 0.0) for s in safe_scores]))
+        avg["topology_safe_component_count"] = float(np.mean([s.get("component_count", 0.0) for s in safe_scores]))
+        avg["topology_safe_split_gap_count"] = float(np.mean([s.get("split_gap_count", 0.0) for s in safe_scores]))
+        avg["topology_safe_max_same_line_gap_px"] = float(np.max([s.get("max_same_line_gap_px", 0.0) for s in safe_scores]))
+        avg["topology_safe_bridge_candidate_count"] = float(np.mean([s.get("bridge_candidate_count", 0.0) for s in safe_scores]))
+        avg["topology_safe_continuity_score"] = float(np.mean([s.get("continuity_score", 0.0) for s in safe_scores]))
         avg["topology_safe_objective_min"] = float(np.min([s.get("objective", 0.0) for s in safe_scores]))
         avg["topology_safe_merge_split_risk_max"] = float(np.max([s.get("merge_split_risk", 1.0) for s in safe_scores]))
     avg["topology_risk_high"] = bool(avg["merge_split_risk"] >= 0.10)
@@ -1056,6 +1092,13 @@ def train_edge_model(
                 "val_merge_split_risk": metrics.get("topology_safe_merge_split_risk", metrics.get("merge_split_risk", 1.0)) if run_validation else None,
                 "val_topology_risk": metrics.get("topology_safe_merge_split_risk", metrics.get("merge_split_risk", 1.0)) if run_validation else None,
                 "val_density_ratio": metrics.get("topology_safe_density_ratio") if run_validation else None,
+                "endpoint_count": metrics.get("topology_safe_endpoint_count", metrics.get("endpoint_count")) if run_validation else None,
+                "component_count": metrics.get("topology_safe_component_count", metrics.get("component_count")) if run_validation else None,
+                "split_gap_count": metrics.get("topology_safe_split_gap_count", metrics.get("split_gap_count")) if run_validation else None,
+                "max_same_line_gap_px": metrics.get("topology_safe_max_same_line_gap_px", metrics.get("max_same_line_gap_px")) if run_validation else None,
+                "bridge_candidate_count": metrics.get("topology_safe_bridge_candidate_count", metrics.get("bridge_candidate_count")) if run_validation else None,
+                "branch_count": metrics.get("branch_count") if run_validation else None,
+                "continuity_score": metrics.get("topology_safe_continuity_score", metrics.get("continuity_score")) if run_validation else None,
                 "topology_safe_objective": metrics.get("topology_safe_objective") if run_validation else None,
                 "val_objective": metrics.get("topology_safe_objective") if run_validation else None,
                 "overfit_gap": overfit_gap if run_validation else None,
@@ -1082,6 +1125,31 @@ def train_edge_model(
                     "val_objective": metrics.get("topology_safe_objective") if run_validation else "",
                     "val_topology_risk": metrics.get(
                         "topology_safe_merge_split_risk", metrics.get("merge_split_risk", "")
+                    )
+                    if run_validation
+                    else "",
+                    "endpoint_count": metrics.get("topology_safe_endpoint_count", metrics.get("endpoint_count", ""))
+                    if run_validation
+                    else "",
+                    "component_count": metrics.get("topology_safe_component_count", metrics.get("component_count", ""))
+                    if run_validation
+                    else "",
+                    "split_gap_count": metrics.get("topology_safe_split_gap_count", metrics.get("split_gap_count", ""))
+                    if run_validation
+                    else "",
+                    "max_same_line_gap_px": metrics.get(
+                        "topology_safe_max_same_line_gap_px", metrics.get("max_same_line_gap_px", "")
+                    )
+                    if run_validation
+                    else "",
+                    "bridge_candidate_count": metrics.get(
+                        "topology_safe_bridge_candidate_count", metrics.get("bridge_candidate_count", "")
+                    )
+                    if run_validation
+                    else "",
+                    "branch_count": metrics.get("branch_count", "") if run_validation else "",
+                    "continuity_score": metrics.get(
+                        "topology_safe_continuity_score", metrics.get("continuity_score", "")
                     )
                     if run_validation
                     else "",

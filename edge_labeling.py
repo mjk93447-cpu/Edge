@@ -264,6 +264,40 @@ def count_components(mask: np.ndarray) -> int:
     return components
 
 
+def edge_continuity_metrics(mask: np.ndarray, *, expected_components: int = 2) -> Dict[str, Any]:
+    skeleton = zhang_suen_thinning(np.asarray(mask).astype(bool))
+    neighbors = _neighbor_count(skeleton)
+    endpoint_count = int((skeleton & (neighbors <= 1)).sum())
+    branch_count = int((skeleton & (neighbors >= 3)).sum())
+    component_count = count_components(skeleton)
+    split_gap_count, max_gap = _same_line_gap_stats(skeleton)
+    continuity_score = 1.0 / (1.0 + max(0, component_count - int(expected_components)) + split_gap_count + branch_count)
+    return {
+        "endpoint_count": endpoint_count,
+        "component_count": component_count,
+        "split_gap_count": int(split_gap_count),
+        "max_same_line_gap_px": float(max_gap),
+        "bridge_candidate_count": branch_count,
+        "branch_count": branch_count,
+        "continuity_score": float(continuity_score),
+    }
+
+
+def _same_line_gap_stats(mask: np.ndarray, *, max_gap: int = 12) -> Tuple[int, float]:
+    endpoints = _component_endpoints(mask)
+    if len(endpoints) < 2:
+        return 0, 0.0
+    gaps = []
+    for i, (x1, y1, label1) in enumerate(endpoints):
+        for x2, y2, label2 in endpoints[i + 1 :]:
+            if label1 == label2:
+                continue
+            dist = float(np.hypot(x2 - x1, y2 - y1))
+            if 1.0 < dist <= float(max_gap) and _endpoint_angle_ok(mask, x1, y1, x2, y2, 45.0):
+                gaps.append(dist)
+    return len(gaps), float(max(gaps)) if gaps else 0.0
+
+
 def remove_small_components(mask: np.ndarray, min_pixels: int = 4) -> np.ndarray:
     mask = np.asarray(mask).astype(bool)
     if min_pixels <= 1 or not np.any(mask):
@@ -290,6 +324,169 @@ def remove_small_components(mask: np.ndarray, min_pixels: int = 4) -> np.ndarray
         if len(pixels) >= int(min_pixels):
             yy, xx = zip(*pixels)
             out[np.asarray(yy), np.asarray(xx)] = True
+    return out
+
+
+def _line_points_between(x1: int, y1: int, x2: int, y2: int) -> List[Tuple[int, int]]:
+    points: List[Tuple[int, int]] = []
+    dx = abs(x2 - x1)
+    dy = abs(y2 - y1)
+    x, y = x1, y1
+    sx = 1 if x2 > x1 else -1
+    sy = 1 if y2 > y1 else -1
+    if dx > dy:
+        err = dx / 2.0
+        while x != x2:
+            points.append((x, y))
+            err -= dy
+            if err < 0:
+                y += sy
+                err += dx
+            x += sx
+    else:
+        err = dy / 2.0
+        while y != y2:
+            points.append((x, y))
+            err -= dx
+            if err < 0:
+                x += sx
+                err += dy
+            y += sy
+    points.append((x2, y2))
+    return points
+
+
+def _component_endpoints(mask: np.ndarray) -> List[Tuple[int, int, int]]:
+    mask = np.asarray(mask).astype(bool)
+    if not np.any(mask):
+        return []
+    try:
+        import cv2
+
+        _n, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
+    except Exception:
+        labels = _component_labels(mask)
+    neighbors = _neighbor_count(mask)
+    endpoints: List[Tuple[int, int, int]] = []
+    ys, xs = np.where(mask & (neighbors <= 1))
+    for y, x in zip(ys, xs):
+        label = int(labels[y, x])
+        if label > 0:
+            endpoints.append((int(x), int(y), label))
+    return endpoints
+
+
+def _component_labels(mask: np.ndarray) -> np.ndarray:
+    labels = np.zeros(mask.shape, dtype=np.int32)
+    current = 0
+    for y, x in np.argwhere(mask):
+        if labels[y, x]:
+            continue
+        current += 1
+        stack = [(int(y), int(x))]
+        labels[y, x] = current
+        while stack:
+            cy, cx = stack.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1] and mask[ny, nx] and not labels[ny, nx]:
+                        labels[ny, nx] = current
+                        stack.append((ny, nx))
+    return labels
+
+
+def _endpoint_direction(mask: np.ndarray, x: int, y: int) -> np.ndarray | None:
+    positions = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            nx, ny = x + dx, y + dy
+            if 0 <= ny < mask.shape[0] and 0 <= nx < mask.shape[1] and mask[ny, nx]:
+                positions.append((dx, dy))
+    if not positions:
+        return None
+    vec = -np.asarray(positions[0], dtype=np.float32)
+    norm = np.linalg.norm(vec)
+    return vec / max(norm, 1.0)
+
+
+def _endpoint_angle_ok(mask: np.ndarray, x1: int, y1: int, x2: int, y2: int, tolerance_deg: float) -> bool:
+    dir1 = _endpoint_direction(mask, x1, y1)
+    dir2 = _endpoint_direction(mask, x2, y2)
+    if dir1 is None or dir2 is None:
+        return True
+    connection = np.asarray([x2 - x1, y2 - y1], dtype=np.float32)
+    norm = np.linalg.norm(connection)
+    if norm <= 0:
+        return False
+    connection /= norm
+    angle1 = np.degrees(np.arccos(np.clip(np.dot(dir1, connection), -1.0, 1.0)))
+    angle2 = np.degrees(np.arccos(np.clip(np.dot(dir2, -connection), -1.0, 1.0)))
+    return max(float(angle1), float(angle2)) <= float(max(0.0, min(tolerance_deg, 90.0)))
+
+
+def repair_same_boundary_gaps(
+    mask: np.ndarray,
+    pred_prob: Optional[np.ndarray] = None,
+    *,
+    max_gap: int = 0,
+    low_threshold: float = 0.15,
+    angle_tolerance_deg: float = 40.0,
+    min_expected_components: int = 2,
+) -> np.ndarray:
+    if max_gap <= 0:
+        return np.asarray(mask).astype(bool)
+    out = np.asarray(mask).astype(bool).copy()
+    prob = np.asarray(pred_prob, dtype=np.float32) if pred_prob is not None else None
+    endpoints = _component_endpoints(out)
+    if len(endpoints) < 2:
+        return out
+    before_branch = int((out & (_neighbor_count(out) >= 3)).sum())
+    before_components = count_components(out)
+    candidates: List[Tuple[float, int, int]] = []
+    for i, (x1, y1, label1) in enumerate(endpoints):
+        for j in range(i + 1, len(endpoints)):
+            x2, y2, label2 = endpoints[j]
+            if label1 == label2:
+                continue
+            dist = float(np.hypot(x2 - x1, y2 - y1))
+            if 1.0 < dist <= float(max_gap):
+                candidates.append((dist, i, j))
+    used: set[int] = set()
+    for _dist, i, j in sorted(candidates, key=lambda row: row[0]):
+        if i in used or j in used:
+            continue
+        x1, y1, _label1 = endpoints[i]
+        x2, y2, _label2 = endpoints[j]
+        if not _endpoint_angle_ok(out, x1, y1, x2, y2, angle_tolerance_deg):
+            continue
+        points = _line_points_between(x1, y1, x2, y2)
+        if prob is not None:
+            vals = [float(prob[py, px]) for px, py in points if 0 <= py < prob.shape[0] and 0 <= px < prob.shape[1]]
+            if vals and float(np.mean(vals)) < float(low_threshold):
+                continue
+        candidate = out.copy()
+        for px, py in points:
+            if 0 <= py < candidate.shape[0] and 0 <= px < candidate.shape[1]:
+                candidate[py, px] = True
+        candidate = zhang_suen_thinning(candidate)
+        after_branch = int((candidate & (_neighbor_count(candidate) >= 3)).sum())
+        after_components = count_components(candidate)
+        if after_branch > before_branch:
+            continue
+        if after_components < int(min_expected_components):
+            continue
+        if after_components < before_components - 1:
+            continue
+        out = candidate
+        before_branch = after_branch
+        before_components = after_components
+        used.add(i)
+        used.add(j)
     return out
 
 
@@ -346,13 +543,28 @@ def topology_aware_postprocess(
     max_bridge_gap: int = 0,
     protect_topology: bool = True,
     final_thinning: bool = True,
+    same_boundary_gap_repair: bool = False,
+    max_same_boundary_gap_px: int = 0,
+    same_boundary_low_threshold: float = 0.15,
+    same_boundary_angle_tolerance_deg: float = 40.0,
+    min_expected_components: int = 2,
 ) -> np.ndarray:
     pred = np.asarray(pred_prob, dtype=np.float32)
     binary = pred >= float(threshold)
     thin = zhang_suen_thinning(binary)
     filtered = remove_small_components(thin, min_pixels=min_component_pixels)
     pruned = prune_spurs(filtered, iterations=spur_prune_iters)
-    bridged = bridge_short_gaps(pruned, max_gap=max_bridge_gap, protect_topology=protect_topology)
+    bridged = pruned
+    if same_boundary_gap_repair:
+        bridged = repair_same_boundary_gaps(
+            bridged,
+            pred,
+            max_gap=int(max_same_boundary_gap_px),
+            low_threshold=float(same_boundary_low_threshold),
+            angle_tolerance_deg=float(same_boundary_angle_tolerance_deg),
+            min_expected_components=int(min_expected_components),
+        )
+    bridged = bridge_short_gaps(bridged, max_gap=max_bridge_gap, protect_topology=protect_topology)
     if final_thinning:
         bridged = zhang_suen_thinning(bridged)
     return remove_small_components(bridged, min_pixels=min_component_pixels)
@@ -529,6 +741,7 @@ def compute_edge_label_score(
     branch_count = int((pred_skel & (neighbor >= 3)).sum())
     branch_risk = float(branch_count / max(1, int(gt_skel.sum())))
     loop_count = max(0, int(pred_skel.sum()) - endpoint_count - branch_count - max(0, pred_comp - 1))
+    continuity = edge_continuity_metrics(pred_skel, expected_components=max(1, gt_comp))
     meta_zone_pixels = {}
     if meta_zones:
         for zone_type in META_ZONE_TYPES:
@@ -550,7 +763,12 @@ def compute_edge_label_score(
         "branch_risk": float(branch_risk),
         "merge_split_risk": float(max(merge_risk, split_risk, branch_risk)),
         "endpoint_count": endpoint_count,
+        "component_count": pred_comp,
+        "split_gap_count": continuity["split_gap_count"],
+        "max_same_line_gap_px": continuity["max_same_line_gap_px"],
+        "bridge_candidate_count": continuity["bridge_candidate_count"],
         "branch_count": branch_count,
+        "continuity_score": continuity["continuity_score"],
         "loop_count": loop_count,
         "tolerance_radius": int(tolerance_radius),
         "curve": curve,
@@ -571,6 +789,11 @@ def compute_edge_label_score(
                 max_bridge_gap=int(pp_cfg.get("max_bridge_gap", 0)),
                 protect_topology=bool(pp_cfg.get("protect_topology", True)),
                 final_thinning=bool(pp_cfg.get("final_thinning", True)),
+                same_boundary_gap_repair=bool(pp_cfg.get("same_boundary_gap_repair", False)),
+                max_same_boundary_gap_px=int(pp_cfg.get("max_same_boundary_gap_px", 0)),
+                same_boundary_low_threshold=float(pp_cfg.get("same_boundary_low_threshold", 0.15)),
+                same_boundary_angle_tolerance_deg=float(pp_cfg.get("same_boundary_angle_tolerance_deg", 40.0)),
+                min_expected_components=int(pp_cfg.get("min_expected_components", 2)),
             ) & valid
             safe_curve = _threshold_curve(safe_pred.astype(np.float32), gt, valid, [0.5], int(tolerance_radius))
             safe_exact = _threshold_curve(safe_pred.astype(np.float32), gt, valid, [0.5], 0)[0]
@@ -586,17 +809,24 @@ def compute_edge_label_score(
             safe_branch_count = int((safe_skel & (_neighbor_count(safe_skel) >= 3)).sum())
             safe_branch_risk = float(safe_branch_count / max(1, int(safe_gt_skel.sum())))
             safe_risk = float(max(safe_merge, safe_split, safe_branch_risk))
+            safe_continuity = edge_continuity_metrics(safe_skel, expected_components=max(1, safe_gt_comp))
             safe_precision = float(safe_curve[0]["precision"])
             density_over = max(0.0, density_ratio - 1.0)
             topology_excess = max(0.0, safe_risk - float(topology_risk_tolerance))
             precision_fail = safe_precision < float(min_precision)
             density_fail = density_ratio > float(max_density_ratio)
             topology_fail = safe_risk >= float(topology_risk_tolerance)
+            continuity_penalty = (
+                0.02 * float(safe_continuity["endpoint_count"])
+                + 0.05 * float(safe_continuity["split_gap_count"])
+                + 0.02 * float(safe_continuity["bridge_candidate_count"])
+            )
             objective = (
                 float(safe_curve[0]["f1"])
                 - float(topology_penalty) * safe_risk
                 - float(topology_failure_penalty) * topology_excess * topology_excess
                 - float(density_penalty) * density_over
+                - continuity_penalty
                 - (0.25 if precision_fail else 0.0)
                 - (0.25 if density_fail else 0.0)
                 - (0.50 if topology_fail else 0.0)
@@ -614,6 +844,12 @@ def compute_edge_label_score(
                     "density_ratio": float(density_ratio),
                     "pred_pixels": safe_pred_n,
                     "component_count": int(safe_comp),
+                    "endpoint_count": int(safe_continuity["endpoint_count"]),
+                    "split_gap_count": int(safe_continuity["split_gap_count"]),
+                    "max_same_line_gap_px": float(safe_continuity["max_same_line_gap_px"]),
+                    "bridge_candidate_count": int(safe_continuity["bridge_candidate_count"]),
+                    "continuity_score": float(safe_continuity["continuity_score"]),
+                    "continuity_penalty": float(continuity_penalty),
                     "passes_precision_floor": not precision_fail,
                     "passes_density_ratio": not density_fail,
                     "passes_topology_gate": not topology_fail,
@@ -643,6 +879,11 @@ def compute_edge_label_score(
                 "density_ratio": float(safe_best["density_ratio"]),
                 "pred_pixels": int(safe_best["pred_pixels"]),
                 "component_count": int(safe_best["component_count"]),
+                "endpoint_count": int(safe_best.get("endpoint_count", 0)),
+                "split_gap_count": int(safe_best.get("split_gap_count", 0)),
+                "max_same_line_gap_px": float(safe_best.get("max_same_line_gap_px", 0.0)),
+                "bridge_candidate_count": int(safe_best.get("bridge_candidate_count", 0)),
+                "continuity_score": float(safe_best.get("continuity_score", 0.0)),
                 "candidates": safe_candidates,
                 "postprocess_config": {
                     "min_component_pixels": int(pp_cfg.get("min_component_pixels", 4)),
@@ -650,6 +891,11 @@ def compute_edge_label_score(
                     "max_bridge_gap": int(pp_cfg.get("max_bridge_gap", 0)),
                     "protect_topology": bool(pp_cfg.get("protect_topology", True)),
                     "final_thinning": bool(pp_cfg.get("final_thinning", True)),
+                    "same_boundary_gap_repair": bool(pp_cfg.get("same_boundary_gap_repair", False)),
+                    "max_same_boundary_gap_px": int(pp_cfg.get("max_same_boundary_gap_px", 0)),
+                    "same_boundary_low_threshold": float(pp_cfg.get("same_boundary_low_threshold", 0.15)),
+                    "same_boundary_angle_tolerance_deg": float(pp_cfg.get("same_boundary_angle_tolerance_deg", 40.0)),
+                    "min_expected_components": int(pp_cfg.get("min_expected_components", 2)),
                     "topology_penalty": float(topology_penalty),
                     "topology_failure_penalty": float(topology_failure_penalty),
                     "topology_risk_tolerance": float(topology_risk_tolerance),

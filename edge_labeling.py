@@ -688,6 +688,8 @@ def compute_edge_label_score(
     density_penalty: float = 0.20,
     min_precision: float = 0.05,
     max_density_ratio: float = 8.0,
+    continuity_objective_weight: float = 1.0,
+    bridge_objective_weight: float = 1.0,
     postprocess_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Compute BSDS-style threshold sweep plus 1px topology metrics."""
@@ -816,17 +818,21 @@ def compute_edge_label_score(
             precision_fail = safe_precision < float(min_precision)
             density_fail = density_ratio > float(max_density_ratio)
             topology_fail = safe_risk >= float(topology_risk_tolerance)
-            continuity_penalty = (
+            continuity_penalty = float(continuity_objective_weight) * (
                 0.02 * float(safe_continuity["endpoint_count"])
                 + 0.05 * float(safe_continuity["split_gap_count"])
-                + 0.02 * float(safe_continuity["bridge_candidate_count"])
+            )
+            bridge_penalty = float(bridge_objective_weight) * (
+                0.02 * float(safe_continuity["bridge_candidate_count"])
+                + 0.10 * float(safe_branch_count)
             )
             objective = (
                 float(safe_curve[0]["f1"])
-                - float(topology_penalty) * safe_risk
+                - float(topology_penalty) * float(bridge_objective_weight) * safe_risk
                 - float(topology_failure_penalty) * topology_excess * topology_excess
                 - float(density_penalty) * density_over
                 - continuity_penalty
+                - bridge_penalty
                 - (0.25 if precision_fail else 0.0)
                 - (0.25 if density_fail else 0.0)
                 - (0.50 if topology_fail else 0.0)
@@ -850,6 +856,7 @@ def compute_edge_label_score(
                     "bridge_candidate_count": int(safe_continuity["bridge_candidate_count"]),
                     "continuity_score": float(safe_continuity["continuity_score"]),
                     "continuity_penalty": float(continuity_penalty),
+                    "bridge_penalty": float(bridge_penalty),
                     "passes_precision_floor": not precision_fail,
                     "passes_density_ratio": not density_fail,
                     "passes_topology_gate": not topology_fail,
@@ -902,6 +909,8 @@ def compute_edge_label_score(
                     "density_penalty": float(density_penalty),
                     "min_precision": float(min_precision),
                     "max_density_ratio": float(max_density_ratio),
+                    "continuity_objective_weight": float(continuity_objective_weight),
+                    "bridge_objective_weight": float(bridge_objective_weight),
                 },
             }
     return result

@@ -91,6 +91,10 @@ class TrainConfig:
     topology_risk_tolerance: float = 0.10
     false_bridge_weight: float = 1.0
     split_gap_weight: float = 1.0
+    continuity_gap_weight: float = 0.0
+    endpoint_gap_weight: float = 0.0
+    continuity_objective_weight: float = 1.0
+    bridge_objective_weight: float = 1.0
     topology_loss_warmup_epochs: int = 1
     crop_size: int = 256
     min_label_pixels: int = 2
@@ -565,6 +569,22 @@ def _topology_failure_loss(prob, target, cfg: TrainConfig, eps: float = 1e-6):
     return F.relu(violation).pow(2).mean()
 
 
+def _continuity_gap_loss(prob, target, cfg: TrainConfig, eps: float = 1e-6):
+    """Reward continuous probability inside the GT support band without crossing boundaries."""
+    band = F.max_pool2d(target, kernel_size=3, stride=1, padding=1)
+    local_support = F.avg_pool2d(prob * band, kernel_size=5, stride=1, padding=2)
+    target_support = F.avg_pool2d(target, kernel_size=5, stride=1, padding=2)
+    gap_zone = ((target_support > 0.0).float() * band).clamp(0.0, 1.0)
+    support_miss = (1.0 - local_support).clamp(0.0, 1.0) * gap_zone
+    center_miss = (1.0 - prob).clamp(0.0, 1.0) * target
+    gap_loss = support_miss.sum(dim=(2, 3)) / gap_zone.sum(dim=(2, 3)).clamp(min=eps)
+    endpoint_loss = center_miss.sum(dim=(2, 3)) / target.sum(dim=(2, 3)).clamp(min=eps)
+    return (
+        float(cfg.continuity_gap_weight) * gap_loss
+        + float(cfg.endpoint_gap_weight) * endpoint_loss
+    ).mean()
+
+
 def _edge_loss(outputs: Dict[str, Any], target, cfg: TrainConfig, pos_weight, epoch: int = 0):
     logits = outputs["logits"]
     bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight)
@@ -587,6 +607,8 @@ def _edge_loss(outputs: Dict[str, Any], target, cfg: TrainConfig, pos_weight, ep
         if cfg.topology_loss_warmup_epochs > 0:
             topo_ramp = min(1.0, float(epoch + 1) / float(cfg.topology_loss_warmup_epochs))
         loss = loss + cfg.topology_failure_weight * topo_ramp * _topology_failure_loss(prob, target, cfg)
+    if cfg.continuity_gap_weight > 0 or cfg.endpoint_gap_weight > 0:
+        loss = loss + _continuity_gap_loss(prob, target, cfg)
     # Feature-flagged topology losses are represented by the same differentiable
     # centerline support in v1; separate adapters can replace these terms later.
     topo_w = cfg.cbdice_weight + cfg.simplified_topology_weight
@@ -708,6 +730,8 @@ def _evaluate_model(
                     density_penalty=cfg.density_penalty,
                     min_precision=cfg.min_precision,
                     max_density_ratio=cfg.max_density_ratio,
+                    continuity_objective_weight=cfg.continuity_objective_weight,
+                    bridge_objective_weight=cfg.bridge_objective_weight,
                     postprocess_config={
                         "min_component_pixels": cfg.min_component_pixels,
                         "spur_prune_iters": cfg.spur_prune_iters,
@@ -1183,6 +1207,27 @@ def train_edge_model(
                 "threshold_mode": "topology_safe" if "topology_safe_threshold" in best_metrics else "bf1",
                 "bf1_threshold": best_metrics.get("best_threshold", 0.5),
                 "topology_safe_threshold": best_metrics.get("topology_safe_threshold"),
+                "postprocess_config": {
+                    "min_component_pixels": int(cfg.min_component_pixels),
+                    "spur_prune_iters": int(cfg.spur_prune_iters),
+                    "max_bridge_gap": int(cfg.max_bridge_gap),
+                    "same_boundary_gap_repair": bool(cfg.same_boundary_gap_repair),
+                    "max_same_boundary_gap_px": int(cfg.max_same_boundary_gap_px),
+                    "same_boundary_low_threshold": float(cfg.same_boundary_low_threshold),
+                    "same_boundary_angle_tolerance_deg": float(cfg.same_boundary_angle_tolerance_deg),
+                    "protect_topology": bool(cfg.protect_topology_postprocess),
+                    "final_thinning": bool(cfg.final_thinning_postprocess),
+                    "min_expected_components": 2,
+                },
+                "continuity_policy": {
+                    "continuity_gap_weight": float(cfg.continuity_gap_weight),
+                    "endpoint_gap_weight": float(cfg.endpoint_gap_weight),
+                    "continuity_objective_weight": float(cfg.continuity_objective_weight),
+                    "bridge_objective_weight": float(cfg.bridge_objective_weight),
+                    "false_bridge_weight": float(cfg.false_bridge_weight),
+                    "split_gap_weight": float(cfg.split_gap_weight),
+                    "cldice_weight": float(cfg.cldice_weight),
+                },
             },
             handle,
             indent=2,

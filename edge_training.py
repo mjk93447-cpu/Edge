@@ -16,10 +16,10 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from edge_labeling import EdgeLabelRecord, compute_edge_label_score, load_record_masks, validate_edge_label_quality
 
@@ -909,14 +909,21 @@ def train_edge_model(
         checkpoint = torch.load(cfg.resume_from_checkpoint, map_location=device)
         if isinstance(checkpoint, dict) and "model_state" in checkpoint:
             model.load_state_dict(checkpoint["model_state"], strict=False)
-            if "optimizer_state" in checkpoint:
+            scheduler_compatible = True
+            saved_scheduler_state = checkpoint.get("scheduler_state")
+            if isinstance(saved_scheduler_state, dict):
+                saved_total_steps = saved_scheduler_state.get("total_steps")
+                current_total_steps = getattr(scheduler, "total_steps", None)
+                scheduler_compatible = saved_total_steps in (None, current_total_steps)
+            if scheduler_compatible and "optimizer_state" in checkpoint:
                 optim.load_state_dict(checkpoint["optimizer_state"])
-            if "scheduler_state" in checkpoint:
+            if scheduler_compatible and "scheduler_state" in checkpoint:
                 scheduler.load_state_dict(checkpoint["scheduler_state"])
             best_metrics = checkpoint.get("best_metrics", best_metrics)
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-            start_epoch = int(checkpoint.get("epoch", 0))
-            best_epoch = int(checkpoint.get("best_epoch", start_epoch))
+            if scheduler_compatible:
+                start_epoch = int(checkpoint.get("epoch", 0))
+                best_epoch = int(checkpoint.get("best_epoch", start_epoch))
     start = time.time()
     stop_reason = None
     total_epochs = max(1, cfg.epochs)
@@ -929,6 +936,7 @@ def train_edge_model(
         os.remove(metrics_csv_path)
     metric_key = cfg.early_stopping_metric or "best_bf1"
     for epoch in range(start_epoch, total_epochs):
+        epoch_start = time.time()
         model.train()
         epoch_loss = 0.0
         for batch in loader:
@@ -955,6 +963,7 @@ def train_edge_model(
             scheduler.step()
             lr_history.append(float(optim.param_groups[0]["lr"]))
             epoch_loss += float(loss.detach().cpu())
+        epoch_train_sec = float(time.time() - epoch_start)
         train_loss = epoch_loss / max(1, len(loader))
         epoch_no = epoch + 1
         is_last_epoch = epoch_no >= total_epochs
@@ -962,13 +971,17 @@ def train_edge_model(
         probe_mode = "full" if is_last_epoch else (cfg.val_eval_mode or "fast")
         val_pixel_loss: Optional[float] = None
         eval_mode = probe_mode
+        validation_sec = 0.0
+        full_eval_sec = 0.0
         if run_validation:
+            validation_start = time.time()
             metrics = _evaluate_model(model, val_records, cfg, device, eval_mode=probe_mode)
             last_metrics = metrics
             val_pixel_loss = _compute_val_pixel_loss(
                 model, val_records, cfg, device, pos_weight, epoch=epoch
             )
             last_val_pixel_loss = val_pixel_loss
+            validation_sec = float(time.time() - validation_start)
         else:
             metrics = last_metrics
         full_val_metrics = run_validation and eval_mode == "full"
@@ -984,7 +997,9 @@ def train_edge_model(
                 and bool(cfg.checkpoint_full_eval_on_improve)
                 and not is_last_epoch
             ):
+                full_eval_start = time.time()
                 full_metrics = _evaluate_model(model, val_records, cfg, device, eval_mode="full")
+                full_eval_sec = float(time.time() - full_eval_start)
                 full_value = _metric_value_from_eval(full_metrics, metric_key)
                 if full_value > best_value + float(cfg.early_stopping_min_delta):
                     metrics = full_metrics
@@ -1048,6 +1063,10 @@ def train_edge_model(
                 "best_epoch": best_epoch,
                 "no_improve_epochs": no_improve_epochs,
                 "elapsed": time.time() - start,
+                "elapsed_sec": time.time() - start,
+                "epoch_train_sec": epoch_train_sec,
+                "validation_sec": validation_sec if run_validation else None,
+                "full_eval_sec": full_eval_sec if full_eval_sec else None,
                 "validation_ran": run_validation,
                 "val_eval_mode": eval_mode if run_validation else None,
             })

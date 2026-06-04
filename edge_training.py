@@ -132,6 +132,9 @@ class TrainConfig:
     val_split_ratio: float = 0.25
     checkpoint_every_n_epochs: int = 1
     checkpoint_full_eval_on_improve: bool = True
+    full_eval_confirm_on_improve: bool = True
+    full_eval_every_n_epochs: int = 0
+    max_full_eval_records: int = 24
     cache_dataset_max_records: int = 100
     augment_enabled: bool = True
     augment_rotation_deg: float = 5.0
@@ -236,19 +239,23 @@ def _infer_label_root(records: Sequence[EdgeLabelRecord]) -> Optional[str]:
 def _load_augmentation_parent_map(label_root: Optional[str]) -> Dict[str, str]:
     if not label_root:
         return {}
-    manifest_path = Path(label_root) / "augmentation_manifest.json"
-    if not manifest_path.exists():
+    manifest_paths = [Path(label_root) / "augmentation_manifest.json", Path(label_root).parent / "augmentation_manifest.json"]
+    manifest_path = next((path for path in manifest_paths if path.exists()), None)
+    if manifest_path is None:
         return {}
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception:
         return {}
     mapping: Dict[str, str] = {}
-    for row in payload.get("accepted") or []:
+    for row in (payload.get("accepted") or payload.get("samples") or []):
         parent = str(row.get("parent_record_key") or "").strip()
         if not parent:
             continue
+        record = row.get("record") or {}
         for key in (
+            record.get("image_hash"),
+            record.get("image_path"),
             row.get("record_key"),
             row.get("image_hash"),
             row.get("output_image_path"),
@@ -256,6 +263,7 @@ def _load_augmentation_parent_map(label_root: Optional[str]) -> Dict[str, str]:
         ):
             if key:
                 mapping[str(key)] = parent
+                mapping[Path(str(key)).name] = parent
     return mapping
 
 
@@ -692,6 +700,7 @@ def _evaluate_model(
     device,
     *,
     eval_mode: Optional[str] = None,
+    max_records: int = 0,
 ) -> Dict[str, Any]:
     model.eval()
     mode = (eval_mode or cfg.val_eval_mode or "full").strip().lower()
@@ -699,9 +708,12 @@ def _evaluate_model(
     thresholds = _FAST_EVAL_THRESHOLDS if fast else None
     topology_safe = not fast
     scores = []
+    eval_records = list(records)
+    if int(max_records) > 0 and len(eval_records) > int(max_records):
+        eval_records = eval_records[: int(max_records)]
     ctx = torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
     with ctx():
-        for rec in records:
+        for rec in eval_records:
             image = Image.open(rec.image_path).convert("L")
             x1, y1, x2, y2 = rec.roi
             roi_img = image.crop((x1, y1, x2, y2))
@@ -784,6 +796,8 @@ def _evaluate_model(
         avg["topology_safe_merge_split_risk_max"] = float(np.max([s.get("merge_split_risk", 1.0) for s in safe_scores]))
     avg["topology_risk_high"] = bool(avg["merge_split_risk"] >= 0.10)
     avg["scores"] = scores
+    avg["eval_record_count"] = len(eval_records)
+    avg["eval_record_cap"] = int(max_records)
     return avg
 
 
@@ -1028,14 +1042,30 @@ def train_edge_model(
         epoch_no = epoch + 1
         is_last_epoch = epoch_no >= total_epochs
         run_validation = is_last_epoch or (epoch_no % val_interval == 0)
-        probe_mode = "full" if is_last_epoch else (cfg.val_eval_mode or "fast")
+        full_interval = max(0, int(cfg.full_eval_every_n_epochs))
+        manual_full_epoch = bool(full_interval > 0 and epoch_no % full_interval == 0)
+        probe_mode = "full" if (is_last_epoch or manual_full_epoch) else (cfg.val_eval_mode or "fast")
         val_pixel_loss: Optional[float] = None
         eval_mode = probe_mode
         validation_sec = 0.0
         full_eval_sec = 0.0
+        full_eval_reason = "disabled"
+        full_eval_cap = max(0, int(cfg.max_full_eval_records))
         if run_validation:
             validation_start = time.time()
-            metrics = _evaluate_model(model, val_records, cfg, device, eval_mode=probe_mode)
+            eval_core_start = time.time()
+            metrics = _evaluate_model(
+                model,
+                val_records,
+                cfg,
+                device,
+                eval_mode=probe_mode,
+                max_records=full_eval_cap if probe_mode == "full" else 0,
+            )
+            eval_core_sec = float(time.time() - eval_core_start)
+            if probe_mode == "full":
+                full_eval_reason = "final_epoch" if is_last_epoch else "manual_interval"
+                full_eval_sec = eval_core_sec
             last_metrics = metrics
             val_pixel_loss = _compute_val_pixel_loss(
                 model, val_records, cfg, device, pos_weight, epoch=epoch
@@ -1055,11 +1085,20 @@ def train_edge_model(
                 fast_improved
                 and probe_mode == "fast"
                 and bool(cfg.checkpoint_full_eval_on_improve)
+                and bool(cfg.full_eval_confirm_on_improve)
                 and not is_last_epoch
             ):
                 full_eval_start = time.time()
-                full_metrics = _evaluate_model(model, val_records, cfg, device, eval_mode="full")
+                full_metrics = _evaluate_model(
+                    model,
+                    val_records,
+                    cfg,
+                    device,
+                    eval_mode="full",
+                    max_records=full_eval_cap,
+                )
                 full_eval_sec = float(time.time() - full_eval_start)
+                full_eval_reason = "confirm_improve"
                 full_value = _metric_value_from_eval(full_metrics, metric_key)
                 if full_value > best_value + float(cfg.early_stopping_min_delta):
                     metrics = full_metrics
@@ -1134,6 +1173,8 @@ def train_edge_model(
                 "epoch_train_sec": epoch_train_sec,
                 "validation_sec": validation_sec if run_validation else None,
                 "full_eval_sec": full_eval_sec if full_eval_sec else None,
+                "full_eval_reason": full_eval_reason if run_validation else None,
+                "full_eval_record_cap": full_eval_cap if full_eval_cap else None,
                 "validation_ran": run_validation,
                 "val_eval_mode": eval_mode if run_validation else None,
             })
@@ -1192,7 +1233,14 @@ def train_edge_model(
     if best_state is not None:
         model.load_state_dict(best_state)
     if val_records:
-        best_metrics = _evaluate_model(model, val_records, cfg, device, eval_mode="full")
+        best_metrics = _evaluate_model(
+            model,
+            val_records,
+            cfg,
+            device,
+            eval_mode="full",
+            max_records=max(0, int(cfg.max_full_eval_records)),
+        )
         last_val_pixel_loss = _compute_val_pixel_loss(
             model, val_records, cfg, device, pos_weight, epoch=max(0, total_epochs - 1)
         )
